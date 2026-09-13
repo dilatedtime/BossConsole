@@ -129,6 +129,10 @@ object FluckEngine {
     // happens-before edge (safe publication for _engine included).
     @Volatile private var _engine: Engine? = null
 
+    // Retained until another engine boots successfully. Cleanup can run during recovery while the
+    // previous engine is still draining, so directory age alone must never make its fallback safe.
+    @Volatile private var activeTemporaryProfile: String? = null
+
     @Volatile private var initializationError: Throwable? = null
 
     @Volatile private var attemptCount = 0
@@ -261,8 +265,8 @@ object FluckEngine {
             cleanupAllLockRelatedFiles(profileDirPath)
         }
 
-        // Clean up ALL temporary profiles from previous sessions
-        // At startup time, no temp profiles should be in use
+        // Clean up temporary profiles left by previous sessions. Another BOSS process may still
+        // own one, and recovery may still be draining ours, so active names remain protected.
         cleanupAllTemporaryProfiles()
     }
 
@@ -1781,7 +1785,7 @@ object FluckEngine {
                 logger.debug(
                     LogCategory.BROWSER,
                     "Some old temporary browser profiles could not be cleaned",
-                    mapOf("failedCount" to result.failed),
+                    cleanupFailureFields(result),
                 )
             }
         } catch (e: Exception) {
@@ -1805,7 +1809,7 @@ object FluckEngine {
                 logger.debug(
                     LogCategory.BROWSER,
                     "Some temporary browser profiles could not be cleaned",
-                    mapOf("failedCount" to result.failed),
+                    cleanupFailureFields(result),
                 )
             }
         } catch (e: Exception) {
@@ -1819,13 +1823,27 @@ object FluckEngine {
         }
     }
 
-    private fun cleanupTemporaryProfiles(olderThanMillis: Long?): TemporaryBrowserProfiles.CleanupResult =
-        TemporaryBrowserProfiles.cleanup(
+    private fun cleanupTemporaryProfiles(olderThanMillis: Long?): TemporaryBrowserProfiles.CleanupResult {
+        val protection = BrowserSettings.profileProtectionSnapshot()
+        val protectedProfiles =
+            protection.availableProfiles + protection.currentProfile + listOfNotNull(activeTemporaryProfile)
+
+        return TemporaryBrowserProfiles.cleanup(
             root = BossDirectories.rootDir.toPath(),
-            registeredProfiles = BrowserSettings.availableProfiles.toSet(),
-            currentProfile = BrowserSettings.currentProfile,
+            protectedProfiles = protectedProfiles,
+            legacyProfileNamesTrusted = protection.legacyProfileNamesTrusted,
             olderThanMillis = olderThanMillis,
         )
+    }
+
+    private fun cleanupFailureFields(result: TemporaryBrowserProfiles.CleanupResult): Map<String, Any> =
+        buildMap {
+            put("failedCount", result.failed)
+            result.firstFailure?.let { failure ->
+                put("firstFailedProfile", failure.profile)
+                put("firstFailure", failure.reason)
+            }
+        }
 
     private fun createEngineWithProfile(chromiumDir: java.nio.file.Path): Engine {
         val selectedProfile = BrowserSettings.currentProfile
@@ -1833,7 +1851,9 @@ object FluckEngine {
         profileDirPath.toFile().mkdirs()
 
         return try {
-            createEngineInstance(chromiumDir, profileDirPath)
+            createEngineInstance(chromiumDir, profileDirPath).also {
+                activeTemporaryProfile = null
+            }
         } catch (e: UserDataDirectoryAlreadyInUseException) {
             logger.warn(
                 LogCategory.BROWSER,
@@ -1860,7 +1880,9 @@ object FluckEngine {
             tempProfilePath.toFile().mkdirs()
 
             try {
-                createEngineInstance(chromiumDir, tempProfilePath)
+                createEngineInstance(chromiumDir, tempProfilePath).also {
+                    activeTemporaryProfile = tempProfile
+                }
             } catch (e2: Exception) {
                 throw e2
             }
