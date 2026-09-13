@@ -43,11 +43,11 @@ class UpdateCompatibilityTest {
 
     @Test
     fun `release applies only the current platform floor`() {
-        val release = release("v9.5.14", minOs = mapOf("macos" to "13.0", "windows" to "11"))
+        val release = release("v9.5.14", minOs = mapOf("macos" to "13.0", "windows" to "10.0"))
 
         assertFalse(release.supportsOs("macOS", "12.7"))
         assertTrue(release.supportsOs("macOS", "13.0"))
-        assertTrue(release.supportsOs("Windows", "11.0"))
+        assertTrue(release.supportsOs("Windows", "10.0"))
         assertTrue(release.supportsOs("Linux-deb", "6.0"))
     }
 

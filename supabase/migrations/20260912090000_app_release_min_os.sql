@@ -20,17 +20,18 @@ BEGIN
     END IF;
 END $$;
 
--- BOSS 9.4.0 raised the macOS floor to 13.0 with JxBrowser 9.4.0. Backfill
+-- BOSS 9.3.0 raised the macOS floor to 13.0 with JxBrowser 9.4.0. Backfill
 -- released rows so currently installed clients benefit before the next publish.
 UPDATE app_releases
 SET min_os = jsonb_set(min_os, '{macos}', '"13.0"'::jsonb, true)
 WHERE app = 'boss'
   AND NOT (min_os ? 'macos')
-  AND version ~ '^[0-9]+\.[0-9]+(\.|$)'
-  AND (
-      split_part(version, '.', 1)::integer > 9
-      OR (
-          split_part(version, '.', 1)::integer = 9
-          AND split_part(version, '.', 2)::integer >= 4
-      )
-  );
+  AND CASE
+      WHEN version ~ '^[0-9]{1,9}\.[0-9]{1,9}(\.|$)' THEN
+          split_part(version, '.', 1)::integer > 9
+          OR (
+              split_part(version, '.', 1)::integer = 9
+              AND split_part(version, '.', 2)::integer >= 3
+          )
+      ELSE false
+  END;

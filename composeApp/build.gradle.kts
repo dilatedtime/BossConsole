@@ -93,7 +93,7 @@ val minimumOsPropsProvider =
 val minimumMacOsVersion =
     minimumOsPropsProvider
         .map { properties ->
-            properties.getProperty("macos")?.trim()?.takeIf { it.matches(Regex("""\d+(\.\d+){0,3}""")) }
+            properties.getProperty("macos")?.trim()?.takeIf { it.matches(Regex("""\d+(\.\d+){0,2}""")) }
                 ?: throw GradleException("gradle/minimum-os-versions.properties needs a numeric macos version")
         }.get()
 

@@ -29,4 +29,7 @@ assert_fails "$TMP_DIR/malformed.properties"
 assert_fails "$TMP_DIR/duplicate.properties"
 assert_fails "$TMP_DIR/missing-equals.properties"
 
+printf 'macos=13.0.1.2\n' > "$TMP_DIR/four-components.properties"
+assert_fails "$TMP_DIR/four-components.properties"
+
 echo "minimum-os parser tests passed"

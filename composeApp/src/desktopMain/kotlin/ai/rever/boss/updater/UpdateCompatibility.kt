@@ -2,7 +2,7 @@ package ai.rever.boss.updater
 
 import ai.rever.boss.utils.Version
 
-private val CATALOG_OS_VERSION = Regex("""\d+(\.\d+){0,3}""")
+private val CATALOG_OS_VERSION = Regex("""\d+(\.\d+){0,2}""")
 
 /** Catalog key for the package family selected by [platform]. */
 internal fun updateOsKey(platform: String): String? =

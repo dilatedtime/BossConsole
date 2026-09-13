@@ -39,7 +39,7 @@ minimum_os_json_from_file() {
       echo "ERROR: duplicate minimum OS key: $key" >&2
       return 1
     fi
-    if [[ ! "$value" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]]; then
+    if [[ ! "$value" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
       echo "ERROR: malformed minimum OS version for $key: $value" >&2
       return 1
     fi
