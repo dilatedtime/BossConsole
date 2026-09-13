@@ -42,7 +42,9 @@ jobs:
         run: bash scripts/test/test-tus-slice.sh
 
       - name: 🧪 Release publish minimum OS metadata tests
-        run: bash scripts/test/test-minimum-os.sh
+        run: |
+          bash scripts/test/test-minimum-os.sh
+          python3 scripts/test/test-minimum-os-publisher.py
 
       - name: 🧪 Release notarization — retry/resume tests
         # Guards the macOS notarization retry path: a dropped status poll must

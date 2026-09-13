@@ -278,8 +278,8 @@ fi
 row="$(jq -nc \
   --arg app "$APP" --arg version "$VERSION" --arg channel "$CHANNEL" \
   --argjson prerelease "$PRERELEASE" --arg notes "$notes" --argjson assets "$assets_json" \
-  --argjson min_os "$MINIMUM_OS_JSON" \
-  '{app: $app, version: $version, channel: $channel, prerelease: $prerelease, release_notes: $notes, assets: $assets, min_os: $min_os}')"
+  --argjson min_os "$MINIMUM_OS_JSON" --arg minimum_os_file "$MINIMUM_OS_FILE" \
+  '{app: $app, version: $version, channel: $channel, prerelease: $prerelease, release_notes: $notes, assets: $assets} + (if $minimum_os_file == "" then {} else {min_os: $min_os} end)')"
 
 echo "Upserting app_releases row for $APP $VERSION ($uploaded asset(s))"
 # on_conflict is required: merge-duplicates alone resolves only against the
@@ -316,7 +316,8 @@ verify_code="$(curl -sS -G -o "$TMP_DIR/verify.txt" -w '%{http_code}' \
 # The query already filters by version, so a non-empty array = the row exists.
 # jq (a hard dep) parses it precisely rather than regex-matching the version.
 if [[ "$verify_code" != "200" ]] || ! jq -e --argjson expected "$MINIMUM_OS_JSON" \
-  'type == "array" and length > 0 and .[0].min_os == $expected' "$TMP_DIR/verify.txt" >/dev/null 2>&1; then
+  --arg minimum_os_file "$MINIMUM_OS_FILE" \
+  'type == "array" and length > 0 and ($minimum_os_file == "" or .[0].min_os == $expected)' "$TMP_DIR/verify.txt" >/dev/null 2>&1; then
   echo "ERROR: post-publish check failed — app_releases has no queryable row for $APP $VERSION (HTTP $verify_code): $(cat "$TMP_DIR/verify.txt")" >&2
   exit 1
 fi

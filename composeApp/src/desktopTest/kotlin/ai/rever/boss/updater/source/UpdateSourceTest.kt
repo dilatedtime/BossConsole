@@ -20,6 +20,24 @@ class UpdateSourceTest {
             isLenient = true
         }
 
+    @Test
+    fun `malformed OS hints do not discard releases or valid sibling floors`() {
+        for (metadata in listOf("null", "[]", "13", "true", "{}")) {
+            val row = json.decodeFromString<AppReleaseRow>(
+                """{"app":"boss","version":"9.5.0","min_os":$metadata}""",
+            )
+            assertTrue(row.toGitHubRelease().minimumOs.isEmpty())
+            val release = json.decodeFromString<GitHubRelease>(
+                """{"tag_name":"v9.5.0","name":"BOSS","body":"","published_at":"","min_os":$metadata}""",
+            )
+            assertTrue(release.minimumOs.isEmpty())
+        }
+        val row = json.decodeFromString<AppReleaseRow>(
+            """{"app":"boss","version":"9.5.0","min_os":{"macos":"13.0","windows":null,"linux":[]}}""",
+        )
+        assertEquals(mapOf("macos" to "13.0"), row.toGitHubRelease().minimumOs)
+    }
+
     // ---- AppReleaseRow JSON -> GitHubRelease mapping ----
 
     @Test

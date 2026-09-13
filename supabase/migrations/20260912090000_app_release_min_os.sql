@@ -25,6 +25,7 @@ END $$;
 UPDATE app_releases
 SET min_os = jsonb_set(min_os, '{macos}', '"13.0"'::jsonb, true)
 WHERE app = 'boss'
+  AND NOT (min_os ? 'macos')
   AND version ~ '^[0-9]+\.[0-9]+(\.|$)'
   AND (
       split_part(version, '.', 1)::integer > 9

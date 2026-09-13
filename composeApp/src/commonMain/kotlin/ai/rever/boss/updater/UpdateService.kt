@@ -18,6 +18,7 @@ data class GitHubRelease(
     val published_at: String,
     val assets: List<GitHubAsset> = emptyList(),
     /** Minimum supported OS version by catalog key (`macos`, `windows`, `linux`). */
+    @Serializable(with = MinimumOsSerializer::class)
     @SerialName("min_os") val minimumOs: Map<String, String> = emptyMap(),
 )
 
