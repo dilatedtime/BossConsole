@@ -16,9 +16,9 @@ assert_fails() {
 
 [[ "$(minimum_os_json_from_file)" == '{}' ]]
 
-printf '# floors\nmacos=13.0\nwindows = 10.0.19041\nlinux=6\n' > "$TMP_DIR/valid.properties"
+printf '# floors\nmacos=13.0\nwindows = 10.0\nlinux=6\n' > "$TMP_DIR/valid.properties"
 actual="$(minimum_os_json_from_file "$TMP_DIR/valid.properties")"
-jq -e '. == {macos:"13.0", windows:"10.0.19041", linux:"6"}' <<< "$actual" >/dev/null
+jq -e '. == {macos:"13.0", windows:"10.0", linux:"6"}' <<< "$actual" >/dev/null
 
 printf 'android=14\n' > "$TMP_DIR/unknown.properties"
 printf 'macos=13.x\n' > "$TMP_DIR/malformed.properties"

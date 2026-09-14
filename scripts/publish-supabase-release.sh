@@ -305,11 +305,16 @@ fi
 # the release would be invisible to clients with no obvious signal. Fail loud.
 # -G + --data-urlencode so a version with URL-unsafe chars (e.g. a +build.meta
 # semver suffix, where '+' would otherwise decode to space) filters correctly.
+# Legacy callers must also work before the optional metadata column exists.
+VERIFY_SELECT="version"
+if [[ -n "$MINIMUM_OS_FILE" ]]; then
+  VERIFY_SELECT="version,min_os"
+fi
 verify_code="$(curl -sS -G -o "$TMP_DIR/verify.txt" -w '%{http_code}' \
   "$SUPABASE_URL/rest/v1/app_releases" \
   --data-urlencode "app=eq.$APP" \
   --data-urlencode "version=eq.$VERSION" \
-  --data-urlencode "select=version,min_os" \
+  --data-urlencode "select=$VERIFY_SELECT" \
   --data-urlencode "limit=1" \
   -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
   -H "apikey: $SUPABASE_SERVICE_ROLE_KEY")"

@@ -26,8 +26,14 @@ if '--data' in args:
     (root / 'row.json').write_text(json.dumps(row))
     print('204', end='')
 elif '-G' in args:
+    projection = next(arg for arg in args if arg.startswith('select='))
+    if os.environ.get('PRE_MIGRATION') and 'min_os' in projection:
+        pathlib.Path(args[args.index('-o') + 1]).write_text('{"code":"42703"}')
+        print('400', end='')
+        sys.exit(0)
     row = json.loads((root / 'row.json').read_text())
-    row.setdefault('min_os', {'macos': '14.0'})
+    if not os.environ.get('PRE_MIGRATION'):
+        row.setdefault('min_os', {'macos': '14.0'})
     if os.environ.get('BAD_READBACK'):
         row['min_os'] = {'macos': '99.0'}
     pathlib.Path(args[args.index('-o') + 1]).write_text(json.dumps([row]))
@@ -48,6 +54,9 @@ else:
             result = run([str(floors)], dict(env, BAD_READBACK='1'))
             self.assertNotEqual(0, result.returncode, 'mismatched metadata must fail publication')
             result = run([])
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertNotIn('min_os', json.loads((root / 'row.json').read_text()))
+            result = run([], dict(env, PRE_MIGRATION='1'))
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             self.assertNotIn('min_os', json.loads((root / 'row.json').read_text()))
 
