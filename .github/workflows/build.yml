@@ -33,6 +33,12 @@ jobs:
       - name: 🧪 Claude review authorization tests
         run: node --test .github/scripts/test-claude-review.cjs
 
+      - name: Plugin publisher HTTP fixtures
+        run: |
+          BOSS_TEST_PWSH=$(command -v pwsh)
+          export BOSS_TEST_PWSH
+          python3 scripts/test/test-publish-plugin.py
+
       - name: Headless CLI launcher tests
         run: bash scripts/test/test-headless-cli.sh
 
