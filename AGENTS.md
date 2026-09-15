@@ -2190,3 +2190,21 @@ are intentional. Global access filters still apply independently of registration
 - **Test Veracity Rules**:
   - In deduplication tests, ALWAYS test with dev JAR `lastModified` strictly greater than standard JAR `lastModified` to mirror real-world compiler outputs.
   - Test the public reload pipeline (`DevPluginReloader.reload`) end-to-end rather than calling internal rollback helpers in isolation.
+
+### Health snapshots and intentional disables
+
+Sandbox disabled state alone is not evidence of watchdog failure: operator disable
+and failed registration also set it. `pluginHealthSnapshot` derives watchdog stops
+only from otherwise healthy rows and shares that set with row decoration and CLI
+findings. Manager errors take precedence over disabled state, so a failed
+registration stays visible while an ordinary disabled plugin is not degraded.
+
+Password import and secret request validation reject empty passwords, not
+whitespace-only passwords: whitespace can be the original credential. Never trim
+password values. Bitwarden JSON null encryption flags are treated like an absent
+flag; true or malformed non-null values remain rejected. KeePass format sniffing
+inspects at most 4096 characters; full XML parsing still enforces its own limits.
+
+Dev reload resolves staged JARs with manifest identity validation, matching startup.
+The scaffold wrapper source/hash is recorded in `resources/launcher/README.md`;
+update it with the pinned distribution checksum and scaffold validation together.
