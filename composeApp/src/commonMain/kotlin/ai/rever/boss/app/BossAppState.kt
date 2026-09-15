@@ -24,6 +24,7 @@ import ai.rever.boss.components.workspaces.LayoutWorkspace
 import ai.rever.boss.components.workspaces.workspaceManager
 import ai.rever.boss.html.HtmlFileOpenRequest
 import ai.rever.boss.mcp.McpApprovalRequest
+import ai.rever.boss.search.SpotlightFileIndexOwner
 import ai.rever.boss.services.FileHandlerService
 import ai.rever.boss.services.TerminalHandlerService
 import ai.rever.boss.services.URLHandlerService
@@ -85,6 +86,12 @@ internal class BossAppState(
     var showNewTabDialog by mutableStateOf(false)
     var newTabDialogInitialType by mutableStateOf<TabType?>(null)
     var showGlobalSearchDialog by mutableStateOf(false)
+
+    /**
+     * Retains one project index while this window remains open. Dialog-local search state is kept
+     * in GlobalSearchDialog so a reopen cannot restore another session's query or selection.
+     */
+    val spotlightFileIndexes = SpotlightFileIndexOwner(coroutineScope)
 
     /**
      * The tools launcher's dialog.
@@ -209,6 +216,8 @@ internal class BossAppState(
 
     // --- Plugin install wizard (shown on first login) ------------------------
     var showPluginInstallWizard by mutableStateOf(false)
+    var terminalOnboardingOwnerStarted by mutableStateOf(false)
+    var terminalOnboardingRequestGeneration by mutableStateOf(0)
     var pluginWizardChecked by mutableStateOf(false)
     var pluginWizardRetryCount by mutableStateOf(0)
     var availablePluginsForWizard by mutableStateOf<List<WizardPluginInfo>>(emptyList())

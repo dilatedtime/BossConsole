@@ -2038,9 +2038,6 @@ workspace by selecting the tools you need." Tools install app-wide, not into a S
 - [Role Creation](docs/ROLE_CREATION_GUIDE.md) - Creating and managing roles
 - [Windows Deep Link](docs/WINDOWS_DEEP_LINK_SETUP.md) - Windows protocol handler setup
 - [Release Rebuild](docs/RELEASE_REBUILD_GUIDE.md) - Re-running release builds
-
-
-
 ### Governed MCP invocation (#371)
 
 The host policy applies to registry invocation; it does not isolate installed JVM
@@ -2074,6 +2071,7 @@ Provider trust also covers tools added by later versions and replacement plugins
 that provider id. Already queued sibling prompts still ask. Explicit tool ASK rules
 still override provider ALLOW. The Trusted plugins UI lists ALLOW rules only; hand-edited
 provider DENY rules currently require policy-file editing to remove.
+
 Preserve a backup before manual recovery of a damaged policy;
 the fault flow withholds all tools until recovery. No automatic quarantine UI is
 provided. Ledger redaction is bounded and best effort, not a guarantee for secrets
@@ -2083,3 +2081,112 @@ no second sandbox prompt. Explicit policies and session trust retain precedence.
 HIGH/CRITICAL names use the mutating default, while unknown names remain allowed
 by default. Risk reasons and sanitized arguments appear together in the existing
 approval dialog. #362 is closed pending extraction into a management plugin.
+
+**The bottom bar's "MCP: `<tool>`" status line is clickable into an activity log of the last 100
+calls this session.** Before this it was the only visibility into MCP activity at all - every
+call before the current one, and the policy/approval decision behind it, was reachable only by
+opening the rotated ledger file in a text editor. The dialog is a read-only view over
+`McpOperationLedger.recentOperations`, scoped to calls that actually reached the policy engine -
+`McpOperationLedger`'s own KDoc records that an unregistered, unpermitted or kill-switch-disabled
+tool call is refused before that, so this is not a view over every MCP invocation attempt.
+Retention is described as finite and best-effort (the active ledger file plus up to 5 rotated
+backups, and a write failure there is logged rather than retried), not a guarantee older calls
+are still on disk. Unsuccessful calls are broken down by `McpUnsuccessfulCategory` - denied,
+cancelled, withheld (approval queue overflow or a host disk fault that stopped the call from running) or failed - through an exhaustive `when` over `McpApprovalDisposition` rather
+than a `setOf`-based membership check, so a disposition the enum grows later is a compile error
+here rather than silently counted as a tool fault.
+
+This is host UI for now; #416 is where activity/history UI and its ownership are meant to move
+into a dynamic plugin. Should that move happen, the read surface it needs must be
+**host-implemented and permission-gated** (an `mcp.activity.read`-shaped permission, the way MCP
+tool calls already gate on `project.replace` and similar), never a member added to the ungated
+`PluginContext.applicationEventBus`/`projectSearchProvider` surface this file documents elsewhere
+- an ungated ledger read would hand any installed plugin every *other* plugin's tool names,
+sanitized arguments and error snippets, and this file's own sanitizer caveat ("bounded and best
+effort, not a guarantee for secrets under arbitrary keys") is acceptable for an operator-only host
+dialog and not for a cross-plugin observation channel. Until that move happens, keeping this host
+UI is also the stronger guarantee for a second reason: a governance viewer that can be disabled or
+uninstalled by the plugins it governs is weaker than one that ships with the host.
+
+The idle activity entry appears only while MCP tools are exposed (existing history remains reachable).
+The viewer uses the ledger instance's actual optional persistence path. Its tooltip follows the host
+heavyweight overlay route. Width and height follow the originating window, with a fixed-cap fallback
+while window metadata is not yet measured; Close stays outside the scrolling body.
+
+**The "Persisted MCP policies" bottom bar button also lets an operator set a rule
+*proactively*, for a registered tool without a saved rule.** It is present even with zero saved
+rules (labeled "Set MCP tool policies" then). Allow requires a second confirming tap
+and shows the tool's risk assessment first, the same way the approval dialog's own
+"Always Allow" does, since it is the same durable, tool-name-wide grant. The write goes
+through `McpPolicyEngine.setToolPolicyIfAbsent`, not the reactive approval path's
+`setToolPolicy` - the proactive contract is "add a rule only while this tool still has
+none of its own," and `expectedRevocation`/`providerId` (captured when the tool was
+offered as a candidate, via `mcpProactivePolicyCandidates` /
+`McpToolIdentity.expectedRevocation`) alone cannot enforce that: `revocationVersion`
+only moves on a revoke, so an intervening explicit ASK or ALLOW made through the
+reactive approval dialog for this same tool never trips it, and a `preserveDeny`-style
+guard would let the proactive write silently clobber that decision. `setToolPolicyIfAbsent`
+re-checks `toolName !in rules` under the same lock the write itself takes, atomically, so
+any rule present at write time - not only a DENY - refuses the write instead. The same
+lock also refuses provider DENY and unreadable-policy faults, preserving damaged files
+for manual recovery. Refused writes refresh candidates and require a fresh confirmation;
+storage failures get separate feedback. Stable DENY and damaged-file refusals are explained
+inside the dialog, including backup/recovery guidance. Confirmation is tied to the full candidate snapshot.
+These privileged writes remain beside host policy enforcement. #416 tracks the separate
+observation/plugin architecture; this PR does not expose a policy writer to plugins.
+
+The MCP tool policies dialog also groups currently registered, enabled tools by
+provider into sections. All allows the section, View selects tools declared
+read-only except names in the host mutating catalog and HIGH/CRITICAL risk tools, Edit selects the remaining
+tools, and Custom uses individual checkboxes. Applying a preset denies tools
+outside its selection; existing tool rules are replaced only after the operator
+confirms the displayed counts and scope. These are explicit tool-name rules,
+not provider trust: future tools are not automatically granted access.
+`McpPolicyEngine.setSectionPolicies` writes the reviewed section atomically,
+checks every prior rule and tool/provider revocation stamp, refuses provider DENY
+and unreadable policy files, and invalidates queued grants/session trust after a
+successful save. Keep these checks when changing section UI; sequential calls to
+`setToolPolicy` would permit partial application and stale overwrites. Individual
+reset controls remain available below the sections.
+
+The section/global confirmation UI uses the same default-risk evaluator as the
+engine. HIGH/CRITICAL grants and replacements of an existing DENY display each
+tool's risk and require Review followed by Confirm. Failed writes retain the
+staged choices and retry action; successful or stale writes refresh revocation
+snapshots. Current saved rules (including ASK/default) are visible in expanded
+rows, and the summary distinguishes rules being replaced from new denials.
+Global None is a distinct deny-all preset, not Custom; Edit is the label at both
+levels. Search by plugin display name also matches its saved tool rules.
+
+## Process-wide plugin registrations belong to window lifetimes
+
+`DefaultPlugin` routes MCP/search providers, panel menus, settings pages, deep-link actions,
+shortcut providers and status-bar items through `WindowRegistrations`. The newest window's
+registration serves every window; unregistering it restores the newest surviving owner.
+Disabling or dynamically unregistering in one window therefore leaves another window's
+registration available. Per-window action dispatch is not implemented by this arbitration.
+
+Each window has a lifetime token. Release fences later registrations and snapshots admitted
+slots under a short owner lock; publication checks the fence under its slot lock. Plugin
+callbacks never run under the owner lock, and disposal does not wait on unowned slots.
+Restoring a shared id re-queries tools()/shortcuts() on the closing thread, so a slow surviving
+provider can delay that close. Replacement warnings and snapshot-at-registration semantics
+are intentional. Global access filters still apply independently of registration ownership.
+
+### Plugin Dev Staging & Launchpad Invariants
+
+- **Protected Plugins Overrule Dev JARs Unconditionally**:
+  When deduplicating or resolving dev vs. standard plugins, `isSystemPlugin` and `requiresRestartInsteadOfHotReload` plugins MUST NEVER be superseded by a dev JAR, regardless of file modification timestamps (`lastModified`). Never rely solely on additive bonuses (`versionBonus + lastModified`) without penalizing or filtering dev JARs on protected identities.
+
+- **Reload Forward & Rollback State Completeness**:
+  Hot-reload must support both active (`LOADED`) and inactive (`DISABLED`) plugins symmetrically:
+  - If a plugin was disabled prior to reload (`wasEnabled = false`), forward reload must install with `enabled = false` and accept `state == DISABLED` as an expected successful outcome.
+  - If the active user lacks RBAC permissions, forward reload must accept `state == DISABLED && !canAccess(manifest)` as a valid outcome.
+  - Rollback must restore `wasEnabled = false` and reinstall `v1.jar` in `DISABLED` state without uninstallation.
+
+- **Archive Traversal & Stream Bounds**:
+  Never trust `ZipEntry.size` alone for decompression limits, as `size == -1` in streaming ZIPs. Always enforce hard byte caps on the incoming `InputStream` (e.g. `readNBytes(MAX + 1)` or explicit counter bounds) to prevent heap exhaustion.
+
+- **Test Veracity Rules**:
+  - In deduplication tests, ALWAYS test with dev JAR `lastModified` strictly greater than standard JAR `lastModified` to mirror real-world compiler outputs.
+  - Test the public reload pipeline (`DevPluginReloader.reload`) end-to-end rather than calling internal rollback helpers in isolation.

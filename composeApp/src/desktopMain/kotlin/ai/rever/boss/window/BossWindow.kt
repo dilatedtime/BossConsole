@@ -3,6 +3,7 @@ package ai.rever.boss.window
 import ai.rever.boss.BossAppWithAuth
 import ai.rever.boss.components.bars.ChromeBar
 import ai.rever.boss.components.bars.displayName
+import ai.rever.boss.components.bars.horizontal.StatusMessageManager
 import ai.rever.boss.components.bars.isBarVisible
 import ai.rever.boss.components.bars.withBarVisible
 import ai.rever.boss.components.dialogs.CLIInstallationDialog
@@ -304,9 +305,6 @@ fun ApplicationScope.BossWindow(
         // State for Reset Terminal dialog
         var showResetTerminalDialog by remember { mutableStateOf(false) }
         var resetTerminalResult by remember { mutableStateOf<Boolean?>(null) }
-
-        // State for Welcome Wizard dialog
-        var showWelcomeWizard by remember { mutableStateOf(false) }
 
         // State for the password/bookmark import dialog
         var showImportDialog by remember { mutableStateOf(false) }
@@ -978,7 +976,15 @@ fun ApplicationScope.BossWindow(
                 Item(
                     "Welcome Wizard...",
                     onClick = {
-                        showWelcomeWizard = true
+                        requestTerminalWelcomeWizard(
+                            providerAvailable = TerminalAPIAccess.getProvider() != null,
+                            onOpen = { MenuActionsHandler.triggerShowTerminalOnboarding(windowState.id) },
+                            onUnavailable = {
+                                StatusMessageManager.showMessage(
+                                    "BOSS Term setup is unavailable. Update or reload Terminal Tab, then try again.",
+                                )
+                            },
+                        )
                     },
                 )
 
@@ -1390,14 +1396,6 @@ fun ApplicationScope.BossWindow(
                 )
             }
 
-            // Welcome Wizard Dialog
-            if (showWelcomeWizard) {
-                TerminalAPIAccess.TerminalOnboardingWizard(
-                    onDismiss = { showWelcomeWizard = false },
-                    onComplete = { showWelcomeWizard = false },
-                )
-            }
-
             // Screen Capture Picker Dialog
             val captureRequest by ScreenCaptureNotifier.captureRequest.collectAsState()
             captureRequest?.let { request ->
@@ -1436,6 +1434,15 @@ fun ApplicationScope.BossWindow(
             }
         }
     }
+}
+
+internal fun requestTerminalWelcomeWizard(
+    providerAvailable: Boolean,
+    onOpen: () -> Unit,
+    onUnavailable: () -> Unit,
+): Boolean {
+    if (providerAvailable) onOpen() else onUnavailable()
+    return providerAvailable
 }
 
 /**

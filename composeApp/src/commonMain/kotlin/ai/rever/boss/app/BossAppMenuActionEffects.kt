@@ -600,6 +600,17 @@ internal fun BossAppMenuActionEffects(
 
     // Handle Show Plugin Wizard menu events
     LaunchedEffect(windowId) {
+        MenuActionsHandler.showTerminalOnboardingEvents
+            .onEach { eventWindowId ->
+                if (eventWindowId == windowId) {
+                    state.terminalOnboardingOwnerStarted = true
+                    state.terminalOnboardingRequestGeneration++
+                }
+            }.launchIn(this)
+    }
+
+    // Handle Show Plugin Wizard menu events
+    LaunchedEffect(windowId) {
         MenuActionsHandler.showPluginWizardEvents
             .onEach { eventWindowId ->
                 if (eventWindowId == windowId) {

@@ -70,8 +70,10 @@ import ai.rever.boss.run.RunConfigurationManager
 import ai.rever.boss.run.RunExecutionService
 import ai.rever.boss.search.SearchSources
 import ai.rever.boss.search.ToolSearchRecord
+import ai.rever.boss.search.rememberSpotlightFileIndexer
 import ai.rever.boss.services.auth.UserDataStorage
 import ai.rever.boss.services.bookmarks.BookmarkAPIAccess
+import ai.rever.boss.services.terminal.TerminalAPIAccess
 import ai.rever.boss.settings.MICROKERNEL_MODE_CONFIRMATION_MESSAGE
 import ai.rever.boss.settings.MicrokernelModePreference
 import ai.rever.boss.terminal.TerminalLinkSettingsManager
@@ -89,6 +91,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -109,6 +112,7 @@ internal fun BossAppDialogs(state: BossAppState) {
     val splitViewState = state.splitViewState
     val windowProjectState = state.windowProjectState
     val selectedProject by windowProjectState.selectedProject.collectAsState()
+    val spotlightFileIndexer = rememberSpotlightFileIndexer(state.spotlightFileIndexes, selectedProject.path)
 
     // Keymap settings (used by ShortcutHelpDialog)
     val keymapSettings by KeymapSettingsManager.currentSettings.collectAsState()
@@ -440,7 +444,7 @@ internal fun BossAppDialogs(state: BossAppState) {
         )
     }
 
-    if (state.showGlobalSearchDialog) {
+    if (state.showGlobalSearchDialog && spotlightFileIndexer != null) {
         // Offer THIS window's tools to the search, for exactly as long as its dialog is open.
         //
         // Registered here rather than per window, because the window that matters is the one whose
@@ -473,6 +477,8 @@ internal fun BossAppDialogs(state: BossAppState) {
 
         GlobalSearchDialog(
             projectPath = selectedProject.path,
+            fileIndexer = spotlightFileIndexer,
+            onIndexProject = { state.spotlightFileIndexes.ensureIndexed(selectedProject.path) },
             workspaceManager = workspaceManager,
             windowId = windowId,
             onDismiss = {
@@ -1147,6 +1153,22 @@ internal fun BossAppDialogs(state: BossAppState) {
                 state.focusRequester.requestFocus()
                 logger.info(LogCategory.SYSTEM, "Plugin wizard completed")
             },
+            onSetupBossTerm = {
+                if (TerminalAPIAccess.getProvider() == null) {
+                    StatusMessageManager.showMessage(
+                        "BOSS Term setup is unavailable. Update or reload Terminal Tab, then try again.",
+                    )
+                    logger.warn(LogCategory.SYSTEM, "BOSS Term setup requested without a Terminal Tab provider")
+                } else {
+                    coroutineScope.launch(Dispatchers.IO) {
+                        UserDataStorage.setPluginWizardCompleted(true)
+                    }
+                    state.showPluginInstallWizard = false
+                    state.terminalOnboardingOwnerStarted = true
+                    state.terminalOnboardingRequestGeneration++
+                    logger.info(LogCategory.SYSTEM, "Plugin wizard completed; opening BOSS Term setup")
+                }
+            },
             onInstallPlugins = { plugins, onProgress ->
                 when {
                     dynamicPluginManager != null -> {
@@ -1171,6 +1193,24 @@ internal fun BossAppDialogs(state: BossAppState) {
                     }
                 }
             },
+        )
+    }
+
+    if (state.terminalOnboardingOwnerStarted) {
+        val requestGeneration = state.terminalOnboardingRequestGeneration
+        val finishTerminalOnboarding: () -> Unit =
+            remember(requestGeneration) {
+                {
+                    state.terminalOnboardingOwnerStarted = false
+                    state.focusRequester.requestFocus()
+                }
+            }
+        // Terminal Tab observes this memoized callback identity as the explicit foreground
+        // generation. Its process-wide renderer ownership guard keeps another host window from
+        // mounting the same setup PTY.
+        TerminalAPIAccess.TerminalOnboardingWizard(
+            onDismiss = finishTerminalOnboarding,
+            onComplete = finishTerminalOnboarding,
         )
     }
 

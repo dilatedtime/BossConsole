@@ -20,6 +20,7 @@ import ai.rever.boss.components.plugin.MissingHandlerPluginEventBus
 import ai.rever.boss.components.plugin.PanelIds
 import ai.rever.boss.components.plugin.PluginDependencyEventBus
 import ai.rever.boss.components.plugin.claimMissingDependencyForWindow
+import ai.rever.boss.components.plugin.providers.createApplicationEventBus
 import ai.rever.boss.components.plugin.resolveRegisteredPanelId
 import ai.rever.boss.components.window_panel.SplitViewState
 import ai.rever.boss.components.workspaces.WorkspaceSerializer
@@ -32,11 +33,13 @@ import ai.rever.boss.html.HtmlFileOpenMode
 import ai.rever.boss.html.HtmlFileSettingsManager
 import ai.rever.boss.mcp.McpToolRegistryImpl
 import ai.rever.boss.mcp.consumeApprovals
+import ai.rever.boss.plugin.api.CustomPluginEvent
 import ai.rever.boss.plugin.api.NewTabContext
 import ai.rever.boss.plugin.api.Panel.Companion.bottom
 import ai.rever.boss.plugin.api.Panel.Companion.left
 import ai.rever.boss.plugin.api.Panel.Companion.right
 import ai.rever.boss.plugin.api.Panel.Companion.top
+import ai.rever.boss.plugin.api.PanelId
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.tab.terminal.TerminalTabInfo
@@ -50,6 +53,7 @@ import ai.rever.boss.run.RunnerTerminalTarget
 import ai.rever.boss.services.FileHandlerService
 import ai.rever.boss.services.TerminalHandlerService
 import ai.rever.boss.services.URLHandlerService
+import ai.rever.boss.services.terminal.TerminalAPIAccess
 import ai.rever.boss.terminal.TerminalLinkOpenMode
 import ai.rever.boss.terminal.TerminalLinkSettingsManager
 import ai.rever.boss.utils.WindowFocusManager
@@ -96,6 +100,139 @@ internal fun BossAppEventBusEffects(state: BossAppState) {
     val logger = state.logger
     val splitViewState = state.splitViewState
     val windowProjectState = state.windowProjectState
+
+    // Fluck 1.0.110 listens for Agent Review only under the codebase plugin id. The event source
+    // below is self-declared, not authenticated; the application bus is not a trust boundary.
+    // Install-time plugin selection and the live request token are the actual gates.
+    LaunchedEffect(windowId, state.panelRegistry) {
+        // Create the host singleton here instead of waiting for a plugin to access its lazy bus.
+        // Returning on a cold start would leave this stable-key effect dead for the window's life.
+        val bus = createApplicationEventBus(this)
+        val delivered = DeliveredSetupRequestLedger()
+        bus.eventsOfType(CustomPluginEvent::class.java).collect { event ->
+            isolateSetupBridgeEvent(
+                onFailure = { error ->
+                    logger.warn(LogCategory.SYSTEM, "Failed to handle BOSS Term setup event", error = error)
+                    val request =
+                        (event.routeSetupFluckOpenRequest(windowId) as? SetupFluckOpenRoute.Accept)?.request
+                    if (request != null) {
+                        runCatching {
+                            bus.publish(
+                                setupDebugAcknowledgement(
+                                    request.requestId,
+                                    request.terminalId,
+                                    accepted = false,
+                                    error = "BOSS could not route this debugging request",
+                                ),
+                            )
+                        }.onFailure { acknowledgementError ->
+                            logger.warn(
+                                LogCategory.SYSTEM,
+                                "Failed to acknowledge rejected BOSS Term setup event",
+                                error = acknowledgementError,
+                            )
+                        }
+                    }
+                },
+            ) handle@{
+                if (event.isSetupOpenRequest(windowId)) {
+                    if (TerminalAPIAccess.getProvider() == null) {
+                        StatusMessageManager.showMessage(
+                            "BOSS Term setup is unavailable. Update or reload Terminal Tab, then try again.",
+                        )
+                        logger.warn(LogCategory.SYSTEM, "BOSS Term setup-open event has no Terminal Tab provider")
+                    } else {
+                        state.terminalOnboardingOwnerStarted = true
+                        state.terminalOnboardingRequestGeneration++
+                    }
+                    return@handle
+                }
+                val probeRequestId = event.toSetupFluckProbeRequest(windowId)
+                if (probeRequestId != null) {
+                    bus.publish(
+                        CustomPluginEvent(
+                            HOST_PLUGIN_ID,
+                            SETUP_FLUCK_AVAILABILITY_EVENT,
+                            mapOf(
+                                "requestId" to probeRequestId,
+                                "available" to
+                                    (state.panelRegistry.resolveRegisteredPanelId(PanelId("atlas", 16)) != null),
+                            ),
+                        ),
+                    )
+                    return@handle
+                }
+                when (val route = event.routeSetupFluckOpenRequest(windowId)) {
+                    SetupFluckOpenRoute.Ignore -> {}
+
+                    is SetupFluckOpenRoute.Reject -> {
+                        logger.warn(LogCategory.SYSTEM, "Rejected BOSS Term Fluck request: ${route.reason}")
+                        if (route.canAcknowledge) {
+                            bus.publish(
+                                setupDebugAcknowledgement(
+                                    route.requestId!!,
+                                    route.terminalId!!,
+                                    accepted = false,
+                                    error = route.reason,
+                                ),
+                            )
+                        }
+                    }
+
+                    is SetupFluckOpenRoute.Accept -> {
+                        val request = route.request
+                        val fluckPanel = state.panelRegistry.resolveRegisteredPanelId(PanelId("atlas", 16))
+                        val classification = delivered.classify(request)
+                        val accepted =
+                            fluckPanel != null &&
+                                classification != DeliveredSetupRequestLedger.Classification.CONFLICT
+                        if (accepted) {
+                            // Open first so an open-panel failure cannot follow a successful
+                            // auto-start publish and then incorrectly acknowledge that request as rejected.
+                            PanelEventBus.openPanel(requireNotNull(fluckPanel), sourceWindowId = windowId)
+                            if (classification == DeliveredSetupRequestLedger.Classification.NEW) {
+                                // Released Fluck has a process-wide inbox. This acknowledgement means
+                                // the host published the request; it cannot prove the model received it.
+                                delivered.deliverAndRecord(request) {
+                                    bus.publish(
+                                        CustomPluginEvent(
+                                            CODEBASE_PLUGIN_ID,
+                                            FLUCK_REVIEW_EVENT,
+                                            mapOf(
+                                                "prompt" to request.prompt,
+                                                "projectPath" to "",
+                                                "autoStart" to true,
+                                            ),
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                        bus.publish(
+                            setupDebugAcknowledgement(
+                                request.requestId,
+                                request.terminalId,
+                                accepted,
+                                when {
+                                    accepted -> {
+                                        null
+                                    }
+
+                                    classification == DeliveredSetupRequestLedger.Classification.CONFLICT -> {
+                                        "This request id was already used for different setup data"
+                                    }
+
+                                    else -> {
+                                        "Fluck is unavailable"
+                                    }
+                                },
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
 
     // Listen for file open events - now handled by split state
     // Issue #506: Filter by window to prevent file opening in all windows

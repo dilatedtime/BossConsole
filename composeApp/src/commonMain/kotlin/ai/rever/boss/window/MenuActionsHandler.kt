@@ -823,6 +823,8 @@ object MenuActionsHandler {
 
     private val _showPluginWizardEvents = MutableSharedFlow<String>(extraBufferCapacity = 10)
     val showPluginWizardEvents: SharedFlow<String> = _showPluginWizardEvents.asSharedFlow()
+    private val _showTerminalOnboardingEvents = MutableSharedFlow<String>(extraBufferCapacity = 10)
+    val showTerminalOnboardingEvents: SharedFlow<String> = _showTerminalOnboardingEvents.asSharedFlow()
 
     /**
      * Trigger a "Show Plugin Wizard" action for the specified window.
@@ -831,5 +833,9 @@ object MenuActionsHandler {
      */
     fun triggerShowPluginWizard(windowId: String) {
         _showPluginWizardEvents.tryEmit(windowId)
+    }
+
+    fun triggerShowTerminalOnboarding(windowId: String) {
+        _showTerminalOnboardingEvents.tryEmit(windowId)
     }
 }
