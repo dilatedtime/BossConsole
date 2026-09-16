@@ -51,9 +51,11 @@ import java.util.concurrent.ConcurrentHashMap
  *    stops the exception recurring.
  *
  * Step 2 suspects **one** plugin at a time, not all of them, and corrects itself.
- * If the fault recurs while a suspect is quarantined, that suspect was innocent:
- * it is released and the next one is tried. The cycle ends when the exceptions
- * stop, which leaves exactly the culprit quarantined.
+ * A newly quarantined subtree gets [SUSPECT_SETTLE_MILLIS] to leave Compose's
+ * in-flight measure and layout work. Faults already queued during that bounded
+ * interval keep the same suspect held. If the fault recurs after the interval,
+ * that suspect was innocent: it is released and the next one is tried. The cycle
+ * ends when the exceptions stop, which leaves exactly the culprit quarantined.
  *
  * Quarantining everything at once was the first attempt and it was wrong in
  * practice, not just in theory. Against the real crash it disabled four plugins
@@ -73,6 +75,17 @@ object PluginRenderRecovery {
      * enough that two unrelated faults minutes apart each get their own retry.
      */
     const val REBUILD_GRACE_MILLIS = 4_000L
+
+    /**
+     * Time allowed for a quarantined plugin's fallback to replace its content.
+     *
+     * A generation change invalidates the subtree immediately, but Compose can
+     * already have measure or layout work queued for nodes from the old subtree.
+     * At 250 ms, roughly fifteen 60 Hz frames can drain before another fault is
+     * accepted as evidence that the held plugin was innocent. The deadline is
+     * fixed when quarantine starts; faults inside it never extend the interval.
+     */
+    const val SUSPECT_SETTLE_MILLIS = 250L
 
     /**
      * How many live boundaries each plugin currently has, and in what order they
@@ -171,7 +184,29 @@ object PluginRenderRecovery {
     ): Outcome {
         val affected = mountedPlugins().toSet()
         val recentlyRebuilt = lastRebuildAt != 0L && now - lastRebuildAt <= REBUILD_GRACE_MILLIS
+        val settlingSuspect =
+            suspect?.takeIf {
+                val elapsed = now - lastRebuildAt
+                elapsed in 0..SUSPECT_SETTLE_MILLIS
+            }
         return when {
+            settlingSuspect != null -> {
+                // Return Quarantined again so the host refunds this bounded fault
+                // and repaints, while its per-message gate suppresses a duplicate
+                // toast. Do not update lastRebuildAt here: sliding the deadline
+                // would let a hot fault stream defeat the crash circuit breaker.
+                logger.debug(
+                    LogCategory.UI,
+                    "Render fault arrived while quarantine was settling - keeping the current suspect",
+                    mapOf(
+                        "suspect" to settlingSuspect,
+                        "elapsedMillis" to (now - lastRebuildAt).toString(),
+                        "errorType" to error::class.simpleName.orEmpty(),
+                    ),
+                )
+                Outcome.Quarantined(setOf(settlingSuspect))
+            }
+
             affected.isEmpty() -> {
                 notPluginRelated(error)
             }
@@ -221,25 +256,7 @@ object PluginRenderRecovery {
         return Outcome.Rebuilt(affected)
     }
 
-    /**
-     * Rule out the plugin we were holding, because the fault outlived it.
-     *
-     * **Known limitation: there is no settle window.** A suspect is judged on the
-     * very next fault, and quarantine only takes effect once the panel recomposes
-     * and stops rendering plugin content. A fault thrown from a measure pass that
-     * was already in flight would therefore convict-then-release the *actual*
-     * culprit, after which narrowing exhausts the remaining plugins and ends
-     * [Outcome.Unexplained] — the broken-window outcome this class exists to
-     * avoid.
-     *
-     * Left as-is deliberately. The generation bump that accompanies a quarantine
-     * discards the offending subtree synchronously, so in the live repro the next
-     * fault was always a genuinely new one, and the cycle converged on the right
-     * plugin. Adding a delay here is not free either: faults inside the settle
-     * window would still reach the host's `RenderCrashPolicy` as unproductive and could
-     * escalate *sooner*. That interaction needs testing on its own rather than a
-     * timing constant tacked onto this change.
-     */
+    /** Rule out the plugin we were holding, because the fault outlived it. */
     private fun releaseSuspectAsInnocent() {
         suspect?.let { wronglyHeld ->
             logger.info(

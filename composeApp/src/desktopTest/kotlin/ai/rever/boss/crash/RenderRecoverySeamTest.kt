@@ -115,4 +115,46 @@ class RenderRecoverySeamTest {
             "narrowing escalated before trying every mounted plugin: tried $quarantined",
         )
     }
+
+    @Test
+    fun `in-flight quarantine faults cannot consume the crash budget`() {
+        var now = 1_000L
+        val policy = RenderCrashPolicy(now = { now })
+
+        assertTrue(frame(policy, now) == WindowExceptionRoute.Contain) // rebuild
+        now += 16
+        assertTrue(frame(policy, now) == WindowExceptionRoute.Contain) // quarantine c
+
+        repeat(12) {
+            now += 16
+            assertTrue(
+                frame(policy, now) == WindowExceptionRoute.Contain,
+                "the circuit breaker fired before the quarantined subtree could leave Compose",
+            )
+            assertTrue(policy.recentFailureCount() == 0, "bounded settling faults must be refunded")
+            assertTrue(PluginCrashRegistry.hasCrashed("plugin.c"), "the same suspect must remain held")
+        }
+    }
+
+    @Test
+    fun `a permanent fault still escalates after every settle deadline`() {
+        var now = 1_000L
+        val policy = RenderCrashPolicy(now = { now })
+        var escalatedAt: Int? = null
+
+        for (frameNumber in 1..200) {
+            if (frame(policy, now) == WindowExceptionRoute.Escalate) {
+                escalatedAt = frameNumber
+                break
+            }
+            now += 16
+        }
+
+        assertTrue(escalatedAt != null, "settling must not turn containment into an infinite loop")
+        assertTrue(
+            now - 1_000 <= PluginRenderRecovery.REBUILD_GRACE_MILLIS,
+            "a corrupt scene should fail honestly inside one rebuild-grace interval; " +
+                "got frame $escalatedAt at ${now - 1_000} ms",
+        )
+    }
 }

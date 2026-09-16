@@ -88,8 +88,9 @@ fun decideWindowExceptionRoute(
  * left every test green — the wiring the test was named for was never asserted.
  *
  * [PluginRenderRecovery.Outcome.Rebuilt] and
- * [PluginRenderRecovery.Outcome.Quarantined] mean the narrowing loop advanced, so
- * that fault should not count toward escalation.
+ * [PluginRenderRecovery.Outcome.Quarantined] mean recovery either advanced the
+ * narrowing loop or is giving a just-quarantined subtree its bounded settle time,
+ * so that fault should not count toward escalation.
  * [PluginRenderRecovery.Outcome.Unexplained] and
  * [PluginRenderRecovery.Outcome.NotPluginRelated] mean it did not, and those must
  * keep accumulating or a corrupt scene never escalates.

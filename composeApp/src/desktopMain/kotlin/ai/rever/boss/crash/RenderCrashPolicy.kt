@@ -64,8 +64,9 @@ class RenderCrashPolicy(
      *
      * Narrowing needs room: faults from a repainting subtree arrive ~16ms apart,
      * all inside one window, while the loop spends one fault to rebuild plus one
-     * per suspect. Counting those would escalate and dispose the window before
-     * the culprit was found.
+     * per suspect. The bounded quarantine-settle interval also refunds stale work
+     * from the subtree being removed. Counting either kind would escalate and
+     * dispose the window before the culprit was found.
      *
      * It removes exactly that one fault rather than clearing the deque, and the
      * difference matters. Clearing made [Escalate][WindowExceptionRoute.Escalate]
