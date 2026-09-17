@@ -1,6 +1,21 @@
 package ai.rever.boss.plugin.browser
 
+import com.teamdev.jxbrowser.browser.callback.BrowserCallback
+import com.teamdev.jxbrowser.browser.callback.SaveAsPdfCallback
 import java.nio.file.Path
+
+/** The extension policy attached to each browser save callback. */
+internal fun requiredExtensionFor(callbackType: Class<out BrowserCallback>): String? =
+    when (callbackType) {
+        SaveAsPdfCallback::class.java -> "pdf"
+        else -> null
+    }
+
+/** Treat both an existing target and an indeterminate filesystem answer as a collision. */
+internal fun targetExistsOrUnknown(
+    path: Path,
+    notExists: (Path) -> Boolean,
+): Boolean = !notExists(path)
 
 /**
  * Pick the path that may actually be written, including any [requiredExtension].
@@ -12,9 +27,9 @@ import java.nio.file.Path
  * cancelling refuses the save. A different name is resolved by the same rule before it can leave.
  *
  * [pick] and [targetExists] are parameters because the native panel needs a display, while this
- * state transition must remain testable on every CI platform. An exception checking the target is
- * allowed to escape to `NativeFileDialogs.answerOnce`, whose fail-closed path cancels the browser
- * callback.
+ * state transition must remain testable on every CI platform. The production probe treats an
+ * indeterminate filesystem answer as a collision; a `SecurityException` is allowed to escape to
+ * `NativeFileDialogs.answerOnce`, whose fail-closed path cancels the browser callback.
  */
 internal fun chooseSaveTarget(
     suggestedFileName: String,

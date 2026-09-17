@@ -271,10 +271,11 @@ class NativeFileDialogsTest {
                 targetExists = { it == actualTarget },
             ) { fileName, directory ->
                 suggestions += fileName to directory
-                picks.removeFirst()
+                picks.removeFirstOrNull()
             }
 
         assertEquals(actualTarget, result)
+        assertTrue(picks.isEmpty(), "the policy must stop after the confirmed target")
         assertEquals(
             listOf("initial.pdf" to "downloads", "report.pdf" to selected.parent.toString()),
             suggestions,
@@ -294,9 +295,63 @@ class NativeFileDialogsTest {
                 suggestedDirectory = "reports",
                 requiredExtension = "pdf",
                 targetExists = { it == actualTarget },
-            ) { _, _ -> picks.removeFirst() }
+            ) { _, _ -> picks.removeFirstOrNull() }
 
         assertEquals(null, result, "cancel must not fall through to the unconfirmed target")
+        assertTrue(picks.isEmpty())
+    }
+
+    @Test
+    fun `cancelling the first required-extension panel refuses the save`() {
+        var probes = 0
+
+        val result =
+            chooseSaveTarget(
+                suggestedFileName = "report",
+                suggestedDirectory = "reports",
+                requiredExtension = "pdf",
+                targetExists = {
+                    probes += 1
+                    true
+                },
+            ) { _, _ -> null }
+
+        assertEquals(null, result)
+        assertEquals(0, probes, "cancellation must not manufacture or probe a target")
+    }
+
+    @Test
+    fun `renaming to another colliding target can reach a third panel`() {
+        val first = Paths.get("reports", "report")
+        val second = Paths.get("reports", "renamed")
+        val confirmed = Paths.get("reports", "final.pdf")
+        val picks = mutableListOf<Path?>(first, second, confirmed)
+        val collisions = setOf(pathWithExtension(first, "pdf"), pathWithExtension(second, "pdf"))
+
+        val result =
+            chooseSaveTarget(
+                suggestedFileName = "report",
+                suggestedDirectory = "reports",
+                requiredExtension = "pdf",
+                targetExists = { it in collisions },
+            ) { _, _ -> picks.removeFirstOrNull() }
+
+        assertEquals(confirmed, result)
+        assertTrue(picks.isEmpty(), "the third accepted target must terminate the loop")
+    }
+
+    @Test
+    fun `save-as-pdf callback requires the pdf extension`() {
+        assertEquals("pdf", requiredExtensionFor(SaveAsPdfCallback::class.java))
+        assertEquals(null, requiredExtensionFor(SaveFileCallback::class.java))
+    }
+
+    @Test
+    fun `an indeterminate disk probe is treated as a collision`() {
+        val target = Paths.get("reports", "report.pdf")
+
+        assertTrue(targetExistsOrUnknown(target) { false })
+        assertFalse(targetExistsOrUnknown(target) { true })
     }
 
     @Test

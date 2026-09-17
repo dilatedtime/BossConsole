@@ -160,6 +160,7 @@ object NativeFileDialogs {
                 suggestedDirectory = params.suggestedDirectory(),
                 extensions = params.acceptableExtensions(),
                 acceptAll = params.acceptAll(),
+                callbackType = SaveFileCallback::class.java,
             )
         },
         open = action::save,
@@ -181,7 +182,7 @@ object NativeFileDialogs {
                 // off a file Chromium is about to write PDF bytes into. Supplying the required
                 // extension here also makes showSave re-present an existing appended target,
                 // so the native panel confirms the file Chromium will actually replace.
-                requiredExtension = PDF,
+                callbackType = SaveAsPdfCallback::class.java,
             )
         },
         open = action::save,
@@ -281,13 +282,15 @@ private fun showSave(
     suggestedDirectory: String,
     extensions: List<String>,
     acceptAll: Boolean,
-    requiredExtension: String? = null,
+    callbackType: Class<out BrowserCallback>,
 ): Path? =
     chooseSaveTarget(
         suggestedFileName = suggestedFileName,
         suggestedDirectory = suggestedDirectory,
-        requiredExtension = requiredExtension,
-        targetExists = Files::exists,
+        requiredExtension = requiredExtensionFor(callbackType),
+        // Files.notExists is false when the answer is unknown. Inverting it deliberately
+        // re-presents that target instead of risking an overwrite without confirmation.
+        targetExists = { targetExistsOrUnknown(it, Files::notExists) },
     ) { nextFileName, nextDirectory ->
         showNativeSaveDialog(
             suggestedFileName = nextFileName,
