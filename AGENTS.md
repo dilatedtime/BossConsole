@@ -86,7 +86,7 @@ explicit set wins if a malformed or hand-built patch names one key in both colle
 sort removed keys for deterministic bytes. Older receivers safely ignore field 4; they retain a
 stale property until a full tree arrives, which is the existing failure rather than a new one.
 
-`NodeUpdated` is a manually implemented value class rather than a data class now because
+`NodeUpdated` is a manually implemented plain class rather than a data class now because
 `boss-ui-sdk` is published to external runtimes. Keep its original three-argument constructor,
 `component1` through `component3`, `copy`, and generated `copy$default` JVM descriptors. New code
 that needs to alter the removal set uses the four-argument constructor or

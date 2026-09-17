@@ -463,6 +463,9 @@ class WidgetDiffEngineTest {
                 WidgetModifier::class.java,
             )
         val copy = type.getDeclaredMethod("copy", String::class.java, Map::class.java, WidgetModifier::class.java)
+        val component1 = type.getDeclaredMethod("component1")
+        val component2 = type.getDeclaredMethod("component2")
+        val component3 = type.getDeclaredMethod("component3")
         val copyDefault =
             type.getDeclaredMethod(
                 "copy\$default",
@@ -479,6 +482,9 @@ class WidgetDiffEngineTest {
         assertTrue(update.removedProperties.isEmpty())
         assertEquals(type, copy.returnType)
         assertEquals(type, copyDefault.returnType)
+        assertEquals(String::class.java, component1.returnType)
+        assertEquals(Map::class.java, component2.returnType)
+        assertEquals(WidgetModifier::class.java, component3.returnType)
     }
 
     private fun propertyTree(properties: Map<String, String>): WidgetTree =

@@ -43,8 +43,10 @@ object IpcVersion {
      * - 1.0.0 - initial Phase 0 contract. The terminal grid /
      *   cursor / scrollback / shell-event / modifier-aware-input / theme
      *   RPCs are defined in `services/terminal.proto` as reserved
-     *   scaffolding but are not implemented by the host. A future minor
-     *   bump beyond 1.1.0 is required before any plugin may rely on them; see
+     *   scaffolding but are not implemented by the host. A global IPC version
+     *   bump is not a capability signal for this reserved surface; plugins may
+     *   rely on it only after a concrete host implementation advertises a
+     *   terminal-specific capability. See
      *   issue #743 for the rollback rationale (terminal-tab pivoted to
      *   in-process in PR #742).
      */
