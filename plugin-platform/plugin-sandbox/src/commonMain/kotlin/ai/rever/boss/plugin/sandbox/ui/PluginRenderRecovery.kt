@@ -53,8 +53,11 @@ import java.util.concurrent.ConcurrentHashMap
  * Step 2 suspects **one** plugin at a time, not all of them, and corrects itself.
  * A newly quarantined subtree gets [SUSPECT_SETTLE_MILLIS] to leave Compose's
  * in-flight measure and layout work. Faults already queued during that bounded
- * interval keep the same suspect held. If the fault recurs after the interval,
- * that suspect was innocent: it is released and the next one is tried. The cycle
+ * interval keep the same suspect held and report [Outcome.Settling], which is not
+ * visible quarantine progress. If the fault recurs after the interval, that
+ * suspect was innocent: it is released and the next one is tried. The host crash
+ * policy bounds how long settling faults may be refunded across the whole burst,
+ * so a large candidate set cannot make honest escalation unreachable. The cycle
  * ends when the exceptions stop, which leaves exactly the culprit quarantined.
  *
  * Quarantining everything at once was the first attempt and it was wrong in
@@ -184,27 +187,32 @@ object PluginRenderRecovery {
     ): Outcome {
         val affected = mountedPlugins().toSet()
         val recentlyRebuilt = lastRebuildAt != 0L && now - lastRebuildAt <= REBUILD_GRACE_MILLIS
+        val currentSuspect = suspect
+        val quarantineStartedAt = lastRebuildAt
+        val settleElapsed = now - quarantineStartedAt
         val settlingSuspect =
-            suspect?.takeIf {
-                val elapsed = now - lastRebuildAt
-                elapsed in 0..SUSPECT_SETTLE_MILLIS
+            if (currentSuspect != null && settleElapsed in 0..SUSPECT_SETTLE_MILLIS) {
+                currentSuspect
+            } else {
+                null
             }
         return when {
             settlingSuspect != null -> {
-                // Return Quarantined again so the host refunds this bounded fault
-                // and repaints, while its per-message gate suppresses a duplicate
-                // toast. Do not update lastRebuildAt here: sliding the deadline
-                // would let a hot fault stream defeat the crash circuit breaker.
+                // Settling is separate from Quarantined because the registry and
+                // generation did not change. The host may refund it while the
+                // burst deadline is open, but must not sweep-repaint every window.
+                // Do not update lastRebuildAt here: sliding the per-suspect deadline
+                // would let a hot fault stream hold one suspect forever.
                 logger.debug(
                     LogCategory.UI,
                     "Render fault arrived while quarantine was settling - keeping the current suspect",
                     mapOf(
                         "suspect" to settlingSuspect,
-                        "elapsedMillis" to (now - lastRebuildAt).toString(),
+                        "elapsedMillis" to settleElapsed.toString(),
                         "errorType" to error::class.simpleName.orEmpty(),
                     ),
                 )
-                Outcome.Quarantined(setOf(settlingSuspect))
+                Outcome.Settling(setOf(settlingSuspect))
             }
 
             affected.isEmpty() -> {
@@ -356,6 +364,11 @@ object PluginRenderRecovery {
 
         /** The rebuild did not help; this plugin is being held responsible for now. */
         data class Quarantined(
+            val plugins: Set<String>,
+        ) : Outcome
+
+        /** Queued work from a just-quarantined subtree is still draining. */
+        data class Settling(
             val plugins: Set<String>,
         ) : Outcome
 

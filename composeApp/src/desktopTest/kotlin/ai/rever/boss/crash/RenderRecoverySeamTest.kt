@@ -5,6 +5,7 @@ import ai.rever.boss.plugin.sandbox.ui.PluginRenderRecovery
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -42,10 +43,25 @@ class RenderRecoverySeamTest {
         val policy = RenderCrashPolicy(now = { 0L })
         policy.recordFailureAndShouldContain()
 
-        val counted = noteRecoveryOutcome(policy, PluginRenderRecovery.Outcome.Unexplained)
+        val visibleProgress = noteRecoveryOutcome(policy, PluginRenderRecovery.Outcome.Unexplained)
 
-        assertTrue(!counted, "Unexplained is not progress")
+        assertTrue(!visibleProgress, "Unexplained is not progress")
         assertTrue(policy.recentFailureCount() == 1, "an unproductive fault must stay counted")
+    }
+
+    @Test
+    fun `settling refunds queued work without requesting another repaint`() {
+        val policy = RenderCrashPolicy(now = { 0L })
+        policy.recordFailureAndShouldContain()
+
+        val visibleProgress =
+            noteRecoveryOutcome(
+                policy,
+                PluginRenderRecovery.Outcome.Settling(setOf("plugin.c")),
+            )
+
+        assertTrue(!visibleProgress, "settling changed no registry or generation state")
+        assertTrue(policy.recentFailureCount() == 0, "early queued work should still be refunded")
     }
 
     /**
@@ -90,6 +106,47 @@ class RenderRecoverySeamTest {
             escalatedAt != null,
             "a permanently broken scene never escalated - the app would spin forever, " +
                 "which is the failure RenderCrashPolicy exists to prevent",
+        )
+    }
+
+    @Test
+    fun `a large mounted set cannot refund settling forever`() {
+        for (index in plugins.size until 32) {
+            PluginRenderRecovery.registerMounted("plugin.$index")
+        }
+        var now = 0L
+        val policy = RenderCrashPolicy(now = { now })
+        var escalatedAt: Long? = null
+        val expectedSuspects = PluginRenderRecovery.mountedPlugins().toSet()
+        val triedSuspects = mutableSetOf<String>()
+
+        while (now <= 48_000 && escalatedAt == null) {
+            val route = decideWindowExceptionRoute(error, attributedPluginId = null, policy = policy)
+            if (route == WindowExceptionRoute.Escalate) {
+                escalatedAt = now
+                break
+            }
+            val outcome = PluginRenderRecovery.onUnattributedRenderException(error, now = now)
+            if (outcome is PluginRenderRecovery.Outcome.Quarantined) triedSuspects += outcome.plugins
+            noteRecoveryOutcome(policy, outcome)
+            now += 16
+        }
+
+        val escalationTime =
+            assertNotNull(
+                escalatedAt,
+                "32 mounted plugins kept refunding a permanent fault for 48 seconds",
+            )
+        assertTrue(
+            triedSuspects.containsAll(expectedSuspects),
+            "the bounded allowance expired before one complete narrowing pass: tried ${triedSuspects.size}/32",
+        )
+        val escalationCeiling =
+            RenderCrashPolicy.DEFAULT_WINDOW_MILLIS +
+                (RenderCrashPolicy.DEFAULT_MAX_FAILURES + 1) * 16L
+        assertTrue(
+            escalationTime <= escalationCeiling,
+            "a continuous corrupt burst should escalate by $escalationCeiling ms, got $escalatedAt",
         )
     }
 
@@ -151,9 +208,12 @@ class RenderRecoverySeamTest {
         }
 
         assertTrue(escalatedAt != null, "settling must not turn containment into an infinite loop")
+        val escalationCeiling =
+            RenderCrashPolicy.DEFAULT_WINDOW_MILLIS +
+                (RenderCrashPolicy.DEFAULT_MAX_FAILURES + 1) * 16L
         assertTrue(
-            now - 1_000 <= PluginRenderRecovery.REBUILD_GRACE_MILLIS,
-            "a corrupt scene should fail honestly inside one rebuild-grace interval; " +
+            now - 1_000 <= escalationCeiling,
+            "a corrupt scene should fail honestly by its burst deadline; " +
                 "got frame $escalatedAt at ${now - 1_000} ms",
         )
     }

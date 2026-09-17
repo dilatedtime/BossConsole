@@ -148,7 +148,7 @@ class PluginRenderRecoveryTest {
 
         val outcome = PluginRenderRecovery.onUnattributedRenderException(error, now = 2_016)
 
-        assertIs<PluginRenderRecovery.Outcome.Quarantined>(outcome)
+        assertIs<PluginRenderRecovery.Outcome.Settling>(outcome)
         assertEquals(setOf("plugin.b"), outcome.plugins, "queued work must not acquit the actual culprit")
         assertTrue(PluginCrashRegistry.hasCrashed("plugin.b"), "the culprit must remain on its fallback")
         assertTrue(!PluginCrashRegistry.hasCrashed("plugin.a"), "an innocent plugin must not be cycled in")
@@ -165,7 +165,7 @@ class PluginRenderRecoveryTest {
 
         assertEquals(
             setOf("plugin.a"),
-            assertIs<PluginRenderRecovery.Outcome.Quarantined>(outcome).plugins,
+            assertIs<PluginRenderRecovery.Outcome.Settling>(outcome).plugins,
             "disposed mount bookkeeping must not turn an in-flight plugin fault into a host fault",
         )
         assertTrue(PluginCrashRegistry.hasCrashed("plugin.a"), "the quarantined culprit must remain held")
@@ -180,7 +180,7 @@ class PluginRenderRecoveryTest {
 
         listOf(2_016L, 2_100L, 2_249L, 2_250L).forEach { now ->
             val settling = PluginRenderRecovery.onUnattributedRenderException(error, now)
-            assertEquals(setOf("plugin.b"), assertIs<PluginRenderRecovery.Outcome.Quarantined>(settling).plugins)
+            assertEquals(setOf("plugin.b"), assertIs<PluginRenderRecovery.Outcome.Settling>(settling).plugins)
         }
         val afterDeadline = PluginRenderRecovery.onUnattributedRenderException(error, now = 2_251)
 
@@ -201,7 +201,7 @@ class PluginRenderRecoveryTest {
         val settling = PluginRenderRecovery.onUnattributedRenderException(error, now = 2_250)
         val expired = PluginRenderRecovery.onUnattributedRenderException(error, now = 2_251)
 
-        assertIs<PluginRenderRecovery.Outcome.Quarantined>(settling)
+        assertIs<PluginRenderRecovery.Outcome.Settling>(settling)
         assertIs<PluginRenderRecovery.Outcome.Unexplained>(expired)
         assertTrue(!PluginCrashRegistry.hasCrashed("plugin.a"), "an innocent plugin must be restored")
     }
