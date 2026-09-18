@@ -198,8 +198,13 @@ class RenderRecoverySeamTest {
         var now = 1_000L
         val policy = RenderCrashPolicy(now = { now })
         var escalatedAt: Int? = null
+        val escalationCeiling =
+            RenderCrashPolicy.DEFAULT_WINDOW_MILLIS +
+                (RenderCrashPolicy.DEFAULT_MAX_FAILURES + 1) * 16L
+        val maximumFrames =
+            (escalationCeiling / 16L + RenderCrashPolicy.DEFAULT_MAX_FAILURES + 2).toInt()
 
-        for (frameNumber in 1..200) {
+        for (frameNumber in 1..maximumFrames) {
             if (frame(policy, now) == WindowExceptionRoute.Escalate) {
                 escalatedAt = frameNumber
                 break
@@ -208,9 +213,6 @@ class RenderRecoverySeamTest {
         }
 
         assertTrue(escalatedAt != null, "settling must not turn containment into an infinite loop")
-        val escalationCeiling =
-            RenderCrashPolicy.DEFAULT_WINDOW_MILLIS +
-                (RenderCrashPolicy.DEFAULT_MAX_FAILURES + 1) * 16L
         assertTrue(
             now - 1_000 <= escalationCeiling,
             "a corrupt scene should fail honestly by its burst deadline; " +
