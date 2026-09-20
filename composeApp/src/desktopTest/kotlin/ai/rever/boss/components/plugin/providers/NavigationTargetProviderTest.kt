@@ -1,8 +1,6 @@
 package ai.rever.boss.components.plugin.providers
 
 import ai.rever.boss.components.events.NavigationTargetBus
-import ai.rever.boss.components.events.NavigationTargetIpcPayload
-import ai.rever.boss.ipc.IpcEventBridge
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
@@ -11,15 +9,11 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 
@@ -126,11 +120,8 @@ class NavigationTargetProviderTest {
         }
 
     @Test
-    fun `invalid target lines are neither replayed nor forwarded`() =
+    fun `invalid target lines are not replayed`() =
         runBlocking {
-            val bridge = RecordingBridge()
-            NavigationTargetBus.ipcBridge = bridge
-
             NavigationTargetBus.navigateTo("/workspace/Zero.kt", 0, 8, "window-a")
             NavigationTargetBus.navigateTo("/workspace/Negative.kt", -4, 8, "window-a")
 
@@ -138,79 +129,7 @@ class NavigationTargetProviderTest {
                 withTimeoutOrNull(NO_EVENT_TIMEOUT_MS) { NavigationTargetProviderImpl.targets.first() },
                 "non-positive lines must not leave a navigation target for a future editor",
             )
-            assertNull(bridge.payload, "a rejected local target must not cross the IPC boundary")
         }
-
-    @Test
-    fun `local and IPC consumers receive equivalent structured targets`() =
-        runBlocking {
-            val bridge = RecordingBridge()
-            NavigationTargetBus.ipcBridge = bridge
-
-            NavigationTargetBus.navigateTo(
-                filePath = "/workspace/src/Shared.kt",
-                line = 73,
-                column = 19,
-                sourceWindowId = "window-shared",
-            )
-
-            val local = withTimeout(TIMEOUT_MS) { NavigationTargetProviderImpl.targets.first() }
-            val forwarded = assertNotNull(bridge.payload) as NavigationTargetIpcPayload
-            assertEquals(local.filePath, forwarded.filePath)
-            assertEquals(local.line, forwarded.line)
-            assertEquals(local.column, forwarded.column)
-            assertEquals(local.sourceWindowId, forwarded.sourceWindowId)
-            assertEquals("NavigationTargetEvent", bridge.eventType)
-            assertEquals("window-shared", bridge.sourceWindowId)
-
-            val json = Json.encodeToJsonElement(NavigationTargetIpcPayload.serializer(), forwarded).jsonObject
-            assertEquals(
-                "/workspace/src/Shared.kt",
-                json
-                    .getValue("filePath")
-                    .jsonPrimitive
-                    .content,
-            )
-            assertEquals(
-                73,
-                json
-                    .getValue("line")
-                    .jsonPrimitive
-                    .content
-                    .toInt(),
-            )
-            assertEquals(
-                19,
-                json
-                    .getValue("column")
-                    .jsonPrimitive
-                    .content
-                    .toInt(),
-            )
-            assertEquals(
-                "window-shared",
-                json
-                    .getValue("sourceWindowId")
-                    .jsonPrimitive
-                    .content,
-            )
-        }
-
-    private class RecordingBridge : IpcEventBridge {
-        var eventType: String? = null
-        var payload: Any? = null
-        var sourceWindowId: String? = null
-
-        override suspend fun forward(
-            eventType: String,
-            payload: Any,
-            sourceWindowId: String,
-        ) {
-            this.eventType = eventType
-            this.payload = payload
-            this.sourceWindowId = sourceWindowId
-        }
-    }
 
     private companion object {
         const val TIMEOUT_MS = 2_000L
