@@ -62,8 +62,11 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Queued work can outlive the suspect's final mounted boundary, so settling takes
  * precedence over an empty mounted set for the same 250 ms. A coincident host fault
- * may inherit that plugin-shaped verdict briefly; after the fixed deadline, another
- * fault releases the stale suspect and is reported as host-related.
+ * may inherit that plugin-shaped verdict briefly. The stale suspect is released only
+ * once the next fault is its own incident - past the rebuild grace - because a
+ * straggler from the suspect's own draining subtree can still be in flight right
+ * after the settle bound, and releasing on that one would un-quarantine the culprit
+ * with nothing mounted to self-correct.
  *
  * Quarantining everything at once was the first attempt and it was wrong in
  * practice, not just in theory. Against the real crash it disabled four plugins
@@ -225,7 +228,18 @@ object PluginRenderRecovery {
                 // reaching this branch means the fixed settle interval has expired.
                 // Removal did not cure the scene, so do not strand an innocent plugin
                 // in its fallback while subsequent host faults keep arriving.
-                releaseSuspectAsInnocent()
+                //
+                // But only once the fault is its own incident. Quarantining the last
+                // content-rendering plugin empties the mounted set, so a straggler
+                // from the suspect's own draining subtree - one GC pause past the
+                // settle bound - can arrive here while it is still within
+                // [REBUILD_GRACE_MILLIS] of the quarantine rebuild. Releasing the
+                // suspect then would un-quarantine the actual culprit, and with
+                // nothing mounted there is no next candidate to self-correct: the
+                // same loop would re-quarantine and re-release it until the policy
+                // escalates. A fault past the grace is a separate incident, and
+                // that is the moment the held suspect is proven innocent.
+                if (!recentlyRebuilt) releaseSuspectAsInnocent()
                 notPluginRelated(error)
             }
 

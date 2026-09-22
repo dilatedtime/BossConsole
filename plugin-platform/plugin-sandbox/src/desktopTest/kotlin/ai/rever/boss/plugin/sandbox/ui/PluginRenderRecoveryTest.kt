@@ -170,8 +170,20 @@ class PluginRenderRecoveryTest {
         )
         assertTrue(PluginCrashRegistry.hasCrashed("plugin.a"), "the quarantined culprit must remain held")
 
+        // Still inside the rebuild grace of the quarantine: this could be a straggler
+        // from the suspect's own draining subtree, so it must not un-quarantine it.
         assertIs<PluginRenderRecovery.Outcome.NotPluginRelated>(
             PluginRenderRecovery.onUnattributedRenderException(error, now = 2_251),
+        )
+        assertTrue(
+            PluginCrashRegistry.hasCrashed("plugin.a"),
+            "a fault inside the rebuild grace must not release the suspect it could belong to",
+        )
+
+        // Past the grace, the next fault is its own incident: the held suspect was
+        // innocent and must be released, or it would stay paused forever.
+        assertIs<PluginRenderRecovery.Outcome.NotPluginRelated>(
+            PluginRenderRecovery.onUnattributedRenderException(error, now = 1_000 + PluginRenderRecovery.REBUILD_GRACE_MILLIS + 1),
         )
         assertFalse(
             PluginCrashRegistry.hasCrashed("plugin.a"),
