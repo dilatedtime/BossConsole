@@ -5,12 +5,16 @@ import ai.rever.boss.components.misc.LoadingScreen
 import ai.rever.boss.components.misc.OfflineScreen
 import ai.rever.boss.services.auth.CoreAuthService
 import ai.rever.boss.services.auth.MagicLinkErrorService
+import ai.rever.boss.services.auth.PasskeyCallbackInbox
 import ai.rever.boss.services.auth.PasskeySessionEventHandler
 import ai.rever.boss.services.supabase.AuthService
+import ai.rever.boss.utils.AuthCallback
+import ai.rever.boss.utils.AuthCallbackParseResult
 import ai.rever.boss.utils.DeepLinkHandler
 import ai.rever.boss.utils.WindowFocusManager
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
+import ai.rever.boss.utils.parseAuthCallback
 import androidx.compose.runtime.*
 import androidx.compose.runtime.key
 import com.arkivanov.decompose.ComponentContext
@@ -40,92 +44,81 @@ fun ComponentContext.BossAppWithAuth(
         AuthService.initialize()
     }
 
-    // Handle deep links for email verification
+    // Consume OS deep links once at the root. Child screens receive only validated callbacks.
     val deepLink by DeepLinkHandler.deepLinkFlow.collectAsState()
 
     LaunchedEffect(deepLink) {
-        // Todo: Why this can not be in DeepLinkHandler itself, may be we can just have
-        //  LaunchedEffect here and rest of the code inside DeepLinkHandler
         deepLink?.let { uri ->
-            logger.debug(LogCategory.AUTH, "Received deep link in app", mapOf("uri" to uri))
-
-            // Bring window to front
+            // Never log the URI: email tokens and passkey session identifiers are credentials.
+            logger.debug(LogCategory.AUTH, "Received deep link in app")
             WindowFocusManager.bringToFront()
 
-            val sessionId =
-                try {
-                    val regex = Regex("sessionId=([^&]+)")
-                    regex.find(uri)?.groupValues?.get(1)
-                } catch (_: Exception) {
-                    logger.warn(LogCategory.AUTH, "Failed to extract sessionId from deep link", mapOf("uri" to uri))
-                    null
-                }
+            when (val parsed = parseAuthCallback(uri)) {
+                is AuthCallbackParseResult.Accepted -> {
+                    when (val callback = parsed.callback) {
+                        is AuthCallback.PasskeyRegistration -> {
+                            logger.info(LogCategory.AUTH, "Validated passkey registration callback")
+                            PasskeyCallbackInbox.publish(callback)
+                            PasskeySessionEventHandler.handleRegistrationCompleted(callback.sessionId)
+                        }
 
-            when {
-                uri.contains("passkey/registered") -> {
-                    sessionId?.let { id ->
-                        logger.info(LogCategory.AUTH, "Passkey registration completed", mapOf("sessionId" to id))
-                        PasskeySessionEventHandler.handleRegistrationCompleted(id)
-                    }
-                    DeepLinkHandler.clearDeepLink()
-                }
+                        is AuthCallback.PasskeyAuthentication -> {
+                            logger.info(LogCategory.AUTH, "Validated passkey authentication callback")
+                            PasskeyCallbackInbox.publish(callback)
 
-                uri.contains("passkey/authenticated") -> {
-                    sessionId?.let { id ->
-                        logger.info(LogCategory.AUTH, "Passkey authentication completed", mapOf("sessionId" to id))
+                            // The cross-device service is already polling. Trigger its existing
+                            // completion event immediately when this process tracks the session.
+                            coroutineScope.launch {
+                                if (PasskeySessionEventHandler.getSessionMetadata(callback.sessionId) != null) {
+                                    PasskeySessionEventHandler.handleAuthenticationCompleted(callback.sessionId)
+                                } else {
+                                    logger.warn(LogCategory.AUTH, "No metadata found for validated passkey session")
+                                }
+                            }
+                        }
 
-                        // Trigger the polling check to complete authentication
-                        coroutineScope.launch {
-                            // The CrossDeviceAuthService is already polling, but we can trigger
-                            // an immediate check when we receive the deep link
-                            val metadata = PasskeySessionEventHandler.getSessionMetadata(id)
-                            metadata?.let { session ->
-                                logger.debug(LogCategory.AUTH, "Checking authentication status", mapOf("sessionId" to id))
-
-                                // Notify that authentication completed
-                                PasskeySessionEventHandler.handleAuthenticationCompleted(id)
-                            } ?: run {
-                                logger.warn(LogCategory.AUTH, "No metadata found for session", mapOf("sessionId" to id))
+                        is AuthCallback.EmailVerification -> {
+                            logger.debug(
+                                LogCategory.AUTH,
+                                "Validated email verification callback",
+                                mapOf("type" to callback.type),
+                            )
+                            coroutineScope.launch {
+                                logger.info(LogCategory.AUTH, "Starting magic link authentication process")
+                                AuthService.verifyEmail(callback.token, callback.type).fold(
+                                    onSuccess = {
+                                        logger.info(LogCategory.AUTH, "Magic link authentication successful")
+                                        if (authState is AuthService.AuthState.NotAuthenticated) {
+                                            AuthService.initialize()
+                                        }
+                                    },
+                                    onFailure = { error ->
+                                        logger.error(
+                                            LogCategory.AUTH,
+                                            "Magic link authentication failed",
+                                            error = error,
+                                        )
+                                        MagicLinkErrorService.setError(
+                                            error.message ?: "Magic link verification failed",
+                                        )
+                                    },
+                                )
                             }
                         }
                     }
                     DeepLinkHandler.clearDeepLink()
                 }
 
-                uri.contains("auth/verify") -> {
-                    val token = DeepLinkHandler.extractVerificationToken(uri)
-                    val type = DeepLinkHandler.extractVerificationType(uri) ?: "magiclink"
-                    token?.let { token ->
-                        logger.debug(LogCategory.AUTH, "Extracted verification token", mapOf("type" to type))
-                        coroutineScope.launch {
-                            // Handle magic link authentication
-                            logger.info(LogCategory.AUTH, "Starting magic link authentication process")
-
-                            AuthService.verifyEmail(token, type).fold(
-                                onSuccess = {
-                                    logger.info(LogCategory.AUTH, "Magic link authentication successful")
-                                    if (authState is AuthService.AuthState.NotAuthenticated) {
-                                        // Trigger a refresh to check if user can now sign in
-                                        AuthService.initialize()
-                                    }
-                                },
-                                onFailure = { error ->
-                                    logger.error(LogCategory.AUTH, "Magic link authentication failed", error = error)
-                                    // Set error so UI can display it
-                                    MagicLinkErrorService.setError(
-                                        error.message ?: "Magic link verification failed",
-                                    )
-                                },
-                            )
-                        }
-                    }
-
+                is AuthCallbackParseResult.Rejected -> {
+                    logger.warn(
+                        LogCategory.AUTH,
+                        "Rejected malformed authentication callback",
+                        mapOf("route" to parsed.route.name, "reason" to parsed.reason.name),
+                    )
                     DeepLinkHandler.clearDeepLink()
                 }
 
-                else -> {
-                    // Route non-auth deep links (boss://url, boss://file, boss://folder, boss://terminal, boss://workspace)
-                    // back to DeepLinkHandler for processing
+                AuthCallbackParseResult.NotAuthCallback -> {
                     logger.debug(LogCategory.AUTH, "Routing non-auth deep link to DeepLinkHandler")
                     DeepLinkHandler.processDeepLink(uri)
                     DeepLinkHandler.clearDeepLink()

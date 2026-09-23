@@ -9,7 +9,6 @@ import ai.rever.boss.components.dialogs.CrossDeviceAuthenticationDialog
 import ai.rever.boss.plugin.ui.BossThemeController
 import ai.rever.boss.services.auth.MagicLinkErrorService
 import ai.rever.boss.services.supabase.AuthService
-import ai.rever.boss.utils.DeepLinkHandler
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.viewmodels.LoginViewModel
@@ -68,17 +67,6 @@ fun AuthScreenContainer(onLoginSuccess: () -> Unit) {
             else -> {
                 // Keep on current screen for all other states
             }
-        }
-    }
-
-    // Handle deep links while on magic link waiting screen
-    val deepLink by DeepLinkHandler.deepLinkFlow.collectAsState()
-    LaunchedEffect(deepLink, currentScreen) {
-        val link = deepLink
-        if (currentScreen == AuthScreen.MAGIC_LINK_WAITING && link != null && link.contains("auth/verify")) {
-            logger.debug(LogCategory.AUTH, "Received deep link while on waiting screen")
-            // Deep link will be processed by BossAppWithAuth, just clear it here to avoid reprocessing
-            DeepLinkHandler.clearDeepLink()
         }
     }
 

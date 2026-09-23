@@ -3,7 +3,8 @@ package ai.rever.boss.components.auth.screens
 import ai.rever.boss.components.bars.horizontal.HorizontalBar
 import ai.rever.boss.layout.BossChrome
 import ai.rever.boss.plugin.ui.BossTheme
-import ai.rever.boss.utils.DeepLinkHandler
+import ai.rever.boss.services.auth.PasskeyCallbackInbox
+import ai.rever.boss.utils.AuthCallback
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogSanitizer
@@ -24,6 +25,60 @@ import kotlinx.coroutines.delay
 
 private val passkeyBrowserLogger = BossLogger.forComponent("PasskeyBrowserScreen")
 
+internal enum class PasskeyCallbackKind {
+    REGISTRATION,
+    AUTHENTICATION,
+}
+
+internal fun matchesPasskeyCallback(
+    callback: AuthCallback,
+    expectedKind: PasskeyCallbackKind,
+    expectedSessionId: String,
+): Boolean =
+    when (callback) {
+        is AuthCallback.PasskeyRegistration -> {
+            expectedKind == PasskeyCallbackKind.REGISTRATION && callback.sessionId == expectedSessionId
+        }
+
+        is AuthCallback.PasskeyAuthentication -> {
+            expectedKind == PasskeyCallbackKind.AUTHENTICATION && callback.sessionId == expectedSessionId
+        }
+
+        is AuthCallback.EmailVerification -> {
+            false
+        }
+    }
+
+internal fun passkeyCallbackKindForBrowserUrl(url: String): PasskeyCallbackKind? {
+    val schemeEnd = url.indexOf("://")
+    return if (schemeEnd <= 0) {
+        null
+    } else {
+        val pathStart = url.indexOf('/', schemeEnd + 3)
+        val pathEnd =
+            url
+                .indexOfAny(charArrayOf('?', '#'), pathStart.coerceAtLeast(0))
+                .takeIf { it >= 0 } ?: url.length
+        when {
+            pathStart < 0 -> {
+                null
+            }
+
+            url.substring(pathStart, pathEnd) == "/functions/v1/passkey/register/mobile" -> {
+                PasskeyCallbackKind.REGISTRATION
+            }
+
+            url.substring(pathStart, pathEnd) == "/functions/v1/passkey/auth/mobile" -> {
+                PasskeyCallbackKind.AUTHENTICATION
+            }
+
+            else -> {
+                null
+            }
+        }
+    }
+}
+
 /**
  * Screen that embeds a browser view for WebAuthn passkey registration/authentication
  *
@@ -42,25 +97,21 @@ fun PasskeyBrowserScreen(
 
     passkeyBrowserLogger.debug(LogCategory.AUTH, "Displaying WebAuthn page", mapOf("url" to LogSanitizer.maskUriParams(url)))
 
-    // Monitor for deep link callbacks indicating success
-    val deepLink by DeepLinkHandler.deepLinkFlow.collectAsState()
-    LaunchedEffect(deepLink) {
-        val link = deepLink
-        if (link != null && (
-                link.contains("auth/verify") ||
-                    link.contains("passkey/registered") ||
-                    link.contains("passkey/authenticated")
-            )
+    // The root collector publishes only structurally validated passkey callbacks here. Match the
+    // operation and session as well, so another auth flow cannot close this browser as successful.
+    val callback by PasskeyCallbackInbox.callback.collectAsState()
+    LaunchedEffect(callback) {
+        val received = callback
+        val expectedCallback = passkeyCallbackKindForBrowserUrl(url)
+        if (
+            received != null &&
+            expectedCallback != null &&
+            matchesPasskeyCallback(received, expectedCallback, sessionId)
         ) {
-            passkeyBrowserLogger.info(LogCategory.AUTH, "Deep link received, operation successful")
+            passkeyBrowserLogger.info(LogCategory.AUTH, "Matching passkey callback received")
 
-            // Add small delay for visual feedback
             delay(500)
-
-            // Clear the deep link
-            DeepLinkHandler.clearDeepLink()
-
-            // Trigger success callback
+            PasskeyCallbackInbox.consume(received)
             onSuccess()
         }
     }
