@@ -158,12 +158,10 @@ Assert-True ($plain -like "a'b!c*%20e") "mixed quote/bang/space argument survive
 # Inline the CURRENT :detect_and_route from boss.bat. The function reaches
 # :detect_url and :detect_domain by goto from inside, so the inlined block
 # runs to end-of-file. The argument passed in ("xxxxx!yyyyy") contains a
-# literal ! but no http(s)://, no TLD match and no existing file/folder,
-# so :detect_and_route falls through to the "Could not detect type" branch
-# which echoes the argument verbatim. With EnableDelayedExpansion on (the
-# pre-#1059 default), the ! would be eaten at `set "arg=%~1"` and the echo
-# would print "Error: Could not determine type for: xxxxyyyyy"; with
-# DisableDelayedExpansion the ! survives and the probe passes.
+# literal ! but no http(s)://, no TLD match and no existing file/folder, so
+# :detect_and_route must take the no-match branch. That branch deliberately
+# stopped echoing the raw argument in #1570: an unmatched shell metacharacter
+# must not be expanded into a second command line merely to explain the error.
 $detectStartIdx = -1
 for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -eq ':detect_and_route') { $detectStartIdx = $i; break }
@@ -191,13 +189,14 @@ Set-Content -Path $detectProbe -Value $detectBody -Encoding Ascii
 
 try {
     $detectOutput = & cmd.exe /c $detectProbe 2>&1 | ForEach-Object { "$_" }
-    $errLine = $detectOutput | Where-Object { $_ -like 'Error: Could not determine type for: *' } | Select-Object -First 1
+    $errLine = $detectOutput | Where-Object { $_ -like 'Error: Could not determine the supplied argument type.*' } | Select-Object -First 1
     if ($null -eq $errLine) {
-        Write-Error 'ASSERTION FAILED: No "Error: Could not determine type" line captured (probe did not reach the no-match branch)'
+        Write-Error 'ASSERTION FAILED: No static auto-detection error captured (probe did not reach the no-match branch)'
         exit 1
     }
-    Assert-True ($errLine -like 'Error: Could not determine type for: xxxxx!yyyyy') `
-        "literal ! survives the auto-detect path (got: $errLine)"
+    Assert-True ($errLine -eq 'Error: Could not determine the supplied argument type.') `
+        "the no-match diagnostic is static and does not re-expand caller data (got: $errLine)"
+    Assert-True ($detectOutput -contains 'ROUTE_EXIT=1') 'the unmatched bang argument returns the no-match exit code'
 } finally {
     Remove-Item $detectProbe -ErrorAction SilentlyContinue
 }

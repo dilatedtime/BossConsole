@@ -230,23 +230,19 @@ REM Exit with the matching endlocal at each branch below.
 setlocal DisableDelayedExpansion
 set "arg=%~1"
 
-REM Check if it's a URL (has http:// or https://)
-echo %arg% | findstr /i "^http://" >nul
-if %errorlevel%==0 goto :detect_url
-echo %arg% | findstr /i "^https://" >nul
-if %errorlevel%==0 goto :detect_url
+REM Keep the caller-controlled value inside quoted IF operands. Expanding it
+REM into `echo %arg% | findstr` let cmd.exe interpret &, |, >, < and ^ as a
+REM second command line before findstr ever saw the value (#1570).
+if /i "%arg:~0,7%"=="http://" goto :detect_url
+if /i "%arg:~0,8%"=="https://" goto :detect_url
 
-REM Check for common TLDs (looks like a domain)
-echo %arg% | findstr /i "\.com" >nul
-if %errorlevel%==0 goto :detect_domain
-echo %arg% | findstr /i "\.org" >nul
-if %errorlevel%==0 goto :detect_domain
-echo %arg% | findstr /i "\.net" >nul
-if %errorlevel%==0 goto :detect_domain
-echo %arg% | findstr /i "\.io" >nul
-if %errorlevel%==0 goto :detect_domain
-echo %arg% | findstr /i "\.dev" >nul
-if %errorlevel%==0 goto :detect_domain
+REM Check for common TLDs (looks like a domain). Quoted substitution keeps
+REM metacharacters as data and avoids a subprocess for every suffix.
+if /i not "%arg:.com=%"=="%arg%" goto :detect_domain
+if /i not "%arg:.org=%"=="%arg%" goto :detect_domain
+if /i not "%arg:.net=%"=="%arg%" goto :detect_domain
+if /i not "%arg:.io=%"=="%arg%" goto :detect_domain
+if /i not "%arg:.dev=%"=="%arg%" goto :detect_domain
 
 REM Check if it's a file or folder. Variables read inside a parenthesized
 REM block expand at parse time, before any set/call fills them, so the
@@ -256,13 +252,15 @@ REM top level instead. Without that, `boss ./file.txt` reaches
 REM boss://file?path= with an empty path.
 if exist "%arg%" goto :detect_file_or_folder
 
-REM Could not detect type
-echo Error: Could not determine type for: %arg%
+REM Do not echo the raw value here. This branch is exactly where an unmatched
+REM metacharacter payload lands, and expanding it into an ECHO line would
+REM reintroduce the command-injection sink after the classifier refused it.
+echo Error: Could not determine the supplied argument type.
 echo.
 echo Did you mean:
-echo   boss url %arg%      - Open as URL
-echo   boss file %arg%     - Open as file
-echo   boss folder %arg%   - Open as folder
+echo   boss url ^<value^>      - Open as URL
+echo   boss file ^<path^>      - Open as file
+echo   boss folder ^<path^>    - Open as folder
 echo.
 echo Run 'boss --help' for usage information
 endlocal
