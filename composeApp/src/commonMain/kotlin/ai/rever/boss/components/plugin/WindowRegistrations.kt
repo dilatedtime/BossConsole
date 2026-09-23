@@ -97,8 +97,10 @@ internal class WindowRegistrations {
             value: V,
         ) = synchronized(this) {
             if (!owner.admit(this)) return@synchronized
-            entries.removeAll { it.first === owner }
+            // Prepare BEFORE dropping the owner's previous entry: a prepare that throws must
+            // leave the live registration serving, not strand it with nothing published.
             val prepared = target.prepare(value)
+            entries.removeAll { it.first === owner }
             entries += owner to prepared
             target.publish(prepared)
         }
