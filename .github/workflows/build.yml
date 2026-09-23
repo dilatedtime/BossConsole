@@ -51,12 +51,15 @@ jobs:
       - name: Headless CLI launcher tests
         run: bash scripts/test/test-headless-cli.sh
 
-      - name: 🧪 boss.bat :urlencode injection regression (#1057)
+      - name: 🧪 boss.bat injection regressions (#1057, #1570)
         # The shipped Windows CLI shim interpolated the CLI argument into a
         # single-quoted PowerShell string; one quote in any argument executed
-        # attacker PowerShell. Source-shape checks run everywhere; the live
-        # probes need cmd.exe and skip where it is absent.
-        run: pwsh -NoProfile -File scripts/test/test-boss-bat-urlencode.ps1
+        # attacker PowerShell. Auto-detection also expanded its argument into
+        # an echo pipeline, where cmd.exe interpreted shell metacharacters.
+        # Source-shape checks run here; live probes need cmd.exe and skip.
+        run: |
+          pwsh -NoProfile -File scripts/test/test-boss-bat-urlencode.ps1
+          pwsh -NoProfile -File scripts/test/test-boss-bat-detect.ps1
 
       - name: 🧪 Release publish — TUS slice tests
         # Guards the byte-accurate chunk slicing in the release publish path
@@ -248,6 +251,13 @@ jobs:
           echo "Stopping any existing Kotlin daemons to avoid file handle issues"
           ./gradlew --stop || true
         shell: bash
+
+      - name: 🧪 Exercise boss.bat with cmd.exe (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          ./scripts/test/test-boss-bat-urlencode.ps1
+          ./scripts/test/test-boss-bat-detect.ps1
 
       - name: 🔨 Build and Test Application
         shell: bash
