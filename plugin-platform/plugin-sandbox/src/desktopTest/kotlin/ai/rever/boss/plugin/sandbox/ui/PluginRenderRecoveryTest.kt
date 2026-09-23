@@ -181,9 +181,13 @@ class PluginRenderRecoveryTest {
         )
 
         // Past the grace, the next fault is its own incident: the held suspect was
-        // innocent and must be released, or it would stay paused forever.
+        // innocent and must be released, or it would stay paused forever. Anchor
+        // the grace period on the quarantine at 2_000, which re-stamps lastRebuildAt.
         assertIs<PluginRenderRecovery.Outcome.NotPluginRelated>(
-            PluginRenderRecovery.onUnattributedRenderException(error, now = 1_000 + PluginRenderRecovery.REBUILD_GRACE_MILLIS + 1),
+            PluginRenderRecovery.onUnattributedRenderException(
+                error,
+                now = 2_000 + PluginRenderRecovery.REBUILD_GRACE_MILLIS + 1,
+            ),
         )
         assertFalse(
             PluginCrashRegistry.hasCrashed("plugin.a"),
