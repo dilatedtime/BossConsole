@@ -61,8 +61,8 @@ object AWTKeyboardInterceptor {
      * Browser print is the only host action that runs when the chord is let go of rather than
      * on its press. The fluck browser's native key callback also sees Cmd/Ctrl+P and
      * prints the page itself, and manual macOS testing found the AWT path alone did not open
-     * the preview. So the AWT press only arms it, and [cancelPendingNativePrint] disarms it when
-     * the native layer got there, which is how one press avoids printing twice. It remains armed
+     * the preview. So the AWT press only arms it, and [claimNativePrint] transfers ownership when
+     * the native layer gets there, which is how one press avoids printing twice. It remains armed
      * across modifier releases and fires only when the primary key comes up. That keeps a fast
      * Cmd-before-P release working without racing the native callback at the modifier boundary.
      * Future actions should continue to run on press: release delay is the bug #1568 removed.
@@ -71,9 +71,14 @@ object AWTKeyboardInterceptor {
     // identity needed after a modifier release. Native print cancellation can race the EDT.
     internal val heldShortcuts = HeldShortcutRegistry()
 
-    /** A native browser print already handled this press; a later AWT release must not print twice. */
-    internal fun cancelPendingNativePrint(windowId: String) {
-        heldShortcuts.disarmNativePrint(windowId)
+    /** Run [print] only when the native callback atomically wins this physical print press. */
+    internal fun claimNativePrint(
+        windowId: String,
+        print: () -> Unit,
+    ): Boolean {
+        if (!heldShortcuts.claimNativePrint(windowId)) return false
+        print()
+        return true
     }
 
     private var focusListener: java.beans.PropertyChangeListener? = null
@@ -362,6 +367,9 @@ object AWTKeyboardInterceptor {
      */
     internal fun handleKeyReleased(event: KeyEvent): Boolean {
         if (isModifierOnlyKey(event.keyCode)) {
+            // processKeyEvent already performed this update before dispatching here. Keep the
+            // idempotent call because tests and package-local callers exercise this entry point
+            // directly as the release boundary.
             heldShortcuts.modifierReleased(event)
             return false
         }

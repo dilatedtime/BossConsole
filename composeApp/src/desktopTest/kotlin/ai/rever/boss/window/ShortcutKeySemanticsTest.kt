@@ -401,7 +401,7 @@ class ShortcutKeySemanticsTest {
         assertEquals(2, printEventCount.get(), "the primary release fires it too")
 
         assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_PRESSED, KeyEvent.VK_P)))
-        AWTKeyboardInterceptor.cancelPendingNativePrint(windowId)
+        assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId) {})
         assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P)), "the release stays consumed")
         assertEquals(2, printEventCount.get(), "the native print took it, so AWT must not print again")
     }
@@ -411,10 +411,34 @@ class ShortcutKeySemanticsTest {
         useBindings(KeyBinding(actionId = KeymapActions.BROWSER_PRINT, key = "P", modifiers = listOf("Cmd")))
         assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_PRESSED, KeyEvent.VK_P)))
         assertFalse(dispatchKeyEvent(modifierRelease()))
-        AWTKeyboardInterceptor.cancelPendingNativePrint(windowId)
+        assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId) {})
         assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P, modifiers = 0)))
         assertEquals(0, printEventCount.get(), "a late native callback still owns the one print")
         assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+    }
+
+    @Test
+    fun `AWT release winning before native callback prints exactly once`() {
+        useBindings(KeyBinding(actionId = KeymapActions.BROWSER_PRINT, key = "P", modifiers = listOf("Cmd")))
+        var nativePrints = 0
+
+        assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_PRESSED, KeyEvent.VK_P)))
+        assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P)))
+        assertFalse(AWTKeyboardInterceptor.claimNativePrint(windowId) { nativePrints++ })
+
+        assertEquals(1, printEventCount.get() + nativePrints)
+    }
+
+    @Test
+    fun `native callback winning before AWT press prints exactly once`() {
+        useBindings(KeyBinding(actionId = KeymapActions.BROWSER_PRINT, key = "P", modifiers = listOf("Cmd")))
+        var nativePrints = 0
+
+        assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId) { nativePrints++ })
+        assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_PRESSED, KeyEvent.VK_P)))
+        assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P)))
+
+        assertEquals(1, printEventCount.get() + nativePrints)
     }
 
     @Test

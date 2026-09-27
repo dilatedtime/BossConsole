@@ -2961,12 +2961,12 @@ object FluckEngine {
                     if (keyCode == com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_P &&
                         usesNativePrintChord(ai.rever.boss.keymap.KeymapSettingsManager.currentSettings.value)
                     ) {
-                        shortcutWindowId?.let {
-                            ai.rever.boss.window.AWTKeyboardInterceptor
-                                .cancelPendingNativePrint(it)
-                        }
-                        if (!browser.isClosed) {
-                            browser.mainFrame().ifPresent { it.executeJavaScript<Any>(PRINT_BROWSER_SCRIPT) }
+                        if (shortcutWindowId != null) {
+                            ai.rever.boss.window.AWTKeyboardInterceptor.claimNativePrint(shortcutWindowId) {
+                                if (!browser.isClosed) {
+                                    browser.mainFrame().ifPresent { it.executeJavaScript<Any>(PRINT_BROWSER_SCRIPT) }
+                                }
+                            }
                         }
                         return@PressKeyCallback com.teamdev.jxbrowser.browser.callback.input.PressKeyCallback.Response
                             .suppress()

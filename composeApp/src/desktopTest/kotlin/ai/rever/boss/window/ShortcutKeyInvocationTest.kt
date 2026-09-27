@@ -66,9 +66,9 @@ class ShortcutKeyInvocationTest {
                 hostBinding = binding,
             )
         AWTKeyboardInterceptor.heldShortcuts.claim(pending)
-        AWTKeyboardInterceptor.cancelPendingNativePrint("another-window")
+        assertFalse(AWTKeyboardInterceptor.claimNativePrint("another-window") {})
         assertEquals(pending, AWTKeyboardInterceptor.heldShortcuts[KeyEvent.VK_P])
-        AWTKeyboardInterceptor.cancelPendingNativePrint("native-print")
+        assertTrue(AWTKeyboardInterceptor.claimNativePrint("native-print") {})
         assertFalse(AWTKeyboardInterceptor.heldShortcuts[KeyEvent.VK_P]?.releaseActionArmed ?: true)
         assertTrue(AWTKeyboardInterceptor.handleKeyReleased(keyEvent(KeyEvent.KEY_RELEASED, KeyEvent.VK_P)))
         assertNull(AWTKeyboardInterceptor.heldShortcuts[KeyEvent.VK_P])
@@ -78,7 +78,7 @@ class ShortcutKeyInvocationTest {
     fun `native print does not cancel another action bound to P`() {
         val pending = pendingFor("native-print", keyCode = KeyEvent.VK_P)
         AWTKeyboardInterceptor.heldShortcuts.claim(pending)
-        AWTKeyboardInterceptor.cancelPendingNativePrint("native-print")
+        assertFalse(AWTKeyboardInterceptor.claimNativePrint("native-print") {})
         assertEquals(pending, AWTKeyboardInterceptor.heldShortcuts[KeyEvent.VK_P])
     }
 

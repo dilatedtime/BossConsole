@@ -135,7 +135,7 @@ class HeldShortcutRegistryTest {
         val registry = HeldShortcutRegistry()
         registry.claim(held(keyCode = KeyEvent.VK_P, actionId = KeymapActions.BROWSER_PRINT))
 
-        registry.disarmNativePrint("window-a")
+        assertTrue(registry.claimNativePrint("window-a"))
 
         val print = assertNotNull(registry[KeyEvent.VK_P])
         assertTrue(print.firesOnRelease)
@@ -148,7 +148,7 @@ class HeldShortcutRegistryTest {
         val print = held(keyCode = KeyEvent.VK_P, actionId = KeymapActions.BROWSER_PRINT)
         registry.claim(print)
 
-        registry.disarmNativePrint("window-b")
+        assertFalse(registry.claimNativePrint("window-b"))
 
         assertEquals(print, registry[KeyEvent.VK_P])
     }
@@ -159,7 +159,7 @@ class HeldShortcutRegistryTest {
         val shortcut = held(keyCode = KeyEvent.VK_P)
         registry.claim(shortcut)
 
-        registry.disarmNativePrint("window-a")
+        assertFalse(registry.claimNativePrint("window-a"))
 
         assertEquals(shortcut, registry[KeyEvent.VK_P])
     }
@@ -200,16 +200,17 @@ class HeldShortcutRegistryTest {
     }
 
     @Test
-    fun `native cancellation racing primary release has one atomic outcome`() {
+    fun `native callback racing primary release produces exactly one winner`() {
         repeat(100) {
             val registry = HeldShortcutRegistry()
             registry.claim(held(keyCode = KeyEvent.VK_P, actionId = KeymapActions.BROWSER_PRINT))
             val start = CountDownLatch(1)
             var released: HeldShortcut? = null
-            val cancel =
+            var nativeWon = false
+            val native =
                 thread(start = true) {
                     start.await()
-                    registry.disarmNativePrint("window-a")
+                    nativeWon = registry.claimNativePrint("window-a")
                 }
             val release =
                 thread(start = true) {
@@ -217,11 +218,37 @@ class HeldShortcutRegistryTest {
                     released = registry.release(KeyEvent.VK_P)
                 }
             start.countDown()
-            cancel.join()
+            native.join()
             release.join()
 
             assertNotNull(released)
+            val awtWon = released?.releaseActionArmed == true
+            assertEquals(1, listOf(nativeWon, awtWon).count { it })
             assertTrue(registry.isEmpty())
         }
+    }
+
+    @Test
+    fun `native winner before AWT press prevents release rearm`() {
+        val registry = HeldShortcutRegistry()
+
+        assertTrue(registry.claimNativePrint("window-a"))
+        val claimed = registry.claim(held(keyCode = KeyEvent.VK_P, actionId = KeymapActions.BROWSER_PRINT))
+        val released = assertNotNull(registry.release(KeyEvent.VK_P))
+
+        assertFalse(claimed.releaseActionArmed)
+        assertFalse(released.releaseActionArmed)
+        assertFalse(registry.claimNativePrint("window-a"), "a duplicate native callback cannot print")
+    }
+
+    @Test
+    fun `AWT winner before native callback refuses the late callback`() {
+        val registry = HeldShortcutRegistry()
+        registry.claim(held(keyCode = KeyEvent.VK_P, actionId = KeymapActions.BROWSER_PRINT))
+
+        val released = assertNotNull(registry.release(KeyEvent.VK_P))
+
+        assertTrue(released.releaseActionArmed)
+        assertFalse(registry.claimNativePrint("window-a"))
     }
 }

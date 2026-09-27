@@ -2,7 +2,6 @@ package ai.rever.boss.window
 
 import ai.rever.boss.keymap.model.KeymapActions
 import java.awt.event.KeyEvent
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * A shortcut key owned by the AWT interceptor until its physical key-up arrives.
@@ -62,23 +61,60 @@ internal data class AwtModifierSnapshot(
 /**
  * Atomic per-key ownership for AWT shortcuts.
  *
- * Native print cancellation arrives from JxBrowser while normal key events arrive on the EDT,
- * so every mutation that can race is expressed as a [ConcurrentHashMap] per-key operation.
+ * Native print callbacks arrive from JxBrowser while normal key events arrive on the EDT. A
+ * single monitor linearizes both sources. Browser print additionally retains a short-lived
+ * winner marker after either source wins: it covers a native callback that precedes the AWT
+ * press and one that follows the AWT release. The next AWT press replaces that marker.
  */
 internal class HeldShortcutRegistry {
-    private val held = ConcurrentHashMap<Int, HeldShortcut>()
+    private sealed interface KeyState {
+        val windowId: String
 
-    fun isEmpty(): Boolean = held.isEmpty()
+        data class Held(
+            val shortcut: HeldShortcut,
+        ) : KeyState {
+            override val windowId: String = shortcut.windowId
+        }
 
-    operator fun get(keyCode: Int): HeldShortcut? = held[keyCode]
+        data class NativePrintWon(
+            override val windowId: String,
+        ) : KeyState
+
+        data class NativePrintCompleted(
+            override val windowId: String,
+        ) : KeyState
+
+        data class AwtPrintWon(
+            override val windowId: String,
+        ) : KeyState
+    }
+
+    private val lock = Any()
+    private val states = mutableMapOf<Int, KeyState>()
+
+    fun isEmpty(): Boolean = synchronized(lock) { states.values.none { it is KeyState.Held } }
+
+    operator fun get(keyCode: Int): HeldShortcut? = synchronized(lock) { (states[keyCode] as? KeyState.Held)?.shortcut }
 
     fun claim(
         shortcut: HeldShortcut,
         event: KeyEvent? = null,
     ): HeldShortcut {
-        val claimed = if (event == null) shortcut else shortcut.copy(modifiers = AwtModifierSnapshot.from(event))
-        held[claimed.keyCode] = claimed
-        return claimed
+        val candidate = if (event == null) shortcut else shortcut.copy(modifiers = AwtModifierSnapshot.from(event))
+        return synchronized(lock) {
+            val previous = states[candidate.keyCode]
+            val claimed =
+                if (candidate.firesOnRelease &&
+                    previous is KeyState.NativePrintWon &&
+                    previous.windowId == candidate.windowId
+                ) {
+                    candidate.copy(releaseActionArmed = false)
+                } else {
+                    candidate
+                }
+            states[claimed.keyCode] = KeyState.Held(claimed)
+            claimed
+        }
     }
 
     /**
@@ -88,24 +124,69 @@ internal class HeldShortcutRegistry {
     fun claimsRepeat(
         event: KeyEvent,
         windowId: String,
-    ): Boolean {
-        var repeat = false
-        held.compute(event.keyCode) { _, current ->
-            if (current != null && current.matches(event, windowId)) {
-                repeat = true
-                current
-            } else {
-                null
+    ): Boolean =
+        synchronized(lock) {
+            when (val current = states[event.keyCode]) {
+                is KeyState.Held -> {
+                    if (current.shortcut.matches(event, windowId)) {
+                        true
+                    } else {
+                        states.remove(event.keyCode)
+                        false
+                    }
+                }
+
+                // Preserve a native-first marker until claim() can turn it into a disarmed
+                // physical-key record. An AWT winner belongs to the prior press and is replaced.
+                is KeyState.NativePrintWon -> {
+                    if (current.windowId != windowId) states.remove(event.keyCode)
+                    false
+                }
+
+                is KeyState.NativePrintCompleted,
+                is KeyState.AwtPrintWon,
+                -> {
+                    states.remove(event.keyCode)
+                    false
+                }
+
+                null -> {
+                    false
+                }
             }
         }
-        return repeat
-    }
 
     fun unclaim(shortcut: HeldShortcut) {
-        held.remove(shortcut.keyCode, shortcut)
+        synchronized(lock) {
+            if ((states[shortcut.keyCode] as? KeyState.Held)?.shortcut == shortcut) {
+                states.remove(shortcut.keyCode)
+            }
+        }
     }
 
-    fun release(keyCode: Int): HeldShortcut? = held.remove(keyCode)
+    fun release(keyCode: Int): HeldShortcut? =
+        synchronized(lock) {
+            val current = states[keyCode]
+            val shortcut = (current as? KeyState.Held)?.shortcut
+            when {
+                shortcut == null -> {
+                    states.remove(keyCode)
+                }
+
+                shortcut.firesOnRelease && shortcut.releaseActionArmed -> {
+                    states[keyCode] = KeyState.AwtPrintWon(shortcut.windowId)
+                }
+
+                shortcut.firesOnRelease -> {
+                    states[keyCode] = KeyState.NativePrintCompleted(shortcut.windowId)
+                }
+
+                else -> {
+                    states.remove(keyCode)
+                }
+            }
+            shortcut
+        }
 
     /**
      * Preserve key ownership when one of a chord's own modifiers comes up, while updating the
@@ -113,32 +194,56 @@ internal class HeldShortcutRegistry {
      */
     fun modifierReleased(event: KeyEvent) {
         val newModifiers = AwtModifierSnapshot.from(event)
-        for (keyCode in held.keys.toList()) {
-            held.computeIfPresent(keyCode) { _, current ->
-                if (current.usedModifier(event.keyCode)) current.copy(modifiers = newModifiers) else current
+        synchronized(lock) {
+            states.replaceAll { _, state ->
+                if (state is KeyState.Held && state.shortcut.usedModifier(event.keyCode)) {
+                    KeyState.Held(state.shortcut.copy(modifiers = newModifiers))
+                } else {
+                    state
+                }
             }
         }
     }
 
     /**
-     * The native browser callback owns this print. Keep the physical key claimed until key-up,
-     * but atomically disarm the AWT release action so the preview cannot open twice.
+     * Atomically claim a browser-print press for the native callback.
+     *
+     * A native-first callback leaves a marker that makes the later AWT press disarmed. An AWT
+     * release-first marker refuses the native callback. Duplicate callbacks also lose. Returns
+     * true only to the one callback that owns the print side effect.
      */
-    fun disarmNativePrint(windowId: String) {
-        held.computeIfPresent(KeyEvent.VK_P) { _, current ->
-            if (current.windowId == windowId && current.firesOnRelease) {
-                current.copy(releaseActionArmed = false)
-            } else {
-                current
+    fun claimNativePrint(windowId: String): Boolean =
+        synchronized(lock) {
+            when (val current = states[KeyEvent.VK_P]) {
+                is KeyState.Held -> {
+                    val shortcut = current.shortcut
+                    if (shortcut.windowId == windowId && shortcut.firesOnRelease && shortcut.releaseActionArmed) {
+                        states[KeyEvent.VK_P] = KeyState.Held(shortcut.copy(releaseActionArmed = false))
+                        true
+                    } else {
+                        false
+                    }
+                }
+
+                is KeyState.NativePrintWon,
+                is KeyState.NativePrintCompleted,
+                is KeyState.AwtPrintWon,
+                -> {
+                    false
+                }
+
+                null -> {
+                    states[KeyEvent.VK_P] = KeyState.NativePrintWon(windowId)
+                    true
+                }
             }
         }
-    }
 
     fun removeWindow(windowId: String) {
-        held.entries.removeIf { it.value.windowId == windowId }
+        synchronized(lock) { states.entries.removeIf { it.value.windowId == windowId } }
     }
 
     fun clear() {
-        held.clear()
+        synchronized(lock) { states.clear() }
     }
 }

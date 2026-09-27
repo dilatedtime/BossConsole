@@ -72,9 +72,12 @@ internal data class KeymapModifierSnapshot(
  * 2. Configured key bindings
  * 3. Enabled state of shortcuts
  *
- * Recognizes shortcut chords and executes the action on KeyDown, once: auto-repeat KeyDowns of
- * the held key and its KeyUp are consumed without executing again. Releasing a modifier first
- * cancels nothing (BossConsole#1568). This handler is not wired into the desktop event path yet:
+ * Recognizes shortcut chords and executes the action on KeyDown, once. While the context is
+ * unchanged, auto-repeat KeyDowns of the held key and its KeyUp keep the first press's consumed
+ * result without executing again. A context change retires that ownership record, so its later
+ * KeyUp is not consumed. Releasing a modifier that was part of the original chord cancels nothing
+ * (BossConsole#1568); pressing an additional modifier changes the chord identity and lets the next
+ * repeat match afresh. This handler is not wired into the desktop event path yet:
  * unlike the AWT/JxBrowser integration, every action (including browser print) executes on
  * KeyDown. A declined action is remembered until KeyUp so auto-repeat does not retry it, but its
  * press, repeats, and release remain unconsumed.
