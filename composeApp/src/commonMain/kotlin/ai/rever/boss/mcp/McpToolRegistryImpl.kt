@@ -190,7 +190,7 @@ object McpToolRegistryImpl : McpToolRegistry {
 
     fun registerProvider(provider: McpToolProvider) = core.registerProvider(provider)
 
-    /** Capture plugin-owned metadata once so a later window restore cannot re-enter the plugin. */
+    /** Capture plugin-owned metadata once so restore does not re-invoke its metadata getters. */
     internal fun snapshotProvider(provider: McpToolProvider): McpToolProvider = core.snapshotProvider(provider)
 
     fun unregisterProvider(providerId: String) = core.unregisterProvider(providerId)

@@ -6,6 +6,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
@@ -244,6 +245,30 @@ class WindowRegistrationsTest {
 
         assertEquals(2, preparations, "restoring the survivor must reuse its prepared value")
         assertEquals("ONE", registry.served["tools"])
+    }
+
+    @Test
+    fun `failed replacement preparation preserves the live registration and its ownership`() {
+        var preparations = 0
+        val target =
+            WindowRegistrations.Target(
+                name = "fallible",
+                publish = registry.target.publish,
+                withdraw = registry.target.withdraw,
+                prepare = { value: Pair<String, String> ->
+                    check(++preparations == 1) { "replacement snapshot failed" }
+                    value
+                },
+            )
+        registrations.register(target, "tools", window1, "tools" to "one")
+
+        assertFailsWith<IllegalStateException> {
+            registrations.register(target, "tools", window1, "tools" to "two")
+        }
+
+        assertEquals("one", registry.served["tools"])
+        assertEquals(Outcome.WITHDRAWN, registrations.unregister(target, "tools", window1))
+        assertEquals(emptyMap(), registry.served)
     }
 
     @Test

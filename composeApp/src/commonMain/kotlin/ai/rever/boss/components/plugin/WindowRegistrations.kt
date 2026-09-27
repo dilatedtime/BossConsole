@@ -26,9 +26,10 @@ import java.util.concurrent.ConcurrentHashMap
  * **Locked per (registry, id), never globally.** A target can [Target.prepare] a value once, after
  * the owner is admitted but before it is published. MCP and shortcut targets use that boundary to
  * snapshot `tools()` / `shortcuts()`: restoring an older window republishes its prepared value and
- * never re-enters surviving plugin code on the closing thread. A per-id lock can only make the same
- * id in another window wait. Release fences future registrations and visits only slots admitted by
- * that owner.
+ * never re-invokes those metadata getters on the closing thread. Publishing can still enter the
+ * registry and eventually dispatch through handler closures owned by that plugin. A per-id lock can
+ * only make the same id in another window wait. Release fences future registrations and visits only
+ * slots admitted by that owner.
  *
  * Not addressed here: while two windows are open, the most recent window's copy serves every window,
  * exactly as before. A provider whose action looks a window up in its own plugin state (a shortcut's
@@ -96,10 +97,17 @@ internal class WindowRegistrations {
             owner: Owner,
             value: V,
         ) = synchronized(this) {
+            val alreadyRegistered = entries.any { it.first === owner }
             if (!owner.admit(this)) return@synchronized
             // Prepare BEFORE dropping the owner's previous entry: a prepare that throws must
             // leave the live registration serving, not strand it with nothing published.
-            val prepared = target.prepare(value)
+            var preparationCompleted = false
+            val prepared =
+                try {
+                    target.prepare(value).also { preparationCompleted = true }
+                } finally {
+                    if (!preparationCompleted && !alreadyRegistered) owner.forget(this)
+                }
             entries.removeAll { it.first === owner }
             entries += owner to prepared
             target.publish(prepared)
