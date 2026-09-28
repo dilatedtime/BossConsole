@@ -10,6 +10,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.serializer
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -74,6 +75,22 @@ class NavigationTargetIpcTest {
 
             assertNull(bridge.payload, "a rejected local target must not cross the IPC boundary")
         }
+
+    @Test
+    fun `navigation payload resolves through the production runtime serializer`() {
+        val payload = NavigationTargetIpcPayload("/workspace/src/Runtime.kt", 11, 4, "window-runtime")
+
+        // IpcEventBridgeImpl cannot use the generated serializer directly: it receives Any and
+        // resolves from payload.javaClass. Exercise that exact lookup so an internal visibility
+        // or serializer-generation change cannot silently push navigation onto its toString fallback.
+        val encoded = Json.encodeToString(serializer(payload.javaClass), payload)
+        val json = Json.parseToJsonElement(encoded).jsonObject
+
+        assertEquals("/workspace/src/Runtime.kt", json.getValue("filePath").jsonPrimitive.content)
+        assertEquals("11", json.getValue("line").jsonPrimitive.content)
+        assertEquals("4", json.getValue("column").jsonPrimitive.content)
+        assertEquals("window-runtime", json.getValue("sourceWindowId").jsonPrimitive.content)
+    }
 
     private class RecordingBridge : IpcEventBridge {
         var eventType: String? = null

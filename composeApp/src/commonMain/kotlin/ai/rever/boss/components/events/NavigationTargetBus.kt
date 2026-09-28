@@ -38,7 +38,10 @@ object NavigationTargetBus {
     private val _targets =
         MutableSharedFlow<NavigationTargetEvent>(
             replay = 1, // Replay last event for late subscribers
-            extraBufferCapacity = 5,
+            // The old provider relay contributed a second five-event buffer. Now that this is
+            // the sole replay owner, keep the same ten-event burst headroom in one place. A slow
+            // active editor still backpressures navigateTo after this bounded queue fills.
+            extraBufferCapacity = 10,
         )
     val targets: SharedFlow<NavigationTargetEvent> = _targets.asSharedFlow()
 
