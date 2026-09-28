@@ -254,6 +254,21 @@ class HeldShortcutRegistryTest {
     }
 
     @Test
+    fun `native key-up keeps a lagging AWT press from printing again`() {
+        val registry = HeldShortcutRegistry()
+
+        val nativeWon = registry.claimNativePrint("window-a")
+        registry.releaseNativePrint("window-a")
+        val claimed = registry.claim(held(keyCode = KeyEvent.VK_P, actionId = KeymapActions.BROWSER_PRINT))
+        val released = assertNotNull(registry.release(KeyEvent.VK_P))
+
+        assertTrue(nativeWon)
+        assertFalse(claimed.releaseActionArmed)
+        assertFalse(released.releaseActionArmed)
+        assertEquals(1, listOf(nativeWon, released.releaseActionArmed).count { it })
+    }
+
+    @Test
     fun `foreign native marker is replaced rather than suppressing another window`() {
         val registry = HeldShortcutRegistry()
 
