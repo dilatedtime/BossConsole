@@ -64,7 +64,8 @@ internal data class AwtModifierSnapshot(
  * Native print callbacks arrive from JxBrowser while normal key events arrive on the EDT. A
  * single monitor linearizes both sources. Browser print additionally retains a short-lived
  * winner marker after either source wins: it covers a native callback that precedes the AWT
- * press and one that follows the AWT release. The next AWT press replaces that marker.
+ * press and one that follows the AWT release. The next AWT press replaces that marker, while
+ * the native key-up retires it for native-only browser input that never reaches AWT.
  */
 internal class HeldShortcutRegistry {
     private sealed interface KeyState {
@@ -92,7 +93,8 @@ internal class HeldShortcutRegistry {
     private val lock = Any()
     private val states = mutableMapOf<Int, KeyState>()
 
-    fun isEmpty(): Boolean = synchronized(lock) { states.values.none { it is KeyState.Held } }
+    val hasNoHeldKeys: Boolean
+        get() = synchronized(lock) { states.values.none { it is KeyState.Held } }
 
     operator fun get(keyCode: Int): HeldShortcut? = synchronized(lock) { (states[keyCode] as? KeyState.Held)?.shortcut }
 
@@ -229,7 +231,12 @@ internal class HeldShortcutRegistry {
                 is KeyState.NativePrintCompleted,
                 is KeyState.AwtPrintWon,
                 -> {
-                    false
+                    if (current.windowId == windowId) {
+                        false
+                    } else {
+                        states[KeyEvent.VK_P] = KeyState.NativePrintWon(windowId)
+                        true
+                    }
                 }
 
                 null -> {
@@ -238,6 +245,22 @@ internal class HeldShortcutRegistry {
                 }
             }
         }
+
+    /** Retire this window's native winner marker when JxBrowser reports the physical key-up. */
+    fun releaseNativePrint(windowId: String) {
+        synchronized(lock) {
+            when (val current = states[KeyEvent.VK_P]) {
+                is KeyState.NativePrintWon,
+                is KeyState.NativePrintCompleted,
+                is KeyState.AwtPrintWon,
+                -> if (current.windowId == windowId) states.remove(KeyEvent.VK_P)
+
+                is KeyState.Held,
+                null,
+                -> Unit
+            }
+        }
+    }
 
     fun removeWindow(windowId: String) {
         synchronized(lock) { states.entries.removeIf { it.value.windowId == windowId } }

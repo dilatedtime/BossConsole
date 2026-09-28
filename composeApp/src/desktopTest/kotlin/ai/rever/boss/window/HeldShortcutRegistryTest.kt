@@ -63,7 +63,7 @@ class HeldShortcutRegistryTest {
         registry.claim(held())
 
         assertFalse(registry.claimsRepeat(event(modifiers = InputEvent.META_DOWN_MASK), "window-b"))
-        assertTrue(registry.isEmpty())
+        assertTrue(registry.hasNoHeldKeys)
     }
 
     @Test
@@ -72,7 +72,7 @@ class HeldShortcutRegistryTest {
         registry.claim(held())
 
         assertFalse(registry.claimsRepeat(event(modifiers = InputEvent.CTRL_DOWN_MASK), "window-a"))
-        assertTrue(registry.isEmpty())
+        assertTrue(registry.hasNoHeldKeys)
     }
 
     @Test
@@ -196,7 +196,7 @@ class HeldShortcutRegistryTest {
 
         registry.clear()
 
-        assertTrue(registry.isEmpty())
+        assertTrue(registry.hasNoHeldKeys)
     }
 
     @Test
@@ -224,12 +224,12 @@ class HeldShortcutRegistryTest {
             assertNotNull(released)
             val awtWon = released?.releaseActionArmed == true
             assertEquals(1, listOf(nativeWon, awtWon).count { it })
-            assertTrue(registry.isEmpty())
+            assertTrue(registry.hasNoHeldKeys)
         }
     }
 
     @Test
-    fun `native winner before AWT press prevents release rearm`() {
+    fun `same-press native duplicate loses before native key-up`() {
         val registry = HeldShortcutRegistry()
 
         assertTrue(registry.claimNativePrint("window-a"))
@@ -238,7 +238,31 @@ class HeldShortcutRegistryTest {
 
         assertFalse(claimed.releaseActionArmed)
         assertFalse(released.releaseActionArmed)
-        assertFalse(registry.claimNativePrint("window-a"), "a duplicate native callback cannot print")
+        assertFalse(registry.claimNativePrint("window-a"), "the same physical press cannot print twice")
+    }
+
+    @Test
+    fun `native key-up lets a second native-only press print`() {
+        val registry = HeldShortcutRegistry()
+
+        assertTrue(registry.claimNativePrint("window-a"))
+        registry.releaseNativePrint("window-a")
+        assertTrue(registry.claimNativePrint("window-a"), "the next physical press must get a fresh winner")
+        registry.releaseNativePrint("window-a")
+
+        assertTrue(registry.hasNoHeldKeys)
+    }
+
+    @Test
+    fun `foreign native marker is replaced rather than suppressing another window`() {
+        val registry = HeldShortcutRegistry()
+
+        assertTrue(registry.claimNativePrint("window-a"))
+        assertTrue(registry.claimNativePrint("window-b"))
+        registry.releaseNativePrint("window-a")
+        assertFalse(registry.claimNativePrint("window-b"), "another window cannot retire the current winner")
+        registry.releaseNativePrint("window-b")
+        assertTrue(registry.claimNativePrint("window-b"))
     }
 
     @Test

@@ -71,15 +71,21 @@ object AWTKeyboardInterceptor {
     // identity needed after a modifier release. Native print cancellation can race the EDT.
     internal val heldShortcuts = HeldShortcutRegistry()
 
-    /** Run [print] only when the native callback atomically wins this physical print press. */
+    /**
+     * Run [print] only when the native callback atomically wins this physical print press.
+     * A legacy unowned browser has no AWT contender, so a null [windowId] runs directly.
+     */
     internal fun claimNativePrint(
-        windowId: String,
+        windowId: String?,
         print: () -> Unit,
     ): Boolean {
-        if (!heldShortcuts.claimNativePrint(windowId)) return false
+        if (windowId != null && !heldShortcuts.claimNativePrint(windowId)) return false
         print()
         return true
     }
+
+    /** Retire native-only print ownership once JxBrowser observes the physical P key-up. */
+    internal fun releaseNativePrint(windowId: String) = heldShortcuts.releaseNativePrint(windowId)
 
     private var focusListener: java.beans.PropertyChangeListener? = null
 

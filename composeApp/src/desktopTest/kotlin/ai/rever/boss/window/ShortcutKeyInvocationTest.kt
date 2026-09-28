@@ -192,7 +192,7 @@ class ShortcutKeyInvocationTest {
 
     @Test
     fun `with no chord armed, a key-up does nothing`() {
-        assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
         assertFalse(AWTKeyboardInterceptor.handleKeyReleased(keyEvent(KeyEvent.KEY_RELEASED, KeyEvent.VK_N)))
     }
 
@@ -288,7 +288,7 @@ class ShortcutKeyInvocationTest {
             AWTKeyboardInterceptor.handleKeyReleased(keyEvent(KeyEvent.KEY_RELEASED, KeyEvent.VK_N)),
             "the first chord must still own its release, not have been silently dropped",
         )
-        assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
     }
 
     @Test
@@ -297,7 +297,7 @@ class ShortcutKeyInvocationTest {
 
         AWTKeyboardInterceptor.cancelPendingShortcut()
 
-        assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
         assertFalse(AWTKeyboardInterceptor.handleKeyReleased(keyEvent(KeyEvent.KEY_RELEASED, KeyEvent.VK_N)))
     }
 }

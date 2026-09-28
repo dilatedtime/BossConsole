@@ -136,7 +136,7 @@ class ShortcutKeySemanticsTest {
         assertTrue(dispatchKeyEvent(release), "the primary release must not leak to the focused component")
         assertTrue(release.isConsumed)
         assertEquals(1, newTabEventCount.get(), "the release must not fire a second time")
-        assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
     }
 
     @Test
@@ -186,7 +186,7 @@ class ShortcutKeySemanticsTest {
 
         // Exercise the listener registered by install without creating or focusing a window.
         AWTKeyboardInterceptor.handleFocusChangeForTest()
-        assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
 
         assertFalse(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED)))
         assertEquals(1, newTabEventCount.get())
@@ -300,7 +300,7 @@ class ShortcutKeySemanticsTest {
         try {
             useBindings()
             assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_PRESSED, KeyEvent.VK_K)))
-            assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+            assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
             assertFalse(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_K)))
         } finally {
             PluginShortcutRegistryImpl.unregister(provider.providerId)
@@ -414,7 +414,7 @@ class ShortcutKeySemanticsTest {
         assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId) {})
         assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P, modifiers = 0)))
         assertEquals(0, printEventCount.get(), "a late native callback still owns the one print")
-        assertTrue(AWTKeyboardInterceptor.heldShortcuts.isEmpty())
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
     }
 
     @Test
@@ -439,6 +439,29 @@ class ShortcutKeySemanticsTest {
         assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P)))
 
         assertEquals(1, printEventCount.get() + nativePrints)
+    }
+
+    @Test
+    fun `native-only key-up gives each physical press one print`() {
+        var nativePrints = 0
+
+        repeat(2) {
+            assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId) { nativePrints++ })
+            AWTKeyboardInterceptor.releaseNativePrint(windowId)
+        }
+
+        assertEquals(2, nativePrints)
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
+    }
+
+    @Test
+    fun `legacy unowned browser prints because it has no AWT contender`() {
+        var nativePrints = 0
+
+        assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId = null) { nativePrints++ })
+
+        assertEquals(1, nativePrints)
+        assertTrue(AWTKeyboardInterceptor.heldShortcuts.hasNoHeldKeys)
     }
 
     @Test

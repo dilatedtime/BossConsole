@@ -2961,11 +2961,9 @@ object FluckEngine {
                     if (keyCode == com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_P &&
                         usesNativePrintChord(ai.rever.boss.keymap.KeymapSettingsManager.currentSettings.value)
                     ) {
-                        if (shortcutWindowId != null) {
-                            ai.rever.boss.window.AWTKeyboardInterceptor.claimNativePrint(shortcutWindowId) {
-                                if (!browser.isClosed) {
-                                    browser.mainFrame().ifPresent { it.executeJavaScript<Any>(PRINT_BROWSER_SCRIPT) }
-                                }
+                        ai.rever.boss.window.AWTKeyboardInterceptor.claimNativePrint(shortcutWindowId) {
+                            if (!browser.isClosed) {
+                                browser.mainFrame().ifPresent { it.executeJavaScript<Any>(PRINT_BROWSER_SCRIPT) }
                             }
                         }
                         return@PressKeyCallback com.teamdev.jxbrowser.browser.callback.input.PressKeyCallback.Response
@@ -3271,6 +3269,17 @@ object FluckEngine {
 
                 // Let all other key events proceed normally
                 com.teamdev.jxbrowser.browser.callback.input.PressKeyCallback.Response
+                    .proceed()
+            },
+        )
+        browser.set(
+            com.teamdev.jxbrowser.browser.callback.input.ReleaseKeyCallback::class.java,
+            com.teamdev.jxbrowser.browser.callback.input.ReleaseKeyCallback { params ->
+                if (params.event().keyCode() == com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_P) {
+                    val shortcutWindowId = ownerWindowId ?: WindowFocusManager.focusedWindowFlow.value
+                    shortcutWindowId?.let(ai.rever.boss.window.AWTKeyboardInterceptor::releaseNativePrint)
+                }
+                com.teamdev.jxbrowser.browser.callback.input.ReleaseKeyCallback.Response
                     .proceed()
             },
         )
