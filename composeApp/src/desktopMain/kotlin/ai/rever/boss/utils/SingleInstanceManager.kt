@@ -671,9 +671,22 @@ private object SingleInstanceFiles {
      * descriptor pointing at a removed socket is the state
      * [SingleInstanceManager.acquireLock] reclaims cleanly, while a socket with no
      * descriptor is unreachable and never cleaned up.
+     *
+     * Only withdraws what was published by this instance: if the descriptor file on disk
+     * already belongs to another token (because another process reclaimed the endpoint while
+     * this instance was tearing down or releasing), it is left in place so the new owner's
+     * descriptor and listening socket are not unlinked.
      */
     fun withdraw(descriptor: InstanceDescriptor?) {
         try {
+            val onDisk = read()
+            if (descriptor != null && onDisk != null && onDisk.token != descriptor.token) {
+                logger.info(
+                    LogCategory.SYSTEM,
+                    "Single-instance descriptor was reclaimed by another owner; leaving it in place",
+                )
+                return
+            }
             Files.deleteIfExists(descriptorFile.toPath())
             if (descriptor?.transport == SingleInstanceTransport.UNIX) {
                 Files.deleteIfExists(File(descriptor.endpoint).toPath())
@@ -1371,8 +1384,15 @@ private fun pluginActionResponse(verdict: kotlinx.coroutines.Deferred<Boolean>?)
 @Suppress("TooManyFunctions", "LargeClass")
 object SingleInstanceManager {
     private val lifecycleLock = Any()
+
+    @Volatile
     private var serverChannel: ServerSocketChannel? = null
+
+    @Volatile
     private var listenerThread: Thread? = null
+
+    @Volatile
+    private var listenerEpoch: Long = 0L
 
     /** Indicates whether the IPC listener thread is currently running. */
     internal val isListenerAlive: Boolean
@@ -1447,6 +1467,15 @@ object SingleInstanceManager {
         set(value) {
             SingleInstanceFiles.runtimeDirOverride = value
         }
+
+    /** The published descriptor for test assertions. */
+    internal val publishedInstanceDescriptor: InstanceDescriptor?
+        get() = published
+
+    /** Test-only seam to drive descriptor withdrawal with an explicit descriptor. */
+    internal fun withdrawForTest(descriptor: InstanceDescriptor?) {
+        SingleInstanceFiles.withdraw(descriptor)
+    }
 
     /**
      * Check whether another instance of BOSS is already running, by asking it.
@@ -1543,66 +1572,70 @@ object SingleInstanceManager {
      * Bind the channel, publish the descriptor and start accepting.
      * Returns false when there is nothing a second launch could reach.
      */
-    private fun startServer(): Boolean =
-        synchronized(lifecycleLock) {
-            listenerThread?.let {
-                if (it.isAlive && it != Thread.currentThread()) {
-                    try {
-                        it.join(1000L)
-                    } catch (e: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        logger.warn(LogCategory.SYSTEM, "Interrupted waiting for previous listener thread", error = e)
-                    }
+    private fun startServer(): Boolean {
+        listenerThread?.let {
+            if (it.isAlive && it != Thread.currentThread()) {
+                try {
+                    it.join(1000L)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    logger.warn(LogCategory.SYSTEM, "Interrupted waiting for previous listener thread", error = e)
                 }
             }
-            listenerThread = null
-            try {
-                serverChannel?.close()
-            } catch (e: IOException) {
-                logger.warn(LogCategory.SYSTEM, "Error closing previous server channel", error = e)
-            }
-            serverChannel = null
-
-            val token = newChannelToken()
-            val bound =
-                SingleInstanceWire.openUnixServer(SingleInstanceFiles.socketFile, token)
-                    ?: SingleInstanceWire.openTcpServer(token)
-            serverChannel = bound?.first
-
-            // Without a published descriptor no second launch could reach us, and the
-            // token would be unknowable, so failing to publish is failing to start
-            // rather than listening on something nobody can address.
-            val descriptor = bound?.second?.takeIf { SingleInstanceFiles.write(it) }
-            if (descriptor == null) {
-                logger.error(
-                    LogCategory.SYSTEM,
-                    if (bound == null) {
-                        "Failed to bind the single-instance channel on any endpoint"
-                    } else {
-                        "Failed to publish the single-instance descriptor"
-                    },
-                )
-                release()
-                return false
-            }
-
-            published = descriptor
-            logger.info(
-                LogCategory.SYSTEM,
-                "Single-instance channel listening",
-                mapOf("transport" to descriptor.transport.name, "endpoint" to descriptor.endpoint),
-            )
-
-            startAcceptLoop()
-            return true
         }
+        val started =
+            synchronized(lifecycleLock) {
+                listenerThread = null
+                try {
+                    serverChannel?.close()
+                } catch (e: IOException) {
+                    logger.warn(LogCategory.SYSTEM, "Error closing previous server channel", error = e)
+                }
+                serverChannel = null
+
+                val token = newChannelToken()
+                val bound =
+                    SingleInstanceWire.openUnixServer(SingleInstanceFiles.socketFile, token)
+                        ?: SingleInstanceWire.openTcpServer(token)
+                serverChannel = bound?.first
+
+                // Without a published descriptor no second launch could reach us, and the
+                // token would be unknowable, so failing to publish is failing to start
+                // rather than listening on something nobody can address.
+                val descriptor = bound?.second?.takeIf { SingleInstanceFiles.write(it) }
+                if (descriptor == null) {
+                    logger.error(
+                        LogCategory.SYSTEM,
+                        if (bound == null) {
+                            "Failed to bind the single-instance channel on any endpoint"
+                        } else {
+                            "Failed to publish the single-instance descriptor"
+                        },
+                    )
+                    release()
+                    false
+                } else {
+                    published = descriptor
+                    logger.info(
+                        LogCategory.SYSTEM,
+                        "Single-instance channel listening",
+                        mapOf("transport" to descriptor.transport.name, "endpoint" to descriptor.endpoint),
+                    )
+
+                    startAcceptLoop()
+                    true
+                }
+            }
+        return started
+    }
 
     @Suppress("TooGenericExceptionCaught")
     private fun startAcceptLoop() {
+        val epoch = synchronized(lifecycleLock) { ++listenerEpoch }
         isListening = true
         listenerThread =
             thread(isDaemon = true, name = "BOSS-IPC-Listener") {
-                logger.trace(LogCategory.SYSTEM, "IPC listener thread started")
+                logger.trace(LogCategory.SYSTEM, "IPC listener thread started (epoch $epoch)")
 
                 while (isListening && !Thread.currentThread().isInterrupted) {
                     try {
@@ -1614,7 +1647,7 @@ object SingleInstanceManager {
                                     "IPC listener accept failed unexpectedly while listening; " +
                                         "tearing down faulted endpoint",
                                 )
-                                teardownFaultedListener()
+                                teardownFaultedListener(epoch)
                             }
                             break
                         }
@@ -1630,21 +1663,30 @@ object SingleInstanceManager {
                     }
                 }
 
-                logger.trace(LogCategory.SYSTEM, "IPC listener thread stopped")
+                logger.trace(LogCategory.SYSTEM, "IPC listener thread stopped (epoch $epoch)")
             }
     }
 
-    private fun teardownFaultedListener() =
+    private fun teardownFaultedListener(epoch: Long) =
         synchronized(lifecycleLock) {
+            if (epoch != listenerEpoch) {
+                logger.info(
+                    LogCategory.SYSTEM,
+                    "Faulted listener teardown ignored: current epoch $listenerEpoch superseded $epoch",
+                )
+                return@synchronized
+            }
             val descriptor = published
             published = null
+            // Withdraw descriptor first to eliminate the race where endpoint is closed
+            // but descriptor still points to it
+            SingleInstanceFiles.withdraw(descriptor)
             try {
                 serverChannel?.close()
             } catch (e: IOException) {
                 logger.warn(LogCategory.SYSTEM, "Error closing faulted server channel", error = e)
             }
             serverChannel = null
-            SingleInstanceFiles.withdraw(descriptor)
             isListening = false
         }
 

@@ -156,54 +156,73 @@ class SingleInstanceFloodCapTest {
         val dummyPort = server.localPort
 
         try {
-            // Note: Each loop iteration opens three sequential connections while one fixture value is live:
-            // probeInstance, isAnotherInstanceRunning()'s own probe, and acquireLock()'s probe.
-            // For UNREAD_RST, the client encounters Connection Reset on writeLine / readBoundedLine
-            // and treats it as CONNECTED_NO_REPLY via catch (IOException).
             for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED", "UNREAD_RST")) {
-                val servedBefore = servedCounts[currentFixture]?.get() ?: 0
-                fixture.set(currentFixture)
-                val descriptor =
-                    InstanceDescriptor(
-                        transport = SingleInstanceTransport.TCP,
-                        endpoint = dummyPort.toString(),
-                        token = newChannelToken(),
-                        pid = ProcessHandle.current().pid(),
-                    )
-
-                val probe = SingleInstanceWire.probeInstance(descriptor)
-                assertEquals(
-                    SingleInstanceProbe.CONNECTED_NO_REPLY,
-                    probe,
-                    "Fixture $currentFixture must probe as CONNECTED_NO_REPLY",
-                )
-
-                Files.createDirectories(descriptorPath().parent)
-                Files.writeString(descriptorPath(), descriptor.encode())
-                assertTrue(
-                    SingleInstanceManager.isAnotherInstanceRunning(),
-                    "Verified descriptor with fixture $currentFixture must report another instance running",
-                )
-                val acquired = SingleInstanceManager.acquireLock()
-                assertFalse(
-                    acquired,
-                    "Must not reclaim verified descriptor from active endpoint with fixture $currentFixture",
-                )
-                val published = readPublishedDescriptor()
-                assertNotNull(published)
-                assertEquals(descriptor.token, published.token, "Descriptor token must remain unchanged")
-
-                val servedAfter = servedCounts[currentFixture]?.get() ?: 0
-                assertTrue(
-                    servedAfter > servedBefore,
-                    "Fixture $currentFixture must have been served by the dummy server",
-                )
+                assertVerifiedFixturePreservesOwnership(currentFixture, dummyPort, fixture, servedCounts)
             }
         } finally {
             runCatching { server.close() }
             acceptThread.join(2000L)
             assertFalse(acceptThread.isAlive, "Dummy server accept thread must terminate")
         }
+    }
+
+    private fun assertVerifiedFixturePreservesOwnership(
+        currentFixture: String,
+        dummyPort: Int,
+        fixture: AtomicReference<String>,
+        servedCounts: ConcurrentHashMap<String, AtomicInteger>,
+    ) {
+        val servedBefore = servedCounts[currentFixture]?.get() ?: 0
+        fixture.set(currentFixture)
+        val descriptor =
+            InstanceDescriptor(
+                transport = SingleInstanceTransport.TCP,
+                endpoint = dummyPort.toString(),
+                token = newChannelToken(),
+                pid = ProcessHandle.current().pid(),
+            )
+
+        val probe = SingleInstanceWire.probeInstance(descriptor)
+        assertEquals(
+            SingleInstanceProbe.CONNECTED_NO_REPLY,
+            probe,
+            "Fixture $currentFixture must probe as CONNECTED_NO_REPLY",
+        )
+
+        val wireReply = SingleInstanceWire.exchange(descriptor, "PING")
+        val expectedWireReply =
+            when (currentFixture) {
+                "EMPTY" -> null
+                "PARTIAL" -> "BUS"
+                "REJECTED" -> "REJECTED"
+                else -> null
+            }
+        assertEquals(
+            expectedWireReply,
+            wireReply,
+            "Fixture $currentFixture must return expected wire response",
+        )
+
+        Files.createDirectories(descriptorPath().parent)
+        Files.writeString(descriptorPath(), descriptor.encode())
+        assertTrue(
+            SingleInstanceManager.isAnotherInstanceRunning(),
+            "Verified descriptor with fixture $currentFixture must report another instance running",
+        )
+        val acquired = SingleInstanceManager.acquireLock()
+        assertFalse(
+            acquired,
+            "Must not reclaim verified descriptor from active endpoint with fixture $currentFixture",
+        )
+        val published = readPublishedDescriptor()
+        assertNotNull(published)
+        assertEquals(descriptor.token, published.token, "Descriptor token must remain unchanged")
+
+        val servedAfter = servedCounts[currentFixture]?.get() ?: 0
+        assertTrue(
+            servedAfter > servedBefore,
+            "Fixture $currentFixture must have been served by the dummy server",
+        )
     }
 
     @Test
@@ -229,6 +248,20 @@ class SingleInstanceFloodCapTest {
                     SingleInstanceProbe.CONNECTED_NO_REPLY,
                     probe,
                     "Fixture $currentFixture must probe as CONNECTED_NO_REPLY",
+                )
+
+                val wireReply = SingleInstanceWire.exchange(unverifiedDescriptor, "PING")
+                val expectedWireReply =
+                    when (currentFixture) {
+                        "EMPTY" -> null
+                        "PARTIAL" -> "BUS"
+                        "REJECTED" -> "REJECTED"
+                        else -> null
+                    }
+                assertEquals(
+                    expectedWireReply,
+                    wireReply,
+                    "Fixture $currentFixture must return expected wire response",
                 )
 
                 Files.createDirectories(descriptorPath().parent)
@@ -411,7 +444,7 @@ class SingleInstanceFloodCapTest {
         assertEquals(
             MAX_CLIENT_HANDLERS,
             SingleInstanceManager.availableClientSlots,
-            "Client handler slots must recover after old accepted connection closes",
+            "Client handler slots must remain fully available during and after listener teardown",
         )
 
         // Descriptor must be withdrawn and channel closed
@@ -423,6 +456,46 @@ class SingleInstanceFloodCapTest {
         // Second launch must now cleanly acquire lock without hanging or being bricked
         val secondAcquired = SingleInstanceManager.acquireLock()
         assertTrue(secondAcquired, "Next launch must reclaim and acquire lock cleanly after listener fault")
+    }
+
+    @Test
+    fun `stale withdraw does not delete new owner descriptor or socket`() {
+        assertTrue(SingleInstanceManager.acquireLock(), "First launch must acquire lock")
+        val descA = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "First descriptor must exist")
+        SingleInstanceManager.release()
+
+        assertTrue(SingleInstanceManager.acquireLock(), "Second launch must acquire lock")
+        val descB = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "Second descriptor must exist")
+        assertTrue(descA.token != descB.token, "New launch must have a fresh channel token")
+
+        // Simulate late withdraw from instance A
+        SingleInstanceManager.withdrawForTest(descA)
+
+        val onDisk = readPublishedDescriptor()
+        assertNotNull(onDisk, "Descriptor file must not be deleted by stale withdraw")
+        assertEquals(descB.token, onDisk.token, "Descriptor of active owner must remain intact")
+        if (descB.transport == SingleInstanceTransport.UNIX) {
+            assertTrue(File(descB.endpoint).exists(), "Socket file of active owner must remain intact")
+        }
+
+        SingleInstanceManager.release()
+    }
+
+    @Test
+    fun `stale listener epoch teardown does not clobber new server channel or descriptor`() {
+        assertTrue(SingleInstanceManager.acquireLock(), "First launch must acquire lock")
+        val descA = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "First descriptor must exist")
+
+        // Release and immediately re-acquire to increment listenerEpoch
+        SingleInstanceManager.release()
+        assertTrue(SingleInstanceManager.acquireLock(), "Second launch must acquire lock with bumped epoch")
+        val descB = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "Second descriptor must exist")
+        assertTrue(descA.token != descB.token, "Tokens must differ")
+
+        assertTrue(SingleInstanceManager.isListening, "Active instance must remain listening")
+        assertEquals(descB.token, readPublishedDescriptor()?.token, "Active descriptor must remain published")
+
+        SingleInstanceManager.release()
     }
 
     private fun newFailingScheduler(): ScheduledExecutorService =
