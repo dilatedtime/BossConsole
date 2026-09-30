@@ -4,13 +4,12 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
-import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
-import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.net.Socket
 import java.net.SocketAddress
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
@@ -18,15 +17,20 @@ import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
+
+private const val READ_TIMED_OUT = Int.MIN_VALUE
 
 /**
  * Regression test for issue #1326:
@@ -55,7 +59,13 @@ class SingleInstanceFloodCapTest {
         SingleInstanceManager.connectionBudgetMsOverride = null
         SingleInstanceManager.llmTokenProviderOverride = null
         SingleInstanceManager.runtimeDirOverride = null
+        SingleInstanceManager.acceptNextClientOverride = null
         waitForSlotsRecovery()
+        assertEquals(
+            MAX_CLIENT_HANDLERS,
+            SingleInstanceManager.availableClientSlots,
+            "All client handler slots must be recovered after test",
+        )
     }
 
     @Test
@@ -89,8 +99,8 @@ class SingleInstanceFloodCapTest {
             val parkedThreadsAfter = parkedThreadCount()
             val spawned = parkedThreadsAfter - parkedThreadsBefore
             assertTrue(
-                spawned <= MAX_CLIENT_HANDLERS + 2,
-                "Flood parked $spawned handler threads; expected <= ${MAX_CLIENT_HANDLERS + 2}",
+                spawned <= MAX_CLIENT_HANDLERS,
+                "Flood parked $spawned handler threads; expected <= $MAX_CLIENT_HANDLERS",
             )
         } finally {
             heldSockets.forEach { runCatching { it.close() } }
@@ -110,14 +120,7 @@ class SingleInstanceFloodCapTest {
 
     @Test
     fun `failing watchdog setup does not leak socket or client slots`() {
-        val failingScheduler =
-            object : ScheduledExecutorService by Executors.newSingleThreadScheduledExecutor() {
-                override fun schedule(
-                    command: Runnable,
-                    delay: Long,
-                    unit: TimeUnit,
-                ): ScheduledFuture<*> = throw RejectedExecutionException("Watchdog scheduling rejected")
-            }
+        val failingScheduler = newFailingScheduler()
         SingleInstanceManager.watchdogSchedulerOverride = failingScheduler
         try {
             assertTrue(SingleInstanceManager.acquireLock(), "Failed to bind")
@@ -145,13 +148,17 @@ class SingleInstanceFloodCapTest {
 
     @Test
     fun `accepted connection with empty partial or rejected reply preserves verified ownership`() {
-        var fixture = "EMPTY"
-        val (server, acceptThread) = startDummyServer { fixture }
+        val fixture = AtomicReference("EMPTY")
+        val (server, acceptThread) = startDummyServer { fixture.get() }
         val dummyPort = server.localPort
 
         try {
+            // Note: Each loop iteration opens three sequential connections while one fixture value is live:
+            // probeInstance, isAnotherInstanceRunning()'s own probe, and acquireLock()'s probe.
+            // For UNREAD_RST, the client encounters Connection Reset on writeLine / readBoundedLine
+            // and treats it as CONNECTED_NO_REPLY via catch (IOException).
             for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED", "UNREAD_RST")) {
-                fixture = currentFixture
+                fixture.set(currentFixture)
                 val descriptor =
                     InstanceDescriptor(
                         transport = SingleInstanceTransport.TCP,
@@ -184,19 +191,20 @@ class SingleInstanceFloodCapTest {
             }
         } finally {
             runCatching { server.close() }
-            acceptThread.join(1000L)
+            acceptThread.join(2000L)
+            assertFalse(acceptThread.isAlive, "Dummy server accept thread must terminate")
         }
     }
 
     @Test
     fun `unverified descriptor with unresponsive or rejected endpoint is reclaimed instead of bricking startup`() {
-        var fixture = "EMPTY"
-        val (server, acceptThread) = startDummyServer { fixture }
+        val fixture = AtomicReference("EMPTY")
+        val (server, acceptThread) = startDummyServer { fixture.get() }
         val dummyPort = server.localPort
 
         try {
             for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED")) {
-                fixture = currentFixture
+                fixture.set(currentFixture)
                 val unverifiedDescriptor =
                     InstanceDescriptor(
                         transport = SingleInstanceTransport.TCP,
@@ -229,7 +237,8 @@ class SingleInstanceFloodCapTest {
             }
         } finally {
             runCatching { server.close() }
-            acceptThread.join(1000L)
+            acceptThread.join(2000L)
+            assertFalse(acceptThread.isAlive, "Dummy server accept thread must terminate")
         }
     }
 
@@ -240,6 +249,7 @@ class SingleInstanceFloodCapTest {
                 while (!server.isClosed) {
                     try {
                         val client = server.accept()
+                        client.soTimeout = 2000
                         when (fixtureProvider()) {
                             "EMPTY" -> {
                                 client.getInputStream().bufferedReader().readLine()
@@ -265,6 +275,10 @@ class SingleInstanceFloodCapTest {
                             "UNREAD_RST" -> {
                                 client.close()
                             }
+
+                            else -> {
+                                client.close()
+                            }
                         }
                     } catch (_: IOException) {
                         break
@@ -286,28 +300,21 @@ class SingleInstanceFloodCapTest {
                 pid = ProcessHandle.current().pid(),
             )
 
+        val acceptedSockets = CopyOnWriteArrayList<Socket>()
         val acceptThread =
             kotlin.concurrent.thread(isDaemon = true) {
                 while (!server.isClosed) {
                     try {
                         val client = server.accept()
-                        client.getInputStream().bufferedReader().readLine()
-                        client.close()
+                        client.soTimeout = 2000
+                        acceptedSockets.add(client)
                     } catch (_: IOException) {
                         break
                     }
                 }
             }
 
-        val failingScheduler =
-            object : ScheduledExecutorService by Executors.newSingleThreadScheduledExecutor() {
-                override fun schedule(
-                    command: Runnable,
-                    delay: Long,
-                    unit: TimeUnit,
-                ): ScheduledFuture<*> = throw RejectedExecutionException("Watchdog scheduling rejected")
-            }
-
+        val failingScheduler = newFailingScheduler()
         try {
             SingleInstanceManager.watchdogSchedulerOverride = failingScheduler
 
@@ -317,24 +324,80 @@ class SingleInstanceFloodCapTest {
                 probe,
                 "probeInstance must return CONNECTED_NO_REPLY when watchdog scheduling fails",
             )
+            assertTrue(acceptedSockets.isNotEmpty(), "Server must have accepted probe connection")
+            assertClientSocketClosed(
+                acceptedSockets.last(),
+                "Client socket must be closed by probeInstance on rejected watchdog setup",
+            )
 
             val reply = SingleInstanceWire.exchange(descriptor, formatPingRequest(descriptor.token))
-            assertEquals(
-                null,
-                reply,
-                "exchange must return null without throwing when watchdog scheduling fails",
+            assertEquals(null, reply, "exchange must return null without throwing when watchdog scheduling fails")
+            assertClientSocketClosed(
+                acceptedSockets.last(),
+                "Client socket must be closed by exchange on rejected watchdog setup",
             )
 
             Files.createDirectories(descriptorPath().parent)
             Files.writeString(descriptorPath(), descriptor.encode())
             val acquired = SingleInstanceManager.acquireLock()
-            assertFalse(acquired, "acquireLock must return false safely without throwing unchecked exception")
+            assertFalse(acquired, "acquireLock must return false safely when watchdog scheduling is rejected")
         } finally {
             failingScheduler.shutdownNow()
             SingleInstanceManager.watchdogSchedulerOverride = null
             runCatching { server.close() }
-            acceptThread.join(1000L)
+            acceptedSockets.forEach { runCatching { it.close() } }
+            acceptThread.join(2000L)
+            assertFalse(acceptThread.isAlive, "Accept thread must terminate")
         }
+    }
+
+    @Test
+    fun `faulted accept loop tears down endpoint so subsequent launch reclaims cleanly`() {
+        assertTrue(SingleInstanceManager.acquireLock(), "First launch must acquire lock")
+        val descriptor = assertNotNull(readPublishedDescriptor(), "Descriptor must exist")
+        val targetAddress = toSocketAddress(descriptor)
+
+        // Inject accept failure while listening is true and channel is open
+        SingleInstanceManager.acceptNextClientOverride = { _, _ -> null }
+
+        // Wake up the accept loop by initiating a connection
+        runCatching { SocketChannel.open(targetAddress).close() }
+
+        // Wait for listener thread to detect accept-null and tear down
+        val deadline = System.currentTimeMillis() + 3000L
+        while (SingleInstanceManager.isListening && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20)
+        }
+        assertFalse(SingleInstanceManager.isListening, "Listener must stop listening upon unexpected accept failure")
+
+        // Descriptor must be withdrawn and channel closed
+        assertNull(readPublishedDescriptor(), "Faulted endpoint descriptor must be withdrawn")
+
+        // Reset the override to simulate next instance launch
+        SingleInstanceManager.acceptNextClientOverride = null
+
+        // Second launch must now cleanly acquire lock without hanging or being bricked
+        val secondAcquired = SingleInstanceManager.acquireLock()
+        assertTrue(secondAcquired, "Next launch must reclaim and acquire lock cleanly after listener fault")
+    }
+
+    private fun newFailingScheduler(): ScheduledExecutorService =
+        object : ScheduledExecutorService by Executors.newSingleThreadScheduledExecutor() {
+            override fun schedule(
+                command: Runnable,
+                delay: Long,
+                unit: TimeUnit,
+            ): ScheduledFuture<*> = throw RejectedExecutionException("Watchdog scheduling rejected")
+        }
+
+    private fun assertClientSocketClosed(
+        socket: Socket,
+        message: String,
+    ) {
+        socket.soTimeout = 2000
+        val eof = socket.getInputStream().read()
+        assertEquals(-1, eof, message)
+        socket.close()
     }
 
     private fun waitForSlotsExhaustion() {
@@ -403,7 +466,11 @@ class SingleInstanceFloodCapTest {
                 Thread.sleep(10)
             }
         }
-        return if (total > 0) total else -1
+        return when {
+            total > 0 -> total
+            done -> -1
+            else -> READ_TIMED_OUT
+        }
     }
 
     private fun toSocketAddress(descriptor: InstanceDescriptor): SocketAddress =
@@ -419,7 +486,7 @@ class SingleInstanceFloodCapTest {
 
     private fun parkedThreadCount(): Int {
         val threads = Thread.getAllStackTraces().keys
-        return threads.count { it.name == "BOSS-IPC-Client-Handler" }
+        return threads.count { it.isAlive && it.name == "BOSS-IPC-Client-Handler" }
     }
 
     private fun descriptorPath(): Path = File(tempDir.toFile(), "run").toPath().resolve("single-instance")

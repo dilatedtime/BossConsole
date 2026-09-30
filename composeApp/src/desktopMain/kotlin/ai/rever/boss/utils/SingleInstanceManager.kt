@@ -887,6 +887,32 @@ internal object SingleInstanceWire {
         }
     }
 
+    /**
+     * Sends one line and reads one bounded line back, retrying with exponential backoff
+     * when the running instance answers with [RESPONSE_BUSY].
+     */
+    fun exchangeWithRetry(
+        descriptor: InstanceDescriptor,
+        request: String,
+        timeoutMs: Long = SingleInstanceManager.connectionBudgetMsOverride ?: CONNECTION_TIMEOUT_MS,
+        maxResponseBytes: Int = MAX_RESPONSE_BYTES,
+        maxRetries: Int = 3,
+    ): String? {
+        var resp = exchange(descriptor, request, timeoutMs, maxResponseBytes)
+        var retries = 0
+        while (resp == RESPONSE_BUSY && retries < maxRetries) {
+            try {
+                Thread.sleep(50L * (1 shl retries))
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+            retries++
+            resp = exchange(descriptor, request, timeoutMs, maxResponseBytes)
+        }
+        return resp
+    }
+
     private fun connect(descriptor: InstanceDescriptor): SocketChannel? =
         try {
             when (descriptor.transport) {
@@ -1269,14 +1295,15 @@ internal val isSingleLineCredential: (String) -> Boolean =
     { token -> token.isNotBlank() && token.none { it == '\n' || it == '\r' || it == ' ' } }
 
 /**
- * Waits for the next connection, or returns null once the channel is gone —
+ * Waits for the next connection, or returns null once the channel is gone --
  * which is what [SingleInstanceManager.release] closing it looks like from here.
  */
 private fun acceptNextClient(
     serverChannel: ServerSocketChannel?,
     isListening: () -> Boolean,
-): SocketChannel? =
-    try {
+): SocketChannel? {
+    SingleInstanceManager.acceptNextClientOverride?.let { return it(serverChannel, isListening) }
+    return try {
         serverChannel?.accept()
     } catch (error: IOException) {
         if (isListening()) {
@@ -1284,6 +1311,7 @@ private fun acceptNextClient(
         }
         null
     }
+}
 
 private fun pluginActionResponse(verdict: kotlinx.coroutines.Deferred<Boolean>?): String {
     // Null is the queued verdict for an external action held for confirmation. Nothing has run,
@@ -1348,15 +1376,19 @@ object SingleInstanceManager {
     /**
      * Bounds the in-flight client handler threads so a local flood cannot park
      * N daemons per request (#1326). When the budget is exhausted, the listener
-     * thread closes the freshly-accepted connection without spawning a handler:
-     * the worst case for the rejected caller is a closed socket, and the worst
-     * case for the host is `MAX_CLIENT_HANDLERS` parked handler threads.
+     * thread responds with BUSY and closes the freshly-accepted connection without
+     * spawning a handler: the rejected caller receives a transient BUSY wire response
+     * enabling cooperative backoff/retry, and the worst case for the host is
+     * `MAX_CLIENT_HANDLERS` parked handler threads.
      */
     private val clientSlots = java.util.concurrent.Semaphore(MAX_CLIENT_HANDLERS)
 
     /** Number of client handler permits currently available (test seam). */
     internal val availableClientSlots: Int
         get() = clientSlots.availablePermits()
+
+    /** Test seam for intercepting client accept in the listener loop. */
+    internal var acceptNextClientOverride: ((ServerSocketChannel?, () -> Boolean) -> SocketChannel?)? = null
 
     /** Test seam; production serves credentials from the running BOSS session. */
     internal var llmTokenProviderOverride: (() -> Result<String>)? = null
@@ -1388,7 +1420,7 @@ object SingleInstanceManager {
     private const val DROPPED_LOG_INTERVAL_NANOS = 1_000_000_000L
 
     @Volatile
-    private var isListening: Boolean = false
+    internal var isListening: Boolean = false
 
     /** The descriptor this process published, or null when it is not the owner. */
     @Volatile
@@ -1476,8 +1508,10 @@ object SingleInstanceManager {
             // At this point probe is BUSY or CONNECTED_NO_REPLY.
             // Positive evidence of ownership is required before refusing to reclaim:
             // A saturated genuine BOSS instance has trust == VERIFIED.
-            // An UNVERIFIED descriptor (e.g. pid == null pointing at a recycled TCP port or dead listener)
-            // must stay reclaimable, otherwise acquireLock blocks startup permanently (#1326).
+            // Note: probeInstance catches Exception and maps unexpected failures fail-closed to
+            // CONNECTED_NO_REPLY. Gating refusal strictly on VERIFIED ensures that legitimate
+            // saturated owners are preserved while unverified descriptors (e.g. pid == null
+            // pointing at a recycled TCP port or dead listener) remain safely reclaimable (#1326).
             trust != DescriptorTrust.VERIFIED -> {
                 logger.warn(
                     LogCategory.SYSTEM,
@@ -1547,7 +1581,18 @@ object SingleInstanceManager {
 
                 while (isListening && !Thread.currentThread().isInterrupted) {
                     try {
-                        val client = acceptNextClient(serverChannel) { isListening } ?: break
+                        val client = acceptNextClient(serverChannel) { isListening }
+                        if (client == null) {
+                            if (isListening && serverChannel?.isOpen == true) {
+                                logger.error(
+                                    LogCategory.SYSTEM,
+                                    "IPC listener accept failed unexpectedly while listening; " +
+                                        "tearing down faulted endpoint",
+                                )
+                                teardownFaultedListener()
+                            }
+                            break
+                        }
                         handleClient(client)
                     } catch (e: Throwable) {
                         if (isListening && !Thread.currentThread().isInterrupted) {
@@ -1562,6 +1607,19 @@ object SingleInstanceManager {
 
                 logger.trace(LogCategory.SYSTEM, "IPC listener thread stopped")
             }
+    }
+
+    private fun teardownFaultedListener() {
+        isListening = false
+        val descriptor = published
+        published = null
+        try {
+            serverChannel?.close()
+        } catch (e: IOException) {
+            logger.warn(LogCategory.SYSTEM, "Error closing faulted server channel", error = e)
+        }
+        serverChannel = null
+        SingleInstanceFiles.withdraw(descriptor)
     }
 
     /**
@@ -1611,6 +1669,12 @@ object SingleInstanceManager {
                         LogCategory.SYSTEM,
                         "Single-instance connection ended early",
                         mapOf("reason" to (e.message ?: "io error")),
+                    )
+                } catch (e: RejectedExecutionException) {
+                    logger.debug(
+                        LogCategory.SYSTEM,
+                        "Single-instance watchdog scheduling rejected",
+                        mapOf("reason" to (e.message ?: "rejected")),
                     )
                 } catch (e: Throwable) {
                     logger.error(
@@ -1772,7 +1836,7 @@ object SingleInstanceManager {
             )
         } else {
             val response =
-                SingleInstanceWire.exchange(
+                SingleInstanceWire.exchangeWithRetry(
                     target,
                     formatLlmTokenRequest(target.token),
                     LLM_TOKEN_TIMEOUT_MS,
@@ -1783,6 +1847,12 @@ object SingleInstanceManager {
                 )
             } else {
                 when {
+                    response == RESPONSE_BUSY -> {
+                        Result.failure(
+                            IllegalStateException("BOSS is busy handling other requests. Please retry shortly."),
+                        )
+                    }
+
                     response.startsWith(RESPONSE_LLM_TOKEN_PREFIX) -> {
                         Result.success(response.removePrefix(RESPONSE_LLM_TOKEN_PREFIX))
                     }
@@ -1808,7 +1878,7 @@ object SingleInstanceManager {
             readSafeDescriptor()
                 ?: return Result.failure(IllegalStateException("BOSS is not running. Launch BOSS to view status."))
         val response =
-            SingleInstanceWire.exchange(
+            SingleInstanceWire.exchangeWithRetry(
                 target,
                 formatStatusRequest(target.token),
                 timeoutMs = CONNECTION_TIMEOUT_MS,
@@ -1818,6 +1888,10 @@ object SingleInstanceManager {
             )
 
         return when {
+            response == RESPONSE_BUSY -> {
+                Result.failure(IllegalStateException("BOSS is busy handling other requests. Please retry shortly."))
+            }
+
             response.startsWith(RESPONSE_STATUS_PREFIX) -> {
                 val base64 = response.removePrefix(RESPONSE_STATUS_PREFIX).trim()
                 try {
@@ -1853,7 +1927,7 @@ object SingleInstanceManager {
             readSafeDescriptor()
                 ?: return Result.failure(IllegalStateException("BOSS is not running. Launch BOSS to list MCP tools."))
         val response =
-            SingleInstanceWire.exchange(
+            SingleInstanceWire.exchangeWithRetry(
                 target,
                 formatMcpListRequest(target.token),
                 timeoutMs = CONNECTION_TIMEOUT_MS,
@@ -1863,6 +1937,10 @@ object SingleInstanceManager {
             )
 
         return when {
+            response == RESPONSE_BUSY -> {
+                Result.failure(IllegalStateException("BOSS is busy handling other requests. Please retry shortly."))
+            }
+
             response.startsWith(RESPONSE_MCP_LIST_PREFIX) -> {
                 val base64 = response.removePrefix(RESPONSE_MCP_LIST_PREFIX).trim()
                 try {
@@ -1921,6 +1999,10 @@ object SingleInstanceManager {
             )
 
         return when {
+            response == RESPONSE_BUSY -> {
+                Result.failure(IllegalStateException("BOSS is busy handling other requests. Please retry shortly."))
+            }
+
             response.startsWith(RESPONSE_MCP_INVOKE_PREFIX) -> {
                 val base64 = response.removePrefix(RESPONSE_MCP_INVOKE_PREFIX).trim()
                 try {
@@ -2007,19 +2089,7 @@ object SingleInstanceManager {
                     "Attempting to connect to existing instance",
                     mapOf("transport" to target.transport.name, "endpoint" to target.endpoint),
                 )
-                var resp = SingleInstanceWire.exchange(target, request)
-                var retries = 0
-                while (resp == RESPONSE_BUSY && retries < 3) {
-                    try {
-                        Thread.sleep(50L * (1 shl retries))
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        return false
-                    }
-                    retries++
-                    resp = SingleInstanceWire.exchange(target, request)
-                }
-                resp
+                SingleInstanceWire.exchangeWithRetry(target, request)
             }
 
         if (response == RESPONSE_OK) {
@@ -2117,6 +2187,12 @@ object SingleInstanceManager {
                 }
 
             when {
+                response == RESPONSE_BUSY -> {
+                    ReloadResult.TimedOut(
+                        "BossConsole is running but busy handling other requests; please retry dev reload",
+                    )
+                }
+
                 response == "RELOAD_OK $pluginId" -> {
                     ReloadResult.Success
                 }
@@ -2163,6 +2239,7 @@ object SingleInstanceManager {
         isListening = false
         val descriptor = published
         published = null
+        acceptNextClientOverride = null
         llmTokenProviderOverride = null
         statusProviderOverride = null
         mcpListProviderOverride = null
