@@ -683,6 +683,25 @@ private object SingleInstanceFiles {
     }
 }
 
+/** Outcome of probing an instance endpoint to determine reachability and liveness. */
+internal enum class SingleInstanceProbe {
+    /** The endpoint answered the ping request with a valid PONG. */
+    PONG,
+
+    /** The endpoint is active and answered with BUSY. */
+    BUSY,
+
+    /**
+     * The endpoint accepted the connection, confirming a live listener is bound to it,
+     * but closed, timed out, or encountered an error before completing a valid reply.
+     * The instance is active, but currently saturated or dropping requests.
+     */
+    CONNECTED_NO_REPLY,
+
+    /** No process is listening on the endpoint (connection refused or socket unlinked). */
+    UNREACHABLE,
+}
+
 /**
  * The socket mechanics: binding an endpoint, and one bounded request/response
  * exchange over it.
@@ -768,17 +787,46 @@ internal object SingleInstanceWire {
         return null
     }
 
+    /** Probes [descriptor]'s endpoint, distinguishing unreachable from live-but-unresponsive endpoints. */
+    fun probeInstance(
+        descriptor: InstanceDescriptor,
+        request: String = formatPingRequest(descriptor.token),
+        timeoutMs: Long = SingleInstanceManager.connectionBudgetMsOverride ?: CONNECTION_TIMEOUT_MS,
+        maxResponseBytes: Int = MAX_RESPONSE_BYTES,
+    ): SingleInstanceProbe {
+        val channel = connect(descriptor) ?: return SingleInstanceProbe.UNREACHABLE
+        val budget = closeAfterBudget(channel, timeoutMs)
+        return try {
+            channel.use { ch ->
+                runCatching { writeLine(ch, request) }
+                val line =
+                    runCatching {
+                        readBoundedLine(BufferedInputStream(Channels.newInputStream(ch)), maxResponseBytes)
+                    }.getOrNull()
+                when (line) {
+                    RESPONSE_PONG -> SingleInstanceProbe.PONG
+                    RESPONSE_BUSY -> SingleInstanceProbe.BUSY
+                    else -> SingleInstanceProbe.CONNECTED_NO_REPLY
+                }
+            }
+        } catch (_: IOException) {
+            SingleInstanceProbe.CONNECTED_NO_REPLY
+        } finally {
+            budget.cancel(false)
+        }
+    }
+
     /** True when something on [descriptor]'s endpoint answers a probe with the published token or is busy. */
     fun respondsToPing(descriptor: InstanceDescriptor): Boolean {
-        val response = exchange(descriptor, formatPingRequest(descriptor.token))
-        return response == RESPONSE_PONG || response == RESPONSE_BUSY
+        val probe = probeInstance(descriptor)
+        return probe == SingleInstanceProbe.PONG || probe == SingleInstanceProbe.BUSY
     }
 
     /** Sends one line and reads one bounded line back, within the connection budget. */
     fun exchange(
         descriptor: InstanceDescriptor,
         request: String,
-        timeoutMs: Long = CONNECTION_TIMEOUT_MS,
+        timeoutMs: Long = SingleInstanceManager.connectionBudgetMsOverride ?: CONNECTION_TIMEOUT_MS,
         maxResponseBytes: Int = MAX_RESPONSE_BYTES,
     ): String? {
         val channel = connect(descriptor) ?: return null
@@ -869,7 +917,7 @@ internal object SingleInstanceWire {
 
     fun closeAfterBudget(
         channel: SocketChannel,
-        timeoutMs: Long = CONNECTION_TIMEOUT_MS,
+        timeoutMs: Long = SingleInstanceManager.connectionBudgetMsOverride ?: CONNECTION_TIMEOUT_MS,
     ): ScheduledFuture<*> {
         val scheduler = watchdogSchedulerOverride ?: watchdog
         return scheduler.schedule(
@@ -885,19 +933,16 @@ internal object SingleInstanceWire {
     }
 
     fun respondBusyAndClose(client: SocketChannel) {
-        runCatching {
+        try {
             client.configureBlocking(false)
             val bytes = ByteBuffer.wrap("$RESPONSE_BUSY\n".toByteArray(StandardCharsets.UTF_8))
-            client.write(bytes)
+            while (bytes.hasRemaining()) {
+                val written = client.write(bytes)
+                if (written == 0) break
+            }
             runCatching { client.shutdownOutput() }
-            val scheduler = watchdogSchedulerOverride ?: watchdog
-            scheduler.schedule(
-                Runnable { runCatching { client.close() } },
-                100L,
-                TimeUnit.MILLISECONDS,
-            )
-        }.onFailure {
-            runCatching { client.close() }
+        } finally {
+            closeQuietly(client)
         }
     }
 
@@ -1287,6 +1332,9 @@ object SingleInstanceManager {
     /** Test seam / host hook for dev plugin reload response. */
     internal var pluginReloadHandlerOverride: ((String) -> Boolean)? = null
 
+    /** Test seam for overriding connection and handler budget timeouts. */
+    internal var connectionBudgetMsOverride: Long? = null
+
     internal var watchdogSchedulerOverride: ScheduledExecutorService?
         get() = SingleInstanceWire.watchdogSchedulerOverride
         set(value) {
@@ -1294,7 +1342,7 @@ object SingleInstanceManager {
         }
 
     private val droppedConnectionsCount = AtomicInteger(0)
-    private val lastDroppedWarningLogNanos = AtomicLong(0L)
+    private val lastDroppedWarningLogNanos = AtomicLong(Long.MIN_VALUE)
     private const val DROPPED_LOG_INTERVAL_NANOS = 1_000_000_000L
 
     @Volatile
@@ -1329,9 +1377,9 @@ object SingleInstanceManager {
         SingleInstanceFiles.read()?.let { existing ->
             // A dead recorded pid proves the descriptor outlived its publisher;
             // a live pid is not proof of anything (pids are reused), so the
-            // channel ping remains what decides.
+            // channel reachability probe remains what decides.
             (existing.pid == null || isProcessAlive(existing.pid)) &&
-                SingleInstanceWire.respondsToPing(existing)
+                SingleInstanceWire.probeInstance(existing) != SingleInstanceProbe.UNREACHABLE
         } ?: false
 
     /**
@@ -1345,38 +1393,49 @@ object SingleInstanceManager {
         SingleInstanceFiles.prepare()
 
         val existing = SingleInstanceFiles.read()
-        if (existing != null) {
-            // A dead recorded pid proves the descriptor is stale, so the ping —
-            // and any squatter answering it — is skipped outright. A live pid
-            // alone proves nothing (pids are reused); the ping still decides.
-            val isDeadPid = existing.pid != null && !isProcessAlive(existing.pid)
-            if (!isDeadPid && SingleInstanceWire.respondsToPing(existing)) {
-                val forged = descriptorTrust(existing) == DescriptorTrust.FORGED
-                if (forged) {
-                    logger.warn(
-                        LogCategory.SYSTEM,
-                        "The single-instance channel answers, but its recorded owner is a different " +
-                            "program - reclaiming a descriptor that may have been planted",
-                        mapOf("endpoint" to existing.endpoint, "pid" to existing.pid),
-                    )
-                } else {
-                    logger.info(LogCategory.SYSTEM, "Another instance is answering on the single-instance channel")
-                }
-                return if (forged) startServer() else false
-            }
-            if (isDeadPid) {
-                logger.debug(
-                    LogCategory.SYSTEM,
-                    "Reclaiming a single-instance descriptor whose recorded process is gone",
-                    mapOf("pid" to existing.pid),
-                )
-            } else {
-                // Nothing answers, so this descriptor outlived its process.
-                logger.debug(LogCategory.SYSTEM, "Reclaiming a single-instance descriptor nothing answers on")
-            }
+        if (existing != null && !shouldReclaimExisting(existing)) {
+            return false
         }
 
         return startServer()
+    }
+
+    private fun shouldReclaimExisting(existing: InstanceDescriptor): Boolean {
+        if (existing.pid != null && !isProcessAlive(existing.pid)) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Reclaiming a single-instance descriptor whose recorded process is gone",
+                mapOf("pid" to existing.pid),
+            )
+            return true
+        }
+        return isReclaimableEndpoint(existing)
+    }
+
+    private fun isReclaimableEndpoint(existing: InstanceDescriptor): Boolean {
+        val probe = SingleInstanceWire.probeInstance(existing)
+        if (probe == SingleInstanceProbe.UNREACHABLE) {
+            logger.debug(LogCategory.SYSTEM, "Reclaiming a single-instance descriptor nothing answers on")
+            return true
+        }
+        val forged = descriptorTrust(existing) == DescriptorTrust.FORGED
+        if (forged) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "The single-instance channel answers, but its recorded owner is a different " +
+                    "program - reclaiming a descriptor that may have been planted",
+                mapOf("endpoint" to existing.endpoint, "pid" to existing.pid),
+            )
+        } else if (probe == SingleInstanceProbe.PONG) {
+            logger.info(LogCategory.SYSTEM, "Another instance is answering on the single-instance channel")
+        } else {
+            logger.info(
+                LogCategory.SYSTEM,
+                "Another instance is active but saturated on the single-instance channel",
+                mapOf("probe" to probe.name),
+            )
+        }
+        return forged
     }
 
     /**
@@ -1418,6 +1477,7 @@ object SingleInstanceManager {
         return true
     }
 
+    @Suppress("TooGenericExceptionCaught")
     private fun startAcceptLoop() {
         isListening = true
         listenerThread =
@@ -1425,8 +1485,18 @@ object SingleInstanceManager {
                 logger.trace(LogCategory.SYSTEM, "IPC listener thread started")
 
                 while (isListening && !Thread.currentThread().isInterrupted) {
-                    val client = acceptNextClient(serverChannel) { isListening } ?: break
-                    handleClient(client)
+                    try {
+                        val client = acceptNextClient(serverChannel) { isListening } ?: break
+                        handleClient(client)
+                    } catch (e: Throwable) {
+                        if (isListening && !Thread.currentThread().isInterrupted) {
+                            logger.error(
+                                LogCategory.SYSTEM,
+                                "Unexpected error in single-instance accept loop",
+                                error = e,
+                            )
+                        }
+                    }
                 }
 
                 logger.trace(LogCategory.SYSTEM, "IPC listener thread stopped")
@@ -1506,7 +1576,9 @@ object SingleInstanceManager {
         val total = droppedConnectionsCount.incrementAndGet()
         val now = System.nanoTime()
         val last = lastDroppedWarningLogNanos.get()
-        if (now - last >= DROPPED_LOG_INTERVAL_NANOS && lastDroppedWarningLogNanos.compareAndSet(last, now)) {
+        if ((last == Long.MIN_VALUE || now - last >= DROPPED_LOG_INTERVAL_NANOS) &&
+            lastDroppedWarningLogNanos.compareAndSet(last, now)
+        ) {
             logger.warn(
                 LogCategory.SYSTEM,
                 "Single-instance handler at capacity; dropping connection without reading (total: $total)",
@@ -1874,7 +1946,14 @@ object SingleInstanceManager {
                     "Attempting to connect to existing instance",
                     mapOf("transport" to target.transport.name, "endpoint" to target.endpoint),
                 )
-                SingleInstanceWire.exchange(target, request)
+                var resp = SingleInstanceWire.exchange(target, request)
+                var retries = 0
+                while (resp == RESPONSE_BUSY && retries < 3) {
+                    Thread.sleep(50L * (1 shl retries))
+                    retries++
+                    resp = SingleInstanceWire.exchange(target, request)
+                }
+                resp
             }
 
         if (response == RESPONSE_OK) {
@@ -2024,8 +2103,9 @@ object SingleInstanceManager {
         mcpInvokeHandlerOverride = null
         pluginReloadHandlerOverride = null
         watchdogSchedulerOverride = null
+        connectionBudgetMsOverride = null
         droppedConnectionsCount.set(0)
-        lastDroppedWarningLogNanos.set(0L)
+        lastDroppedWarningLogNanos.set(Long.MIN_VALUE)
 
         try {
             serverChannel?.close()

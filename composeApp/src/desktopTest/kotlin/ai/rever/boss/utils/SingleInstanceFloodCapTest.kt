@@ -8,6 +8,7 @@ import java.io.File
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.SocketAddress
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
@@ -49,6 +50,7 @@ class SingleInstanceFloodCapTest {
     fun releaseChannel() {
         SingleInstanceManager.release()
         SingleInstanceManager.watchdogSchedulerOverride = null
+        SingleInstanceManager.connectionBudgetMsOverride = null
         SingleInstanceManager.llmTokenProviderOverride = null
         SingleInstanceManager.runtimeDirOverride = null
         waitForSlotsRecovery()
@@ -56,6 +58,7 @@ class SingleInstanceFloodCapTest {
 
     @Test
     fun `handleClient is bounded so a local flood cannot spawn unbounded threads`() {
+        SingleInstanceManager.connectionBudgetMsOverride = 30_000L
         assertTrue(SingleInstanceManager.acquireLock(), "SingleInstanceManager failed to bind")
         val descriptor = assertNotNull(readPublishedDescriptor(), "Published descriptor must exist")
         val targetAddress = toSocketAddress(descriptor)
@@ -79,6 +82,7 @@ class SingleInstanceFloodCapTest {
             assertNotNull(currentDescriptor)
             assertEquals(descriptor.endpoint, currentDescriptor.endpoint, "Endpoint must stay with first host")
             assertEquals(descriptor.pid, currentDescriptor.pid, "PID must stay with first host")
+            assertEquals(descriptor.token, currentDescriptor.token, "Token must stay with first host")
 
             val parkedThreadsAfter = parkedThreadCount()
             val spawned = parkedThreadsAfter - parkedThreadsBefore
@@ -137,6 +141,94 @@ class SingleInstanceFloodCapTest {
         }
     }
 
+    @Test
+    fun `accepted connection with empty or partial reply preserves single-instance ownership`() {
+        val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val dummyPort = server.localPort
+        val descriptor =
+            InstanceDescriptor(
+                transport = SingleInstanceTransport.TCP,
+                endpoint = dummyPort.toString(),
+                token = newChannelToken(),
+                pid = ProcessHandle.current().pid(),
+            )
+
+        val acceptThread =
+            kotlin.concurrent.thread(isDaemon = true) {
+                while (!server.isClosed) {
+                    try {
+                        val client = server.accept()
+                        // Accept and close immediately without sending PONG
+                        client.close()
+                    } catch (_: IOException) {
+                        break
+                    }
+                }
+            }
+
+        try {
+            val probe = SingleInstanceWire.probeInstance(descriptor)
+            assertEquals(
+                SingleInstanceProbe.CONNECTED_NO_REPLY,
+                probe,
+                "Accepted connection without reply must probe as CONNECTED_NO_REPLY",
+            )
+
+            // When published on disk, acquireLock must NOT reclaim the descriptor
+            Files.createDirectories(descriptorPath().parent)
+            Files.writeString(descriptorPath(), descriptor.encode())
+            assertTrue(SingleInstanceManager.isAnotherInstanceRunning(), "Instance should be considered running")
+            val acquired = SingleInstanceManager.acquireLock()
+            assertFalse(acquired, "Must not reclaim descriptor from an active endpoint that gives no reply")
+            val published = readPublishedDescriptor()
+            assertNotNull(published)
+            assertEquals(descriptor.token, published.token, "Descriptor token must remain unchanged")
+        } finally {
+            runCatching { server.close() }
+            acceptThread.join(1000L)
+        }
+    }
+
+    @Test
+    fun `rejection under failing watchdog scheduler still rejects with BUSY without leaking permits`() {
+        SingleInstanceManager.connectionBudgetMsOverride = 30_000L
+        assertTrue(SingleInstanceManager.acquireLock(), "SingleInstanceManager failed to bind")
+        val descriptor = assertNotNull(readPublishedDescriptor(), "Published descriptor must exist")
+        val targetAddress = toSocketAddress(descriptor)
+
+        val failingScheduler =
+            object : ScheduledExecutorService by Executors.newSingleThreadScheduledExecutor() {
+                override fun schedule(
+                    command: Runnable,
+                    delay: Long,
+                    unit: TimeUnit,
+                ): ScheduledFuture<*> = throw RejectedExecutionException("Watchdog scheduling rejected")
+            }
+
+        val heldSockets = mutableListOf<SocketChannel>()
+        try {
+            repeat(MAX_CLIENT_HANDLERS) {
+                heldSockets += SocketChannel.open(targetAddress)
+            }
+            waitForSlotsExhaustion()
+            assertEquals(0, SingleInstanceManager.availableClientSlots, "All client slots should be occupied")
+
+            SingleInstanceManager.watchdogSchedulerOverride = failingScheduler
+            assertOverflowConnectionsRejected(targetAddress, count = 3)
+        } finally {
+            heldSockets.forEach { runCatching { it.close() } }
+            failingScheduler.shutdownNow()
+            SingleInstanceManager.watchdogSchedulerOverride = null
+        }
+
+        waitForSlotsRecovery()
+        assertEquals(
+            MAX_CLIENT_HANDLERS,
+            SingleInstanceManager.availableClientSlots,
+            "Slots must fully recover after held connections close",
+        )
+    }
+
     private fun waitForSlotsExhaustion() {
         val deadline = System.currentTimeMillis() + 5000L
         while (SingleInstanceManager.availableClientSlots > 0 && System.currentTimeMillis() < deadline) {
@@ -169,14 +261,12 @@ class SingleInstanceFloodCapTest {
                 }
             }
 
-            val buf = ByteBuffer.allocate(32)
             overflowSockets.forEach { ch ->
+                val buf = ByteBuffer.allocate(32)
                 val readBytes = runCatching { readWithTimeout(ch, buf) }.getOrDefault(-1)
-                assertTrue(readBytes > 0 || readBytes == -1, "Must read BUSY response or immediate close")
-                if (readBytes > 0) {
-                    val msg = String(buf.array(), 0, readBytes, StandardCharsets.UTF_8).trim()
-                    assertEquals(RESPONSE_BUSY, msg, "Overflow connection must receive BUSY")
-                }
+                assertTrue(readBytes > 0, "Must read BUSY response bytes before connection is closed")
+                val msg = String(buf.array(), 0, readBytes, StandardCharsets.UTF_8).trim()
+                assertEquals(RESPONSE_BUSY, msg, "Overflow connection must receive BUSY")
             }
         } finally {
             overflowSockets.forEach { runCatching { it.close() } }
