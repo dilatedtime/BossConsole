@@ -1418,8 +1418,9 @@ object SingleInstanceManager {
         var spawned = false
         try {
             thread(isDaemon = true, name = "BOSS-IPC-Client-Handler") {
-                var budget = SingleInstanceWire.closeAfterBudget(client)
+                var budget: ScheduledFuture<*>? = null
                 try {
+                    budget = SingleInstanceWire.closeAfterBudget(client)
                     client.use { channel ->
                         val line =
                             SingleInstanceWire.readBoundedLine(
@@ -1432,7 +1433,7 @@ object SingleInstanceManager {
                         // and nothing an unauthenticated caller sends should change what
                         // this process is willing to spend on it.
                         if (request != null && isLongerBudgetCandidate(request)) {
-                            budget.cancel(false)
+                            budget?.cancel(false)
                             val timeout =
                                 if (request.verb == VERB_LLM_TOKEN) LLM_TOKEN_TIMEOUT_MS else MCP_INVOKE_TIMEOUT_MS
                             budget = SingleInstanceWire.closeAfterBudget(channel, timeout)
@@ -1446,7 +1447,7 @@ object SingleInstanceManager {
                         mapOf("reason" to (e.message ?: "io error")),
                     )
                 } finally {
-                    budget.cancel(false)
+                    budget?.cancel(false)
                     clientSlots.release()
                 }
             }

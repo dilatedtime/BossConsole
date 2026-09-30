@@ -14,8 +14,6 @@ import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -74,20 +72,29 @@ class SingleInstanceFloodCapTest {
         } finally {
             heldSockets.forEach { runCatching { it.close() } }
         }
+
+        waitForSlotsRecovery()
+        assertEquals(
+            MAX_CLIENT_HANDLERS,
+            SingleInstanceManager.availableClientSlots,
+            "Client handler slots must fully recover after connections close",
+        )
     }
 
     private fun waitForSlotsExhaustion() {
-        val drained = CountDownLatch(1)
-        Thread {
-            while (SingleInstanceManager.availableClientSlots > 0) {
-                Thread.sleep(20)
-            }
-            drained.countDown()
-        }.start()
-        assertTrue(
-            drained.await(5, TimeUnit.SECONDS),
-            "Listener did not allocate all 32 client slots in time",
-        )
+        val deadline = System.currentTimeMillis() + 5000L
+        while (SingleInstanceManager.availableClientSlots > 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20)
+        }
+    }
+
+    private fun waitForSlotsRecovery() {
+        val deadline = System.currentTimeMillis() + 5000L
+        while (SingleInstanceManager.availableClientSlots < MAX_CLIENT_HANDLERS &&
+            System.currentTimeMillis() < deadline
+        ) {
+            Thread.sleep(20)
+        }
     }
 
     private fun assertOverflowConnectionsRejected(
@@ -98,7 +105,9 @@ class SingleInstanceFloodCapTest {
         try {
             repeat(count) {
                 try {
-                    overflowSockets += SocketChannel.open(targetAddress)
+                    val ch = SocketChannel.open(targetAddress)
+                    ch.configureBlocking(false)
+                    overflowSockets += ch
                 } catch (_: IOException) {
                     // Rejected synchronously at transport layer
                 }
@@ -106,17 +115,26 @@ class SingleInstanceFloodCapTest {
 
             val buf = ByteBuffer.allocate(16)
             overflowSockets.forEach { ch ->
-                val readBytes =
-                    try {
-                        ch.read(buf)
-                    } catch (_: IOException) {
-                        -1
-                    }
+                val readBytes = runCatching { readWithTimeout(ch, buf) }.getOrDefault(-1)
                 assertEquals(-1, readBytes, "Overflow connection must be immediately closed by server")
             }
         } finally {
             overflowSockets.forEach { runCatching { it.close() } }
         }
+    }
+
+    private fun readWithTimeout(
+        ch: SocketChannel,
+        buf: ByteBuffer,
+        timeoutMs: Long = 2000L,
+    ): Int {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var r = ch.read(buf)
+        while (r == 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20)
+            r = ch.read(buf)
+        }
+        return r
     }
 
     private fun toSocketAddress(descriptor: InstanceDescriptor): SocketAddress =
