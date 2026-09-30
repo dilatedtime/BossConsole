@@ -7,8 +7,14 @@ import ai.rever.boss.mcp.secrets.captureHostLogs
 import ai.rever.boss.plugin.workspace.PanelConfig
 import ai.rever.boss.plugin.workspace.SplitConfig
 import ai.rever.boss.plugin.workspace.WorkspaceSerializer
-import kotlinx.coroutines.delay
+import ai.rever.boss.utils.logging.BossLogger
+import ai.rever.boss.utils.logging.LogEntry
+import ai.rever.boss.utils.logging.LogListener
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
@@ -30,7 +36,7 @@ class WorkspaceDecodePrivacyTest {
     lateinit var dir: File
 
     @Test
-    fun `a corrupt Space file is logged without its layout data`() =
+    fun `a corrupt Space file is logged without its layout data`() {
         runBlocking {
             val secret = "private-space-url-${System.nanoTime()}"
             val fileName = "corrupt-space.json"
@@ -42,9 +48,10 @@ class WorkspaceDecodePrivacyTest {
             assertNull(loaded)
             assertDecodeFailureRedacted(logged, "Failed to load workspace file", secret)
         }
+    }
 
     @Test
-    fun `a corrupt Last Session set is logged without its saved tabs`() =
+    fun `a corrupt Last Session set is logged without its saved tabs`() {
         runBlocking {
             val secret = "private-session-tab-${System.nanoTime()}"
             val fileManager = WorkspaceFileManager(dir.absolutePath)
@@ -59,6 +66,7 @@ class WorkspaceDecodePrivacyTest {
             assertNull(loaded)
             assertDecodeFailureRedacted(logged, "Last Session set could not be read", secret)
         }
+    }
 
     @Test
     fun `a rejected Space import is logged without caller JSON`() {
@@ -73,7 +81,7 @@ class WorkspaceDecodePrivacyTest {
     }
 
     @Test
-    fun `a corrupt Space file loaded via CLI workspace event is logged without its layout data`() =
+    fun `a corrupt Space file loaded via CLI workspace event is logged without its layout data`() {
         runBlocking {
             val secret = "private-cli-space-secret-${System.nanoTime()}"
             val fileName = "corrupt-cli-space.json"
@@ -81,63 +89,112 @@ class WorkspaceDecodePrivacyTest {
             corruptFile.writeText("{\"name\":\"CLISpace\",\"url\":\"https://$secret.example/")
             var loadedWorkspace: LayoutWorkspace? = null
 
+            val loggedSignal = CompletableDeferred<Unit>()
+            val logger = BossLogger.forComponent("BossAppEventBusEffects")
+
             val (_, logged) =
                 captureHostLogs {
                     runBlocking {
-                        val subscription =
-                            subscribeWorkspaceLoadEvents(
-                                windowId = "window-cli-test",
-                                onLoadSpace = { _, workspace -> loadedWorkspace = workspace },
+                        val before = WorkspaceEventBus.subscriptionCount.value
+                        val logListener =
+                            LogListener { entry ->
+                                if (entry.message == "Workspace load from CLI failed") {
+                                    loggedSignal.complete(Unit)
+                                }
+                            }
+                        BossLogger.addListener(logListener)
+                        try {
+                            val subscription =
+                                subscribeWorkspaceLoadEvents(
+                                    windowId = "window-cli-test",
+                                    logger = logger,
+                                    onLoadSpace = { _, workspace -> loadedWorkspace = workspace },
+                                )
+                            WorkspaceEventBus.subscriptionCount.first { it > before }
+                            WorkspaceEventBus.loadWorkspace(
+                                workspacePath = corruptFile.absolutePath,
+                                sourceWindowId = "window-cli-test",
                             )
-                        WorkspaceEventBus.loadWorkspace(
-                            workspacePath = corruptFile.absolutePath,
-                            sourceWindowId = "window-cli-test",
-                        )
-                        delay(50)
-                        subscription.cancel()
+                            withTimeout(5_000) { loggedSignal.await() }
+                            subscription.cancelAndJoin()
+                        } finally {
+                            BossLogger.removeListener(logListener)
+                        }
                     }
                 }
 
             assertNull(loadedWorkspace, "corrupt Space must not be loaded")
             assertDecodeFailureRedacted(logged, "Workspace load from CLI failed", secret)
             val failure = logged.single { it.message == "Workspace load from CLI failed" }
-            assertEquals(corruptFile.absolutePath, failure.data?.get("path"))
+            assertEquals(corruptFile.absolutePath, failure.data?.get("spacePath"))
         }
+    }
 
     @Test
-    fun `a corrupt Space file targeted at another window does not log or dispatch in this window`() =
+    fun `a corrupt Space file targeted at another window does not log or dispatch in this window`() {
         runBlocking {
-            val secret = "private-other-window-secret-${System.nanoTime()}"
-            val corruptFile = File(dir, "other-window.json")
-            corruptFile.writeText("{\"name\":\"OtherSpace\",\"command\":\"echo $secret")
-            var loadedWorkspace: LayoutWorkspace? = null
+            val secretOther = "private-other-window-secret-${System.nanoTime()}"
+            val corruptFileOther = File(dir, "other-window.json")
+            corruptFileOther.writeText("{\"name\":\"OtherSpace\",\"command\":\"echo $secretOther")
+
+            val validWorkspace =
+                LayoutWorkspace(
+                    id = "control-space-id",
+                    name = "ControlSpace",
+                    description = "Positive control",
+                    layout = SplitConfig.SinglePanel(PanelConfig("test-panel", emptyList())),
+                )
+            val validFileActive = File(dir, "active-control-space.json")
+            validFileActive.writeText(WorkspaceSerializer.serialize(validWorkspace))
+
+            var otherDispatched = false
+            var activeDispatched = false
+            val activeSignal = CompletableDeferred<Unit>()
+            val logger = BossLogger.forComponent("BossAppEventBusEffects")
 
             val (_, logged) =
                 captureHostLogs {
                     runBlocking {
+                        val before = WorkspaceEventBus.subscriptionCount.value
                         val subscription =
                             subscribeWorkspaceLoadEvents(
                                 windowId = "window-active",
-                                onLoadSpace = { _, workspace -> loadedWorkspace = workspace },
+                                logger = logger,
+                                onLoadSpace = { event, _ ->
+                                    if (event.sourceWindowId == "window-other") {
+                                        otherDispatched = true
+                                    }
+                                    if (event.sourceWindowId == "window-active") {
+                                        activeDispatched = true
+                                        activeSignal.complete(Unit)
+                                    }
+                                },
                             )
+                        WorkspaceEventBus.subscriptionCount.first { it > before }
                         WorkspaceEventBus.loadWorkspace(
-                            workspacePath = corruptFile.absolutePath,
+                            workspacePath = corruptFileOther.absolutePath,
                             sourceWindowId = "window-other",
                         )
-                        delay(50)
-                        subscription.cancel()
+                        WorkspaceEventBus.loadWorkspace(
+                            workspacePath = validFileActive.absolutePath,
+                            sourceWindowId = "window-active",
+                        )
+                        withTimeout(5_000) { activeSignal.await() }
+                        subscription.cancelAndJoin()
                     }
                 }
 
-            assertNull(loadedWorkspace)
+            assertTrue(activeDispatched, "positive control for window-active must be dispatched")
+            assertFalse(otherDispatched, "events for window-other must not be dispatched in window-active")
             assertTrue(
                 logged.none { it.message == "Workspace load from CLI failed" },
-                "events for window-other must not be processed by window-active",
+                "events for window-other must not log failures in window-active",
             )
         }
+    }
 
     @Test
-    fun `valid Space file loaded via CLI workspace event dispatches to onLoadSpace without errors`() =
+    fun `valid Space file loaded via CLI workspace event dispatches to onLoadSpace without errors`() {
         runBlocking {
             val validWorkspace =
                 LayoutWorkspace(
@@ -150,24 +207,30 @@ class WorkspaceDecodePrivacyTest {
             validFile.writeText(WorkspaceSerializer.serialize(validWorkspace))
             var loadedEvent: WorkspaceLoadEvent? = null
             var loadedSpace: LayoutWorkspace? = null
+            val loadedSignal = CompletableDeferred<Unit>()
+            val logger = BossLogger.forComponent("BossAppEventBusEffects")
 
             val (_, logged) =
                 captureHostLogs {
                     runBlocking {
+                        val before = WorkspaceEventBus.subscriptionCount.value
                         val subscription =
                             subscribeWorkspaceLoadEvents(
                                 windowId = "window-valid",
+                                logger = logger,
                                 onLoadSpace = { event, workspace ->
                                     loadedEvent = event
                                     loadedSpace = workspace
+                                    loadedSignal.complete(Unit)
                                 },
                             )
+                        WorkspaceEventBus.subscriptionCount.first { it > before }
                         WorkspaceEventBus.loadWorkspace(
                             workspacePath = validFile.absolutePath,
                             sourceWindowId = "window-valid",
                         )
-                        delay(50)
-                        subscription.cancel()
+                        withTimeout(5_000) { loadedSignal.await() }
+                        subscription.cancelAndJoin()
                     }
                 }
 
@@ -179,38 +242,103 @@ class WorkspaceDecodePrivacyTest {
                 "valid workspace load must not log failure",
             )
         }
+    }
 
     @Test
-    fun `an unreadable Space path on CLI workspace event retains error throwable`() =
+    fun `an unreadable Space path on CLI workspace event retains error throwable`() {
         runBlocking {
             val subDir = File(dir, "unreadable-dir-space")
             subDir.mkdir()
+            val loggedSignal = CompletableDeferred<Unit>()
+            val logger = BossLogger.forComponent("BossAppEventBusEffects")
 
             val (_, logged) =
                 captureHostLogs {
                     runBlocking {
-                        val subscription =
-                            subscribeWorkspaceLoadEvents(
-                                windowId = "window-io-test",
-                                onLoadSpace = { _, _ -> },
+                        val before = WorkspaceEventBus.subscriptionCount.value
+                        val logListener =
+                            LogListener { entry ->
+                                if (entry.message == "Workspace load from CLI failed") {
+                                    loggedSignal.complete(Unit)
+                                }
+                            }
+                        BossLogger.addListener(logListener)
+                        try {
+                            val subscription =
+                                subscribeWorkspaceLoadEvents(
+                                    windowId = "window-io-test",
+                                    logger = logger,
+                                    onLoadSpace = { _, _ -> },
+                                )
+                            WorkspaceEventBus.subscriptionCount.first { it > before }
+                            WorkspaceEventBus.loadWorkspace(
+                                workspacePath = subDir.absolutePath,
+                                sourceWindowId = "window-io-test",
                             )
-                        WorkspaceEventBus.loadWorkspace(
-                            workspacePath = subDir.absolutePath,
-                            sourceWindowId = "window-io-test",
-                        )
-                        delay(50)
-                        subscription.cancel()
+                            withTimeout(5_000) { loggedSignal.await() }
+                            subscription.cancelAndJoin()
+                        } finally {
+                            BossLogger.removeListener(logListener)
+                        }
                     }
                 }
 
             val failure = logged.single { it.message == "Workspace load from CLI failed" }
             assertNotNull(failure.error, "ordinary I/O exceptions must retain their throwable")
-            assertEquals(subDir.absolutePath, failure.data?.get("path"))
+            assertEquals(subDir.absolutePath, failure.data?.get("spacePath"))
             assertNull(failure.data?.get("decodeFailure"), "ordinary I/O must not be classified as decode failure")
         }
+    }
+
+    @Test
+    fun `decode failure carrying at path segment preserves spacePath and logs JSON path`() {
+        runBlocking {
+            val secret = "nested-private-url-${System.nanoTime()}"
+            val corruptFile = File(dir, "corrupt-at-path.json")
+            corruptFile.writeText("{\"name\":\"SpaceWithPath\",\"url\":\"https://$secret.example/\",\"layout\":")
+            val loggedSignal = CompletableDeferred<Unit>()
+            val logger = BossLogger.forComponent("BossAppEventBusEffects")
+
+            val (_, logged) =
+                captureHostLogs {
+                    runBlocking {
+                        val before = WorkspaceEventBus.subscriptionCount.value
+                        val logListener =
+                            LogListener { entry ->
+                                if (entry.message == "Workspace load from CLI failed") {
+                                    loggedSignal.complete(Unit)
+                                }
+                            }
+                        BossLogger.addListener(logListener)
+                        try {
+                            val subscription =
+                                subscribeWorkspaceLoadEvents(
+                                    windowId = "window-path-test",
+                                    logger = logger,
+                                    onLoadSpace = { _, _ -> },
+                                )
+                            WorkspaceEventBus.subscriptionCount.first { it > before }
+                            WorkspaceEventBus.loadWorkspace(
+                                workspacePath = corruptFile.absolutePath,
+                                sourceWindowId = "window-path-test",
+                            )
+                            withTimeout(5_000) { loggedSignal.await() }
+                            subscription.cancelAndJoin()
+                        } finally {
+                            BossLogger.removeListener(logListener)
+                        }
+                    }
+                }
+
+            assertDecodeFailureRedacted(logged, "Workspace load from CLI failed", secret)
+            val failure = logged.single { it.message == "Workspace load from CLI failed" }
+            assertEquals(corruptFile.absolutePath, failure.data?.get("spacePath"))
+            assertNotNull(failure.data?.get("path"), "JSON path from decodeFailure must be preserved")
+        }
+    }
 
     private fun assertDecodeFailureRedacted(
-        logged: List<ai.rever.boss.utils.logging.LogEntry>,
+        logged: List<LogEntry>,
         message: String,
         secret: String,
     ) {

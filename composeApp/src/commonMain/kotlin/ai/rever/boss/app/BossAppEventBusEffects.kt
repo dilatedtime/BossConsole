@@ -74,6 +74,7 @@ import ai.rever.boss.window.WindowProjectState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1334,7 +1335,7 @@ private suspend fun loadRequestedSpace(
  */
 internal fun CoroutineScope.subscribeWorkspaceLoadEvents(
     windowId: String,
-    logger: ComponentLogger = BossLogger.forComponent("BossAppEventBusEffects"),
+    logger: ComponentLogger,
     onLoadSpace: suspend (WorkspaceLoadEvent, LayoutWorkspace) -> Unit,
 ): Job =
     WorkspaceEventBus.workspaceLoadEvents
@@ -1353,14 +1354,16 @@ internal fun CoroutineScope.subscribeWorkspaceLoadEvents(
                 logger.warn(
                     LogCategory.WORKSPACE,
                     "Workspace load from CLI failed",
-                    mapOf("path" to event.workspacePath) + decodeFailure(e),
+                    mapOf("spacePath" to event.workspacePath) + decodeFailure(e),
                 )
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 logger.warn(
                     LogCategory.WORKSPACE,
                     "Workspace load from CLI failed",
                     mapOf(
-                        "path" to event.workspacePath,
+                        "spacePath" to event.workspacePath,
                     ),
                     error = e,
                 )
