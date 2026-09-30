@@ -17,8 +17,8 @@ import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -249,35 +249,34 @@ class SingleInstanceFloodCapTest {
                 while (!server.isClosed) {
                     try {
                         val client = server.accept()
-                        client.soTimeout = 2000
-                        when (fixtureProvider()) {
-                            "EMPTY" -> {
-                                client.getInputStream().bufferedReader().readLine()
-                                client.close()
-                            }
+                        client.use {
+                            client.soTimeout = 2000
+                            when (fixtureProvider()) {
+                                "EMPTY" -> {
+                                    client.getInputStream().bufferedReader().readLine()
+                                }
 
-                            "PARTIAL" -> {
-                                client.getInputStream().bufferedReader().readLine()
-                                val out = client.getOutputStream()
-                                out.write("BUS".toByteArray(StandardCharsets.UTF_8))
-                                out.flush()
-                                client.close()
-                            }
+                                "PARTIAL" -> {
+                                    client.getInputStream().bufferedReader().readLine()
+                                    val out = client.getOutputStream()
+                                    out.write("BUS".toByteArray(StandardCharsets.UTF_8))
+                                    out.flush()
+                                }
 
-                            "REJECTED" -> {
-                                client.getInputStream().bufferedReader().readLine()
-                                val out = client.getOutputStream()
-                                out.write("REJECTED\n".toByteArray(StandardCharsets.UTF_8))
-                                out.flush()
-                                client.close()
-                            }
+                                "REJECTED" -> {
+                                    client.getInputStream().bufferedReader().readLine()
+                                    val out = client.getOutputStream()
+                                    out.write("REJECTED\n".toByteArray(StandardCharsets.UTF_8))
+                                    out.flush()
+                                }
 
-                            "UNREAD_RST" -> {
-                                client.close()
-                            }
+                                "UNREAD_RST" -> {
+                                    // Intentionally left unread; closed by client.use
+                                }
 
-                            else -> {
-                                client.close()
+                                else -> {
+                                    // Closed by client.use
+                                }
                             }
                         }
                     } catch (_: IOException) {
@@ -287,6 +286,22 @@ class SingleInstanceFloodCapTest {
             }
         return server to acceptThread
     }
+
+    private fun startQueueDummyServer(
+        server: ServerSocket,
+        queue: LinkedBlockingQueue<Socket>,
+    ): Thread =
+        kotlin.concurrent.thread(isDaemon = true) {
+            while (!server.isClosed) {
+                try {
+                    val client = server.accept()
+                    client.soTimeout = 2000
+                    queue.put(client)
+                } catch (_: IOException) {
+                    break
+                }
+            }
+        }
 
     @Test
     fun `probeInstance and exchange under failing watchdog scheduler do not leak socket or throw`() {
@@ -300,19 +315,8 @@ class SingleInstanceFloodCapTest {
                 pid = ProcessHandle.current().pid(),
             )
 
-        val acceptedSockets = CopyOnWriteArrayList<Socket>()
-        val acceptThread =
-            kotlin.concurrent.thread(isDaemon = true) {
-                while (!server.isClosed) {
-                    try {
-                        val client = server.accept()
-                        client.soTimeout = 2000
-                        acceptedSockets.add(client)
-                    } catch (_: IOException) {
-                        break
-                    }
-                }
-            }
+        val acceptedQueue = LinkedBlockingQueue<Socket>()
+        val acceptThread = startQueueDummyServer(server, acceptedQueue)
 
         val failingScheduler = newFailingScheduler()
         try {
@@ -324,16 +328,19 @@ class SingleInstanceFloodCapTest {
                 probe,
                 "probeInstance must return CONNECTED_NO_REPLY when watchdog scheduling fails",
             )
-            assertTrue(acceptedSockets.isNotEmpty(), "Server must have accepted probe connection")
+            val probeSocket = acceptedQueue.poll(3000L, TimeUnit.MILLISECONDS)
+            assertNotNull(probeSocket, "Server must have accepted probe connection")
             assertClientSocketClosed(
-                acceptedSockets.last(),
+                probeSocket,
                 "Client socket must be closed by probeInstance on rejected watchdog setup",
             )
 
             val reply = SingleInstanceWire.exchange(descriptor, formatPingRequest(descriptor.token))
             assertEquals(null, reply, "exchange must return null without throwing when watchdog scheduling fails")
+            val exchangeSocket = acceptedQueue.poll(3000L, TimeUnit.MILLISECONDS)
+            assertNotNull(exchangeSocket, "Server must have accepted exchange connection")
             assertClientSocketClosed(
-                acceptedSockets.last(),
+                exchangeSocket,
                 "Client socket must be closed by exchange on rejected watchdog setup",
             )
 
@@ -345,7 +352,9 @@ class SingleInstanceFloodCapTest {
             failingScheduler.shutdownNow()
             SingleInstanceManager.watchdogSchedulerOverride = null
             runCatching { server.close() }
-            acceptedSockets.forEach { runCatching { it.close() } }
+            while (acceptedQueue.isNotEmpty()) {
+                runCatching { acceptedQueue.poll()?.close() }
+            }
             acceptThread.join(2000L)
             assertFalse(acceptThread.isAlive, "Accept thread must terminate")
         }
@@ -363,12 +372,22 @@ class SingleInstanceFloodCapTest {
         // Wake up the accept loop by initiating a connection
         runCatching { SocketChannel.open(targetAddress).close() }
 
-        // Wait for listener thread to detect accept-null and tear down
+        // Wait for listener thread to detect accept-null, finish teardown, and terminate
         val deadline = System.currentTimeMillis() + 3000L
-        while (SingleInstanceManager.isListening && System.currentTimeMillis() < deadline) {
+        while ((SingleInstanceManager.isListening || SingleInstanceManager.isListenerAlive) &&
+            System.currentTimeMillis() < deadline
+        ) {
             Thread.sleep(20)
         }
         assertFalse(SingleInstanceManager.isListening, "Listener must stop listening upon unexpected accept failure")
+        assertFalse(SingleInstanceManager.isListenerAlive, "Listener thread must terminate upon accept failure")
+
+        waitForSlotsRecovery()
+        assertEquals(
+            MAX_CLIENT_HANDLERS,
+            SingleInstanceManager.availableClientSlots,
+            "Client handler slots must recover after old accepted connection closes",
+        )
 
         // Descriptor must be withdrawn and channel closed
         assertNull(readPublishedDescriptor(), "Faulted endpoint descriptor must be withdrawn")

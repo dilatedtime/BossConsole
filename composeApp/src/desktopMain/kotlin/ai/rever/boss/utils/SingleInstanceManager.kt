@@ -1370,8 +1370,13 @@ private fun pluginActionResponse(verdict: kotlinx.coroutines.Deferred<Boolean>?)
  */
 @Suppress("TooManyFunctions", "LargeClass")
 object SingleInstanceManager {
+    private val lifecycleLock = Any()
     private var serverChannel: ServerSocketChannel? = null
     private var listenerThread: Thread? = null
+
+    /** Indicates whether the IPC listener thread is currently running. */
+    internal val isListenerAlive: Boolean
+        get() = listenerThread?.isAlive == true
 
     /**
      * Bounds the in-flight client handler threads so a local flood cannot park
@@ -1459,16 +1464,17 @@ object SingleInstanceManager {
      * the channel. On success the channel is listening and the descriptor is
      * published.
      */
-    fun acquireLock(): Boolean {
-        SingleInstanceFiles.prepare()
+    fun acquireLock(): Boolean =
+        synchronized(lifecycleLock) {
+            SingleInstanceFiles.prepare()
 
-        val existing = SingleInstanceFiles.read()
-        if (existing != null && !shouldReclaimExisting(existing)) {
-            return false
+            val existing = SingleInstanceFiles.read()
+            if (existing != null && !shouldReclaimExisting(existing)) {
+                return false
+            }
+
+            return startServer()
         }
-
-        return startServer()
-    }
 
     private fun shouldReclaimExisting(existing: InstanceDescriptor): Boolean {
         if (existing.pid != null && !isProcessAlive(existing.pid)) {
@@ -1537,40 +1543,59 @@ object SingleInstanceManager {
      * Bind the channel, publish the descriptor and start accepting.
      * Returns false when there is nothing a second launch could reach.
      */
-    private fun startServer(): Boolean {
-        val token = newChannelToken()
-        val bound =
-            SingleInstanceWire.openUnixServer(SingleInstanceFiles.socketFile, token)
-                ?: SingleInstanceWire.openTcpServer(token)
-        serverChannel = bound?.first
+    private fun startServer(): Boolean =
+        synchronized(lifecycleLock) {
+            listenerThread?.let {
+                if (it.isAlive && it != Thread.currentThread()) {
+                    try {
+                        it.join(1000L)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        logger.warn(LogCategory.SYSTEM, "Interrupted waiting for previous listener thread", error = e)
+                    }
+                }
+            }
+            listenerThread = null
+            try {
+                serverChannel?.close()
+            } catch (e: IOException) {
+                logger.warn(LogCategory.SYSTEM, "Error closing previous server channel", error = e)
+            }
+            serverChannel = null
 
-        // Without a published descriptor no second launch could reach us, and the
-        // token would be unknowable, so failing to publish is failing to start
-        // rather than listening on something nobody can address.
-        val descriptor = bound?.second?.takeIf { SingleInstanceFiles.write(it) }
-        if (descriptor == null) {
-            logger.error(
+            val token = newChannelToken()
+            val bound =
+                SingleInstanceWire.openUnixServer(SingleInstanceFiles.socketFile, token)
+                    ?: SingleInstanceWire.openTcpServer(token)
+            serverChannel = bound?.first
+
+            // Without a published descriptor no second launch could reach us, and the
+            // token would be unknowable, so failing to publish is failing to start
+            // rather than listening on something nobody can address.
+            val descriptor = bound?.second?.takeIf { SingleInstanceFiles.write(it) }
+            if (descriptor == null) {
+                logger.error(
+                    LogCategory.SYSTEM,
+                    if (bound == null) {
+                        "Failed to bind the single-instance channel on any endpoint"
+                    } else {
+                        "Failed to publish the single-instance descriptor"
+                    },
+                )
+                release()
+                return false
+            }
+
+            published = descriptor
+            logger.info(
                 LogCategory.SYSTEM,
-                if (bound == null) {
-                    "Failed to bind the single-instance channel on any endpoint"
-                } else {
-                    "Failed to publish the single-instance descriptor"
-                },
+                "Single-instance channel listening",
+                mapOf("transport" to descriptor.transport.name, "endpoint" to descriptor.endpoint),
             )
-            release()
-            return false
+
+            startAcceptLoop()
+            return true
         }
-
-        published = descriptor
-        logger.info(
-            LogCategory.SYSTEM,
-            "Single-instance channel listening",
-            mapOf("transport" to descriptor.transport.name, "endpoint" to descriptor.endpoint),
-        )
-
-        startAcceptLoop()
-        return true
-    }
 
     @Suppress("TooGenericExceptionCaught")
     private fun startAcceptLoop() {
@@ -1609,18 +1634,19 @@ object SingleInstanceManager {
             }
     }
 
-    private fun teardownFaultedListener() {
-        isListening = false
-        val descriptor = published
-        published = null
-        try {
-            serverChannel?.close()
-        } catch (e: IOException) {
-            logger.warn(LogCategory.SYSTEM, "Error closing faulted server channel", error = e)
+    private fun teardownFaultedListener() =
+        synchronized(lifecycleLock) {
+            val descriptor = published
+            published = null
+            try {
+                serverChannel?.close()
+            } catch (e: IOException) {
+                logger.warn(LogCategory.SYSTEM, "Error closing faulted server channel", error = e)
+            }
+            serverChannel = null
+            SingleInstanceFiles.withdraw(descriptor)
+            isListening = false
         }
-        serverChannel = null
-        SingleInstanceFiles.withdraw(descriptor)
-    }
 
     /**
      * Handle one connection.
@@ -2233,40 +2259,43 @@ object SingleInstanceManager {
      * Stop the channel and withdraw the descriptor.
      * Should be called on application shutdown.
      */
-    fun release() {
-        logger.info(LogCategory.SYSTEM, "Releasing the single-instance channel...")
+    fun release() =
+        synchronized(lifecycleLock) {
+            logger.info(LogCategory.SYSTEM, "Releasing the single-instance channel...")
 
-        isListening = false
-        val descriptor = published
-        published = null
-        acceptNextClientOverride = null
-        llmTokenProviderOverride = null
-        statusProviderOverride = null
-        mcpListProviderOverride = null
-        mcpInvokeHandlerOverride = null
-        pluginReloadHandlerOverride = null
-        watchdogSchedulerOverride = null
-        connectionBudgetMsOverride = null
-        droppedConnectionsCount.set(0)
-        lastDroppedWarningLogNanos.set(Long.MIN_VALUE)
+            isListening = false
+            val descriptor = published
+            published = null
+            acceptNextClientOverride = null
+            llmTokenProviderOverride = null
+            statusProviderOverride = null
+            mcpListProviderOverride = null
+            mcpInvokeHandlerOverride = null
+            pluginReloadHandlerOverride = null
+            watchdogSchedulerOverride = null
+            connectionBudgetMsOverride = null
+            droppedConnectionsCount.set(0)
+            lastDroppedWarningLogNanos.set(Long.MIN_VALUE)
 
-        try {
-            serverChannel?.close()
-        } catch (e: IOException) {
-            logger.warn(LogCategory.SYSTEM, "Error closing the server channel", error = e)
+            try {
+                serverChannel?.close()
+            } catch (e: IOException) {
+                logger.warn(LogCategory.SYSTEM, "Error closing the server channel", error = e)
+            }
+            serverChannel = null
+
+            try {
+                if (listenerThread != Thread.currentThread()) {
+                    listenerThread?.join(1000)
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                logger.warn(LogCategory.SYSTEM, "Interrupted waiting for the listener thread", error = e)
+            }
+            listenerThread = null
+
+            SingleInstanceFiles.withdraw(descriptor)
+
+            logger.info(LogCategory.SYSTEM, "Single-instance channel released")
         }
-        serverChannel = null
-
-        try {
-            listenerThread?.join(1000)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            logger.warn(LogCategory.SYSTEM, "Interrupted waiting for the listener thread", error = e)
-        }
-        listenerThread = null
-
-        SingleInstanceFiles.withdraw(descriptor)
-
-        logger.info(LogCategory.SYSTEM, "Single-instance channel released")
-    }
 }
