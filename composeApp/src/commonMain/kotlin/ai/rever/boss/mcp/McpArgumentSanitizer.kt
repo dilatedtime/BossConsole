@@ -154,13 +154,19 @@ object McpArgumentSanitizer {
     /**
      * A candidate `{{secret:...}}` that is not a valid secret reference. A valid reference
      * (`{{secret:<uuid>}}`) is preserved in cleartext so operators and audits can see which secret
-     * was authorized; any invalid candidate (e.g. `{{secret:hunter2}}`) may be an agent-authored
-     * plaintext credential with no keyword prefix, so it is redacted before reaching refusal
-     * messages, dialogs, or disk.
+     * was authorized; any invalid candidate (e.g. `{{secret:hunter2}}` or an unterminated
+     * `{{secret:hunter2}`) may be an agent-authored plaintext credential with no keyword prefix,
+     * so it is redacted before reaching refusal messages, dialogs, or disk.
+     *
+     * Note: The pattern consumes to the next closing brace or end-of-string so an unmatched
+     * candidate is redacted in full. If a malformed reference is missing its closing braces mid-command
+     * (e.g. `curl -X POST {{secret:abc https://api/x`), this consumes up to the next brace or end of
+     * string, trading operator readability of subsequent arguments for preventing plaintext leaks.
      */
     private val malformedSecretReference =
         Regex(
-            """(?i)\{\{secret:(?!$validSecretReferenceId(?:\.(?:password|username|notes))?\}\})[^{}]*+(?:\}\}|$)""",
+            """(?i)\{\{secret:(?!$validSecretReferenceId(?:\.(?:password|username|notes))?\}\})""" +
+                """(?:\{[^{}]*+\}|[^{}])++\}{0,2}""",
         )
 
     // `*+`, not `*`: see STACK SAFETY on [sanitizeMessage]. Nothing that may follow the name
@@ -169,7 +175,7 @@ object McpArgumentSanitizer {
     private val sensitiveAssignment =
         Regex(
             """(?i)(?:(?:password|passwd|token|api[_-]?key|credential|cookie)|(?<!\{\{)secret)""" +
-                """(?:[_-][A-Za-z0-9]+)*+$KEY_CLOSE\s*[:=]\s*(?!$validSecretReference(?:[\s&,;}]|$))$VALUE""",
+                """(?:[_-][A-Za-z0-9]+)*+$KEY_CLOSE\s*[:=]\s*(?!$validSecretReference+(?:[\s&,;}]|$))$VALUE""",
         )
     private val bearer = Regex("""(?i)Bearer\s+[^\s"',;}]+""")
 

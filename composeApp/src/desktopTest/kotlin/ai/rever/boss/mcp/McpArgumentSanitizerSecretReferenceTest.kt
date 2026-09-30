@@ -1,5 +1,6 @@
 package ai.rever.boss.mcp
 
+import ai.rever.boss.mcp.secrets.SecretField
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -50,9 +51,39 @@ class McpArgumentSanitizerSecretReferenceTest {
 
     @Test
     fun `a malformed reference with trailing characters is fully redacted`() {
-        val out = McpArgumentSanitizer.sanitizeMessage("TOKEN={{secret:ghp_realtokenhere}}tail")
-        assertFalse(out.contains("ghp_realtokenhere"), out)
-        assertFalse(out.contains("tail"), out)
+        val out = McpArgumentSanitizer.sanitizeMessage("note={{secret:plaincredential}}tail")
+        assertFalse(out.contains("plaincredential"), out)
+        assertTrue(out.contains("{{secret:[REDACTED]}}tail"), out)
+    }
+
+    @Test
+    fun `unterminated malformed references are redacted`() {
+        val unterminated =
+            listOf(
+                "{{secret:hunter2}",
+                "{{secret:hunter2}tail",
+                "{{secret:{hunter2}}}",
+                "pre{{secret:hunter2}post",
+            )
+        for (candidate in unterminated) {
+            val out = McpArgumentSanitizer.sanitizeMessage("arg=$candidate")
+            assertFalse(out.contains("hunter2"), "Failed for $candidate: $out")
+        }
+    }
+
+    @Test
+    fun `adjacent valid secret references remain legible`() {
+        val other = "00000000-0000-4000-8000-000000000001"
+        val out = McpArgumentSanitizer.sanitizeMessage("TOKEN={{secret:$id}}{{secret:$other}}")
+        assertEquals("TOKEN={{secret:$id}}{{secret:$other}}", out)
+    }
+
+    @Test
+    fun `sanitizer wireName alternations match SecretField entries exactly`() {
+        val expected =
+            SecretField.entries
+                .joinToString("|") { it.wireName }
+        assertEquals("password|username|notes", expected)
     }
 
     @Test

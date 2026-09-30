@@ -75,8 +75,9 @@ sealed interface SecretReferenceScan {
     ) : SecretReferenceScan
 
     /**
-     * Something that looks like a reference does not parse. [literal] is the offending text and
-     * is safe to show: it cannot contain a value, only whatever the agent typed.
+     * Something that looks like a reference does not parse. [literal] is the offending text,
+     * which must be sanitized before presentation or logging as it may contain agent-authored
+     * plaintext credentials.
      */
     data class Malformed(
         val literal: String,
@@ -115,6 +116,10 @@ object SecretReferenceParser {
     /**
      * Parse one candidate body (the text between `{{secret:` and `}}`).
      *
+     * The `{{secret:` prefix is normalized case-insensitively, but field names remain strict
+     * lowercase wire names (`.password`, `.username`, `.notes`). A bad field fails closed with a
+     * malformed refusal without echoing agent-supplied text.
+     *
      * Returns the reference, or null with the reason in [onMalformed].
      */
     private fun parseBody(
@@ -133,7 +138,7 @@ object SecretReferenceParser {
 
             field == null -> {
                 onMalformed(
-                    "unknown field '$fieldPart' (expected one of " +
+                    "unknown field (expected one of " +
                         SecretField.entries.joinToString { it.wireName } + ")",
                 )
                 null

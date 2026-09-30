@@ -55,7 +55,9 @@ secret's use visible at the approval site rather than hidden behind an earlier `
 - References are recognised inside JSON **string values** at any depth, including inside arrays
   and nested objects. A reference marker in a JSON key refuses the call; keys are never substituted.
 - Anything else of the shape `{{secret:...}}` is malformed and refuses the whole call. A tool is
-  never handed placeholder text it might mistake for a value.
+  never handed placeholder text it might mistake for a value. Candidate text and refusal snippets
+  undergo argument sanitization so agent-authored credentials are never reflected in refusal messages,
+  dialogs, logs, or ledger records.
 - One call may carry several references. They resolve all or nothing.
 
 ## What happens to a call, in order

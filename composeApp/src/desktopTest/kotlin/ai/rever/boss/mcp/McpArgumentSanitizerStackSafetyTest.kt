@@ -187,6 +187,7 @@ class McpArgumentSanitizerStackSafetyTest {
                 "https://",
                 "TOKEN={{secret:",
                 "{{secret:",
+                "{{SECRET:",
             )
 
         /** Repeated after a trigger until the input reaches its size. */
@@ -210,6 +211,7 @@ class McpArgumentSanitizerStackSafetyTest {
                 "A:\\n",
                 "\u00e9",
                 "{{",
+                "{{a}}",
             )
 
         /**
