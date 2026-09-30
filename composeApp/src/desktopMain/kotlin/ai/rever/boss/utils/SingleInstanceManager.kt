@@ -38,6 +38,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.HexFormat
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadFactory
@@ -714,6 +715,11 @@ internal object SingleInstanceWire {
         Executors.newSingleThreadScheduledExecutor(
             ThreadFactory { runnable -> Thread(runnable, "BOSS-IPC-Watchdog").apply { isDaemon = true } },
         )
+
+    /**
+     * Test seam for overriding the watchdog scheduler.
+     * Any test that sets this must restore it to null in a `finally` block or call [SingleInstanceManager.release].
+     */
     internal var watchdogSchedulerOverride: ScheduledExecutorService? = null
 
     /**
@@ -788,6 +794,7 @@ internal object SingleInstanceWire {
     }
 
     /** Probes [descriptor]'s endpoint, distinguishing unreachable from live-but-unresponsive endpoints. */
+    @Suppress("TooGenericExceptionCaught")
     fun probeInstance(
         descriptor: InstanceDescriptor,
         request: String = formatPingRequest(descriptor.token),
@@ -795,9 +802,10 @@ internal object SingleInstanceWire {
         maxResponseBytes: Int = MAX_RESPONSE_BYTES,
     ): SingleInstanceProbe {
         val channel = connect(descriptor) ?: return SingleInstanceProbe.UNREACHABLE
-        val budget = closeAfterBudget(channel, timeoutMs)
+        var budget: ScheduledFuture<*>? = null
         return try {
             channel.use { ch ->
+                budget = closeAfterBudget(ch, timeoutMs)
                 runCatching { writeLine(ch, request) }
                 val line =
                     runCatching {
@@ -811,18 +819,33 @@ internal object SingleInstanceWire {
             }
         } catch (_: IOException) {
             SingleInstanceProbe.CONNECTED_NO_REPLY
+        } catch (_: RejectedExecutionException) {
+            SingleInstanceProbe.CONNECTED_NO_REPLY
+        } catch (e: Exception) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Single-instance probe failed",
+                mapOf("reason" to (e.message ?: "error")),
+            )
+            SingleInstanceProbe.CONNECTED_NO_REPLY
         } finally {
-            budget.cancel(false)
+            budget?.cancel(false)
+            runCatching { channel.close() }
         }
     }
 
-    /** True when something on [descriptor]'s endpoint answers a probe with the published token or is busy. */
+    /**
+     * True when something on [descriptor]'s endpoint answers a probe with the published token or is busy.
+     * Note that [SingleInstanceProbe.CONNECTED_NO_REPLY] returns false here as dev reload requires
+     * a responsive host that holds the token.
+     */
     fun respondsToPing(descriptor: InstanceDescriptor): Boolean {
         val probe = probeInstance(descriptor)
         return probe == SingleInstanceProbe.PONG || probe == SingleInstanceProbe.BUSY
     }
 
     /** Sends one line and reads one bounded line back, within the connection budget. */
+    @Suppress("TooGenericExceptionCaught")
     fun exchange(
         descriptor: InstanceDescriptor,
         request: String,
@@ -830,11 +853,12 @@ internal object SingleInstanceWire {
         maxResponseBytes: Int = MAX_RESPONSE_BYTES,
     ): String? {
         val channel = connect(descriptor) ?: return null
-        val budget = closeAfterBudget(channel, timeoutMs)
+        var budget: ScheduledFuture<*>? = null
         return try {
-            channel.use {
-                writeLine(it, request)
-                readBoundedLine(BufferedInputStream(Channels.newInputStream(it)), maxResponseBytes)
+            channel.use { ch ->
+                budget = closeAfterBudget(ch, timeoutMs)
+                writeLine(ch, request)
+                readBoundedLine(BufferedInputStream(Channels.newInputStream(ch)), maxResponseBytes)
             }
         } catch (e: IOException) {
             logger.debug(
@@ -843,8 +867,23 @@ internal object SingleInstanceWire {
                 mapOf("reason" to (e.message ?: "io error")),
             )
             null
+        } catch (e: RejectedExecutionException) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Single-instance exchange watchdog rejected",
+                mapOf("reason" to (e.message ?: "watchdog rejected")),
+            )
+            null
+        } catch (e: Exception) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Single-instance exchange failed",
+                mapOf("reason" to (e.message ?: "unexpected error")),
+            )
+            null
         } finally {
-            budget.cancel(false)
+            budget?.cancel(false)
+            runCatching { channel.close() }
         }
     }
 
@@ -941,6 +980,8 @@ internal object SingleInstanceWire {
                 if (written == 0) break
             }
             runCatching { client.shutdownOutput() }
+        } catch (_: IOException) {
+            // EPIPE/ECONNRESET when client disconnects early; throttled drop log bounds output.
         } finally {
             closeQuietly(client)
         }
@@ -1299,7 +1340,7 @@ private fun pluginActionResponse(verdict: kotlinx.coroutines.Deferred<Boolean>?)
  * }
  * ```
  */
-@Suppress("TooManyFunctions")
+@Suppress("TooManyFunctions", "LargeClass")
 object SingleInstanceManager {
     private var serverChannel: ServerSocketChannel? = null
     private var listenerThread: Thread? = null
@@ -1335,6 +1376,7 @@ object SingleInstanceManager {
     /** Test seam for overriding connection and handler budget timeouts. */
     internal var connectionBudgetMsOverride: Long? = null
 
+    /** Test seam for watchdog scheduler; must be cleared in test teardown or [release]. */
     internal var watchdogSchedulerOverride: ScheduledExecutorService?
         get() = SingleInstanceWire.watchdogSchedulerOverride
         set(value) {
@@ -1375,11 +1417,7 @@ object SingleInstanceManager {
      */
     fun isAnotherInstanceRunning(): Boolean =
         SingleInstanceFiles.read()?.let { existing ->
-            // A dead recorded pid proves the descriptor outlived its publisher;
-            // a live pid is not proof of anything (pids are reused), so the
-            // channel reachability probe remains what decides.
-            (existing.pid == null || isProcessAlive(existing.pid)) &&
-                SingleInstanceWire.probeInstance(existing) != SingleInstanceProbe.UNREACHABLE
+            !shouldReclaimExisting(existing)
         } ?: false
 
     /**
@@ -1418,24 +1456,47 @@ object SingleInstanceManager {
             logger.debug(LogCategory.SYSTEM, "Reclaiming a single-instance descriptor nothing answers on")
             return true
         }
-        val forged = descriptorTrust(existing) == DescriptorTrust.FORGED
-        if (forged) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "The single-instance channel answers, but its recorded owner is a different " +
-                    "program - reclaiming a descriptor that may have been planted",
-                mapOf("endpoint" to existing.endpoint, "pid" to existing.pid),
-            )
-        } else if (probe == SingleInstanceProbe.PONG) {
-            logger.info(LogCategory.SYSTEM, "Another instance is answering on the single-instance channel")
-        } else {
-            logger.info(
-                LogCategory.SYSTEM,
-                "Another instance is active but saturated on the single-instance channel",
-                mapOf("probe" to probe.name),
-            )
+        val trust = descriptorTrust(existing)
+        return when {
+            trust == DescriptorTrust.FORGED -> {
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "The single-instance channel answers, but its recorded owner is a different " +
+                        "program - reclaiming a descriptor that may have been planted",
+                    mapOf("endpoint" to existing.endpoint, "pid" to existing.pid),
+                )
+                true
+            }
+
+            probe == SingleInstanceProbe.PONG -> {
+                logger.info(LogCategory.SYSTEM, "Another instance is answering on the single-instance channel")
+                false
+            }
+
+            // At this point probe is BUSY or CONNECTED_NO_REPLY.
+            // Positive evidence of ownership is required before refusing to reclaim:
+            // A saturated genuine BOSS instance has trust == VERIFIED.
+            // An UNVERIFIED descriptor (e.g. pid == null pointing at a recycled TCP port or dead listener)
+            // must stay reclaimable, otherwise acquireLock blocks startup permanently (#1326).
+            trust != DescriptorTrust.VERIFIED -> {
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "The single-instance channel accepted a connection but failed to reply with a valid token, " +
+                        "and the descriptor owner is unverified - reclaiming endpoint",
+                    mapOf("endpoint" to existing.endpoint, "pid" to existing.pid, "probe" to probe.name),
+                )
+                true
+            }
+
+            else -> {
+                logger.info(
+                    LogCategory.SYSTEM,
+                    "Another instance is active but saturated on the single-instance channel",
+                    mapOf("probe" to probe.name),
+                )
+                false
+            }
         }
-        return forged
     }
 
     /**
@@ -1552,10 +1613,10 @@ object SingleInstanceManager {
                         mapOf("reason" to (e.message ?: "io error")),
                     )
                 } catch (e: Throwable) {
-                    logger.debug(
+                    logger.error(
                         LogCategory.SYSTEM,
-                        "Single-instance connection failed",
-                        mapOf("reason" to (e.message ?: "error")),
+                        "Single-instance connection failed unexpectedly",
+                        error = e,
                     )
                 } finally {
                     budget?.cancel(false)
@@ -1949,7 +2010,12 @@ object SingleInstanceManager {
                 var resp = SingleInstanceWire.exchange(target, request)
                 var retries = 0
                 while (resp == RESPONSE_BUSY && retries < 3) {
-                    Thread.sleep(50L * (1 shl retries))
+                    try {
+                        Thread.sleep(50L * (1 shl retries))
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
+                    }
                     retries++
                     resp = SingleInstanceWire.exchange(target, request)
                 }

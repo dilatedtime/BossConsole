@@ -4,8 +4,10 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
+import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -142,7 +144,138 @@ class SingleInstanceFloodCapTest {
     }
 
     @Test
-    fun `accepted connection with empty or partial reply preserves single-instance ownership`() {
+    fun `accepted connection with empty partial or rejected reply preserves verified ownership`() {
+        var fixture = "EMPTY"
+        val (server, acceptThread) = startDummyServer { fixture }
+        val dummyPort = server.localPort
+
+        try {
+            for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED", "UNREAD_RST")) {
+                fixture = currentFixture
+                val descriptor =
+                    InstanceDescriptor(
+                        transport = SingleInstanceTransport.TCP,
+                        endpoint = dummyPort.toString(),
+                        token = newChannelToken(),
+                        pid = ProcessHandle.current().pid(),
+                    )
+
+                val probe = SingleInstanceWire.probeInstance(descriptor)
+                assertEquals(
+                    SingleInstanceProbe.CONNECTED_NO_REPLY,
+                    probe,
+                    "Fixture $currentFixture must probe as CONNECTED_NO_REPLY",
+                )
+
+                Files.createDirectories(descriptorPath().parent)
+                Files.writeString(descriptorPath(), descriptor.encode())
+                assertTrue(
+                    SingleInstanceManager.isAnotherInstanceRunning(),
+                    "Verified descriptor with fixture $currentFixture must report another instance running",
+                )
+                val acquired = SingleInstanceManager.acquireLock()
+                assertFalse(
+                    acquired,
+                    "Must not reclaim verified descriptor from active endpoint with fixture $currentFixture",
+                )
+                val published = readPublishedDescriptor()
+                assertNotNull(published)
+                assertEquals(descriptor.token, published.token, "Descriptor token must remain unchanged")
+            }
+        } finally {
+            runCatching { server.close() }
+            acceptThread.join(1000L)
+        }
+    }
+
+    @Test
+    fun `unverified descriptor with unresponsive or rejected endpoint is reclaimed instead of bricking startup`() {
+        var fixture = "EMPTY"
+        val (server, acceptThread) = startDummyServer { fixture }
+        val dummyPort = server.localPort
+
+        try {
+            for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED")) {
+                fixture = currentFixture
+                val unverifiedDescriptor =
+                    InstanceDescriptor(
+                        transport = SingleInstanceTransport.TCP,
+                        endpoint = dummyPort.toString(),
+                        token = newChannelToken(),
+                        pid = null,
+                    )
+
+                val probe = SingleInstanceWire.probeInstance(unverifiedDescriptor)
+                assertEquals(
+                    SingleInstanceProbe.CONNECTED_NO_REPLY,
+                    probe,
+                    "Fixture $currentFixture must probe as CONNECTED_NO_REPLY",
+                )
+
+                Files.createDirectories(descriptorPath().parent)
+                Files.writeString(descriptorPath(), unverifiedDescriptor.encode())
+
+                assertFalse(
+                    SingleInstanceManager.isAnotherInstanceRunning(),
+                    "Unverified descriptor with fixture $currentFixture must not be treated as a live instance",
+                )
+                val acquired = SingleInstanceManager.acquireLock()
+                assertTrue(
+                    acquired,
+                    "Must reclaim unverified descriptor for fixture $currentFixture to prevent bricked startup",
+                )
+
+                SingleInstanceManager.release()
+            }
+        } finally {
+            runCatching { server.close() }
+            acceptThread.join(1000L)
+        }
+    }
+
+    private fun startDummyServer(fixtureProvider: () -> String): Pair<ServerSocket, Thread> {
+        val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val acceptThread =
+            kotlin.concurrent.thread(isDaemon = true) {
+                while (!server.isClosed) {
+                    try {
+                        val client = server.accept()
+                        when (fixtureProvider()) {
+                            "EMPTY" -> {
+                                client.getInputStream().bufferedReader().readLine()
+                                client.close()
+                            }
+
+                            "PARTIAL" -> {
+                                client.getInputStream().bufferedReader().readLine()
+                                val out = client.getOutputStream()
+                                out.write("BUS".toByteArray(StandardCharsets.UTF_8))
+                                out.flush()
+                                client.close()
+                            }
+
+                            "REJECTED" -> {
+                                client.getInputStream().bufferedReader().readLine()
+                                val out = client.getOutputStream()
+                                out.write("REJECTED\n".toByteArray(StandardCharsets.UTF_8))
+                                out.flush()
+                                client.close()
+                            }
+
+                            "UNREAD_RST" -> {
+                                client.close()
+                            }
+                        }
+                    } catch (_: IOException) {
+                        break
+                    }
+                }
+            }
+        return server to acceptThread
+    }
+
+    @Test
+    fun `probeInstance and exchange under failing watchdog scheduler do not leak socket or throw`() {
         val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
         val dummyPort = server.localPort
         val descriptor =
@@ -158,43 +291,13 @@ class SingleInstanceFloodCapTest {
                 while (!server.isClosed) {
                     try {
                         val client = server.accept()
-                        // Accept and close immediately without sending PONG
+                        client.getInputStream().bufferedReader().readLine()
                         client.close()
                     } catch (_: IOException) {
                         break
                     }
                 }
             }
-
-        try {
-            val probe = SingleInstanceWire.probeInstance(descriptor)
-            assertEquals(
-                SingleInstanceProbe.CONNECTED_NO_REPLY,
-                probe,
-                "Accepted connection without reply must probe as CONNECTED_NO_REPLY",
-            )
-
-            // When published on disk, acquireLock must NOT reclaim the descriptor
-            Files.createDirectories(descriptorPath().parent)
-            Files.writeString(descriptorPath(), descriptor.encode())
-            assertTrue(SingleInstanceManager.isAnotherInstanceRunning(), "Instance should be considered running")
-            val acquired = SingleInstanceManager.acquireLock()
-            assertFalse(acquired, "Must not reclaim descriptor from an active endpoint that gives no reply")
-            val published = readPublishedDescriptor()
-            assertNotNull(published)
-            assertEquals(descriptor.token, published.token, "Descriptor token must remain unchanged")
-        } finally {
-            runCatching { server.close() }
-            acceptThread.join(1000L)
-        }
-    }
-
-    @Test
-    fun `rejection under failing watchdog scheduler still rejects with BUSY without leaking permits`() {
-        SingleInstanceManager.connectionBudgetMsOverride = 30_000L
-        assertTrue(SingleInstanceManager.acquireLock(), "SingleInstanceManager failed to bind")
-        val descriptor = assertNotNull(readPublishedDescriptor(), "Published descriptor must exist")
-        val targetAddress = toSocketAddress(descriptor)
 
         val failingScheduler =
             object : ScheduledExecutorService by Executors.newSingleThreadScheduledExecutor() {
@@ -205,28 +308,33 @@ class SingleInstanceFloodCapTest {
                 ): ScheduledFuture<*> = throw RejectedExecutionException("Watchdog scheduling rejected")
             }
 
-        val heldSockets = mutableListOf<SocketChannel>()
         try {
-            repeat(MAX_CLIENT_HANDLERS) {
-                heldSockets += SocketChannel.open(targetAddress)
-            }
-            waitForSlotsExhaustion()
-            assertEquals(0, SingleInstanceManager.availableClientSlots, "All client slots should be occupied")
-
             SingleInstanceManager.watchdogSchedulerOverride = failingScheduler
-            assertOverflowConnectionsRejected(targetAddress, count = 3)
+
+            val probe = SingleInstanceWire.probeInstance(descriptor)
+            assertEquals(
+                SingleInstanceProbe.CONNECTED_NO_REPLY,
+                probe,
+                "probeInstance must return CONNECTED_NO_REPLY when watchdog scheduling fails",
+            )
+
+            val reply = SingleInstanceWire.exchange(descriptor, formatPingRequest(descriptor.token))
+            assertEquals(
+                null,
+                reply,
+                "exchange must return null without throwing when watchdog scheduling fails",
+            )
+
+            Files.createDirectories(descriptorPath().parent)
+            Files.writeString(descriptorPath(), descriptor.encode())
+            val acquired = SingleInstanceManager.acquireLock()
+            assertFalse(acquired, "acquireLock must return false safely without throwing unchecked exception")
         } finally {
-            heldSockets.forEach { runCatching { it.close() } }
             failingScheduler.shutdownNow()
             SingleInstanceManager.watchdogSchedulerOverride = null
+            runCatching { server.close() }
+            acceptThread.join(1000L)
         }
-
-        waitForSlotsRecovery()
-        assertEquals(
-            MAX_CLIENT_HANDLERS,
-            SingleInstanceManager.availableClientSlots,
-            "Slots must fully recover after held connections close",
-        )
     }
 
     private fun waitForSlotsExhaustion() {
@@ -279,12 +387,23 @@ class SingleInstanceFloodCapTest {
         timeoutMs: Long = 2000L,
     ): Int {
         val deadline = System.currentTimeMillis() + timeoutMs
-        var r = ch.read(buf)
-        while (r == 0 && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20)
-            r = ch.read(buf)
+        var total = 0
+        var done = false
+        while (buf.hasRemaining() && !done && System.currentTimeMillis() < deadline) {
+            val r = ch.read(buf)
+            if (r < 0) {
+                done = true
+            } else if (r > 0) {
+                total += r
+                val bytes = buf.array()
+                if ((0 until buf.position()).any { bytes[it] == '\n'.code.toByte() }) {
+                    done = true
+                }
+            } else {
+                Thread.sleep(10)
+            }
         }
-        return r
+        return if (total > 0) total else -1
     }
 
     private fun toSocketAddress(descriptor: InstanceDescriptor): SocketAddress =
