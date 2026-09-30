@@ -78,11 +78,11 @@ internal class McpSecretPrePass(
                 }
 
                 is SecretReferenceScan.Malformed -> {
-                    val sanitizedLiteral = McpArgumentSanitizer.sanitizeMessage(scan.literal)
                     val sanitizedReason = McpArgumentSanitizer.sanitizeMessage(scan.reason)
+                    val descriptor = "{{secret:...}} (offset ${scan.offset}, length ${scan.length})"
                     return SecretPreparation.Refused(
                         McpApprovalDisposition.SECRET_UNRESOLVED,
-                        "Malformed secret reference $sanitizedLiteral: $sanitizedReason".take(240),
+                        "Malformed secret reference $descriptor: $sanitizedReason".take(240),
                     )
                 }
 

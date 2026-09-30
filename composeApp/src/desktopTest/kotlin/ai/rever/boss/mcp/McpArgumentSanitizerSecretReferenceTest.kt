@@ -74,8 +74,15 @@ class McpArgumentSanitizerSecretReferenceTest {
     @Test
     fun `adjacent valid secret references remain legible`() {
         val other = "00000000-0000-4000-8000-000000000001"
-        val out = McpArgumentSanitizer.sanitizeMessage("TOKEN={{secret:$id}}{{secret:$other}}")
-        assertEquals("TOKEN={{secret:$id}}{{secret:$other}}", out)
+        val third = "22222222-2222-4222-8222-222222222222"
+        val out =
+            McpArgumentSanitizer.sanitizeMessage(
+                "TOKEN={{secret:$id.password}}{{secret:$other.username}}{{secret:$third}}",
+            )
+        assertEquals("TOKEN={{secret:$id.password}}{{secret:$other.username}}{{secret:$third}}", out)
+
+        val uppercaseField = McpArgumentSanitizer.sanitizeMessage("TOKEN={{secret:$id.PASSWORD}}")
+        assertFalse(uppercaseField.contains("PASSWORD"), uppercaseField)
     }
 
     @Test
@@ -83,7 +90,30 @@ class McpArgumentSanitizerSecretReferenceTest {
         val expected =
             SecretField.entries
                 .joinToString("|") { it.wireName }
-        assertEquals("password|username|notes", expected)
+        assertEquals(expected, McpArgumentSanitizer.validSecretReferenceFields)
+    }
+
+    @Test
+    fun `malformed references with nested and brace-led bodies are redacted`() {
+        val candidates =
+            listOf(
+                "{{secret:{hunter2",
+                "{{secret:{{hunter2}}}}",
+                "{{SECRET:{{hunter2}}}}",
+                "{{secret:abc{def",
+            )
+        for (candidate in candidates) {
+            val out = McpArgumentSanitizer.sanitizeMessage("arg=$candidate")
+            assertFalse(out.contains("hunter2"), "Failed for $candidate: $out")
+            assertFalse(out.contains("def"), "Failed for $candidate: $out")
+            assertTrue(out.contains("{{secret:[REDACTED]}}"), "Expected redacted marker for $candidate: $out")
+        }
+    }
+
+    @Test
+    fun `valid reference following malformed reference remains legible`() {
+        val out = McpArgumentSanitizer.sanitizeMessage("{{secret:bad}}{{secret:$id}}")
+        assertEquals("{{secret:[REDACTED]}}{{secret:$id}}", out)
     }
 
     @Test

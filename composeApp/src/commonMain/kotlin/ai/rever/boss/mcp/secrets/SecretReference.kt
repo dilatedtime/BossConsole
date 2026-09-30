@@ -77,11 +77,15 @@ sealed interface SecretReferenceScan {
     /**
      * Something that looks like a reference does not parse. [literal] is the offending text,
      * which must be sanitized before presentation or logging as it may contain agent-authored
-     * plaintext credentials.
+     * plaintext credentials. [offset] and [length] identify where the candidate occurred in
+     * the scanned string so refusal messages can report shape and location without echoing
+     * raw candidate text.
      */
     data class Malformed(
         val literal: String,
         val reason: String,
+        val offset: Int = 0,
+        val length: Int = literal.length,
     ) : SecretReferenceScan
 }
 
@@ -173,7 +177,13 @@ object SecretReferenceParser {
                 var malformed: SecretReferenceScan.Malformed? = null
                 val ref =
                     parseBody(match.groupValues[1]) { reason ->
-                        malformed = SecretReferenceScan.Malformed(match.value, reason)
+                        malformed =
+                            SecretReferenceScan.Malformed(
+                                literal = match.value,
+                                reason = reason,
+                                offset = match.range.first,
+                                length = match.value.length,
+                            )
                     }
                 malformed?.let { return it }
                 if (ref != null) found.add(ref)
@@ -181,9 +191,12 @@ object SecretReferenceParser {
             val unmatchedText = candidate.replace(text, "")
             val unmatchedMarker = unmatchedText.indexOf(MARKER, ignoreCase = true)
             if (unmatchedMarker >= 0) {
+                val candidateLength = unmatchedText.length - unmatchedMarker
                 return SecretReferenceScan.Malformed(
-                    unmatchedText.substring(unmatchedMarker).take(120),
-                    "the reference is not terminated with }}",
+                    literal = unmatchedText.substring(unmatchedMarker).take(120),
+                    reason = "the reference is not terminated with }}",
+                    offset = unmatchedMarker,
+                    length = candidateLength,
                 )
             }
         }
