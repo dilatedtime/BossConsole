@@ -4,9 +4,19 @@ import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
+
+internal const val WINDOWS_PATH_TIMEOUT_SECONDS = 30L
+internal const val STREAM_DRAIN_TIMEOUT_SECONDS = 2L
+internal const val MAX_PROCESS_OUTPUT_CHARS = 8192
 
 actual object CLIInstaller {
     private val logger = BossLogger.forComponent("CLIInstaller")
@@ -346,35 +356,102 @@ actual object CLIInstaller {
     }
 
     /**
-     * Update Windows PATH environment variable
+     * Drains an input stream asynchronously into [sink] on a daemon thread up to [capChars].
+     * Prevents a subprocess from deadlocking on full pipe buffers.
      */
-    private fun updateWindowsPath(binPath: String): Boolean {
-        return try {
-            // Use setx command to update user PATH
-            val currentPath = System.getenv("PATH") ?: ""
-
-            // Check if already in PATH
-            if (currentPath.contains(binPath)) {
-                return true
+    private fun drainAsync(
+        stream: InputStream,
+        sink: StringBuilder,
+        capChars: Int = MAX_PROCESS_OUTPUT_CHARS,
+    ): Thread =
+        thread(isDaemon = true, name = "BOSS-CLI-WindowsPath-Drain") {
+            try {
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8)).use { reader ->
+                    val buf = CharArray(512)
+                    while (true) {
+                        val read = reader.read(buf)
+                        if (read < 0) break
+                        synchronized(sink) {
+                            val available = capChars - sink.length
+                            if (available > 0) {
+                                sink.append(buf, 0, minOf(read, available))
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Stream closed or process forcibly terminated
             }
+        }
 
-            // Use setx to add to PATH
-            val process =
-                ProcessBuilder(
-                    "cmd",
-                    "/c",
-                    "setx",
-                    "PATH",
-                    "$binPath;%PATH%",
-                ).start()
+    /**
+     * Update Windows PATH environment variable with a bounded timeout (#1254).
+     * Prevents a hung `setx` command from blocking an IO thread indefinitely.
+     */
+    internal fun updateWindowsPath(
+        binPath: String,
+        timeoutSeconds: Long = WINDOWS_PATH_TIMEOUT_SECONDS,
+        currentPathProvider: () -> String = { System.getenv("PATH") ?: "" },
+        processStarter: (List<String>) -> Process = { cmd -> ProcessBuilder(cmd).start() },
+    ): Boolean {
+        if (currentPathProvider().contains(binPath)) {
+            return true
+        }
+        return executeSetx(binPath, timeoutSeconds, processStarter)
+    }
 
-            process.waitFor()
-            process.exitValue() == 0
+    private fun executeSetx(
+        binPath: String,
+        timeoutSeconds: Long,
+        processStarter: (List<String>) -> Process,
+    ): Boolean =
+        try {
+            val process = processStarter(listOf("cmd", "/c", "setx", "PATH", "$binPath;%PATH%"))
+            val stdout = StringBuilder()
+            val stderr = StringBuilder()
+            val outDrain = drainAsync(process.inputStream, stdout)
+            val errDrain = drainAsync(process.errorStream, stderr)
+
+            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                process.waitFor(STREAM_DRAIN_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                val outStr = synchronized(stdout) { stdout.toString().trim() }
+                val errStr = synchronized(stderr) { stderr.toString().trim() }
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "Windows setx command timed out after ${timeoutSeconds}s; process forcibly terminated",
+                    mapOf(
+                        "binPath" to binPath,
+                        "stdout" to outStr,
+                        "stderr" to errStr,
+                    ),
+                )
+                false
+            } else {
+                outDrain.join(STREAM_DRAIN_TIMEOUT_SECONDS * 1000)
+                errDrain.join(STREAM_DRAIN_TIMEOUT_SECONDS * 1000)
+
+                val exitCode = process.exitValue()
+                if (exitCode != 0) {
+                    val outStr = synchronized(stdout) { stdout.toString().trim() }
+                    val errStr = synchronized(stderr) { stderr.toString().trim() }
+                    logger.warn(
+                        LogCategory.SYSTEM,
+                        "Windows setx command exited with non-zero exit code $exitCode",
+                        mapOf(
+                            "binPath" to binPath,
+                            "stdout" to outStr,
+                            "stderr" to errStr,
+                        ),
+                    )
+                }
+                exitCode == 0
+            }
         } catch (e: Exception) {
             logger.warn(LogCategory.SYSTEM, "Failed to update Windows PATH", error = e)
             false
         }
-    }
 
     private data class ShellConfigResult(
         val success: Boolean,
