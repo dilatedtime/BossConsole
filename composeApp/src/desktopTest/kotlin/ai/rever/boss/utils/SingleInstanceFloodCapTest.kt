@@ -17,12 +17,14 @@ import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -31,6 +33,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 private const val READ_TIMED_OUT = Int.MIN_VALUE
+private typealias DummyServerFixture = Triple<ServerSocket, Thread, ConcurrentHashMap<String, AtomicInteger>>
 
 /**
  * Regression test for issue #1326:
@@ -149,7 +152,7 @@ class SingleInstanceFloodCapTest {
     @Test
     fun `accepted connection with empty partial or rejected reply preserves verified ownership`() {
         val fixture = AtomicReference("EMPTY")
-        val (server, acceptThread) = startDummyServer { fixture.get() }
+        val (server, acceptThread, servedCounts) = startDummyServer { fixture.get() }
         val dummyPort = server.localPort
 
         try {
@@ -158,6 +161,7 @@ class SingleInstanceFloodCapTest {
             // For UNREAD_RST, the client encounters Connection Reset on writeLine / readBoundedLine
             // and treats it as CONNECTED_NO_REPLY via catch (IOException).
             for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED", "UNREAD_RST")) {
+                val servedBefore = servedCounts[currentFixture]?.get() ?: 0
                 fixture.set(currentFixture)
                 val descriptor =
                     InstanceDescriptor(
@@ -188,6 +192,12 @@ class SingleInstanceFloodCapTest {
                 val published = readPublishedDescriptor()
                 assertNotNull(published)
                 assertEquals(descriptor.token, published.token, "Descriptor token must remain unchanged")
+
+                val servedAfter = servedCounts[currentFixture]?.get() ?: 0
+                assertTrue(
+                    servedAfter > servedBefore,
+                    "Fixture $currentFixture must have been served by the dummy server",
+                )
             }
         } finally {
             runCatching { server.close() }
@@ -197,13 +207,14 @@ class SingleInstanceFloodCapTest {
     }
 
     @Test
-    fun `unverified descriptor with unresponsive or rejected endpoint is reclaimed instead of bricking startup`() {
+    fun `unverified descriptor with unresponsive or rejected endpoint is reclaimed instead of bricked startup`() {
         val fixture = AtomicReference("EMPTY")
-        val (server, acceptThread) = startDummyServer { fixture.get() }
+        val (server, acceptThread, servedCounts) = startDummyServer { fixture.get() }
         val dummyPort = server.localPort
 
         try {
             for (currentFixture in listOf("EMPTY", "PARTIAL", "REJECTED")) {
+                val servedBefore = servedCounts[currentFixture]?.get() ?: 0
                 fixture.set(currentFixture)
                 val unverifiedDescriptor =
                     InstanceDescriptor(
@@ -234,6 +245,12 @@ class SingleInstanceFloodCapTest {
                 )
 
                 SingleInstanceManager.release()
+
+                val servedAfter = servedCounts[currentFixture]?.get() ?: 0
+                assertTrue(
+                    servedAfter > servedBefore,
+                    "Fixture $currentFixture must have been served by the dummy server",
+                )
             }
         } finally {
             runCatching { server.close() }
@@ -242,16 +259,24 @@ class SingleInstanceFloodCapTest {
         }
     }
 
-    private fun startDummyServer(fixtureProvider: () -> String): Pair<ServerSocket, Thread> {
+    private fun startDummyServer(fixtureProvider: () -> String): DummyServerFixture {
         val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val servedCounts = ConcurrentHashMap<String, AtomicInteger>()
         val acceptThread =
             kotlin.concurrent.thread(isDaemon = true) {
                 while (!server.isClosed) {
+                    val client =
+                        try {
+                            server.accept()
+                        } catch (_: IOException) {
+                            break
+                        }
                     try {
-                        val client = server.accept()
                         client.use {
                             client.soTimeout = 2000
-                            when (fixtureProvider()) {
+                            val currentFixture = fixtureProvider()
+                            servedCounts.computeIfAbsent(currentFixture) { AtomicInteger() }.incrementAndGet()
+                            when (currentFixture) {
                                 "EMPTY" -> {
                                     client.getInputStream().bufferedReader().readLine()
                                 }
@@ -280,11 +305,11 @@ class SingleInstanceFloodCapTest {
                             }
                         }
                     } catch (_: IOException) {
-                        break
+                        // Individual client communication error does not terminate the accept loop
                     }
                 }
             }
-        return server to acceptThread
+        return Triple(server, acceptThread, servedCounts)
     }
 
     private fun startQueueDummyServer(

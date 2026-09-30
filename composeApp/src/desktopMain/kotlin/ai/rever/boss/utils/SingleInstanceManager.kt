@@ -1392,7 +1392,7 @@ object SingleInstanceManager {
     internal val availableClientSlots: Int
         get() = clientSlots.availablePermits()
 
-    /** Test seam for intercepting client accept in the listener loop. */
+    /** Test seam for intercepting client accept in the listener loop; must be cleared in test teardown or [release]. */
     internal var acceptNextClientOverride: ((ServerSocketChannel?, () -> Boolean) -> SocketChannel?)? = null
 
     /** Test seam; production serves credentials from the running BOSS session. */
