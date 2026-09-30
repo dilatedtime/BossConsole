@@ -26,12 +26,16 @@ import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
+import java.nio.channels.FileChannel
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
@@ -558,6 +562,7 @@ private object SingleInstanceFiles {
     private const val RUNTIME_DIR_NAME = "run"
     private const val DESCRIPTOR_FILE_NAME = "single-instance"
     private const val SOCKET_FILE_NAME = "single-instance.sock"
+    private const val LIFECYCLE_LOCK_FILE_NAME = "single-instance.lifecycle.lock"
 
     /** Pre-hardening lock file, which lived in the system temp directory. */
     private const val LEGACY_LOCK_FILE_NAME = "boss-instance.lock"
@@ -574,6 +579,41 @@ private object SingleInstanceFiles {
 
     val socketFile: File
         get() = File(runtimeDir, SOCKET_FILE_NAME)
+
+    val lifecycleLockFile: File
+        get() = File(runtimeDir, LIFECYCLE_LOCK_FILE_NAME)
+
+    /**
+     * Shared cross-process serialization for publication and withdrawal (#1326).
+     * Ensures an incoming process binding an endpoint cannot have its newly-created
+     * socket unlinked by a concurrent stale withdraw, and that publication never exposes
+     * a half-written or momentarily absent descriptor.
+     */
+    fun <T> withCrossProcessLock(block: () -> T): T {
+        prepare()
+        val path = lifecycleLockFile.toPath()
+        val channel =
+            FileChannel.open(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE,
+            )
+        restrictToOwner(path, ownerOnlyFilePermissions)
+        val lock = channel.lock()
+        return try {
+            block()
+        } finally {
+            try {
+                lock.release()
+            } catch (_: IOException) {
+            }
+            try {
+                channel.close()
+            } catch (_: IOException) {
+            }
+        }
+    }
 
     /**
      * Creates the runtime directory owner-only, re-applying those permissions
@@ -624,18 +664,17 @@ private object SingleInstanceFiles {
         }
     }
 
-    /** Publishes [descriptor] owner-only, replacing whatever was there. */
+    /** Publishes [descriptor] owner-only, replacing whatever was there atomically. */
     fun write(descriptor: InstanceDescriptor): Boolean {
         val path = descriptorFile.toPath()
+        val tempPath = File(runtimeDir, "$DESCRIPTOR_FILE_NAME.tmp").toPath()
         val bytes = descriptor.encode().toByteArray(StandardCharsets.UTF_8)
         return try {
-            Files.deleteIfExists(path)
+            Files.deleteIfExists(tempPath)
             try {
-                // Created with the right mode from the start, so the token is
-                // never briefly readable by anyone else.
                 Files
                     .newByteChannel(
-                        path,
+                        tempPath,
                         setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE),
                         PosixFilePermissions.asFileAttribute(ownerOnlyFilePermissions),
                     ).use { it.write(ByteBuffer.wrap(bytes)) }
@@ -645,8 +684,13 @@ private object SingleInstanceFiles {
                     "POSIX file mode unavailable, writing then restricting",
                     mapOf("reason" to (e.message ?: "unsupported")),
                 )
-                Files.write(path, bytes)
-                restrictToOwner(path, ownerOnlyFilePermissions)
+                Files.write(tempPath, bytes)
+                restrictToOwner(tempPath, ownerOnlyFilePermissions)
+            }
+            try {
+                Files.move(tempPath, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(tempPath, path, StandardCopyOption.REPLACE_EXISTING)
             }
             true
         } catch (e: IOException) {
@@ -676,23 +720,46 @@ private object SingleInstanceFiles {
      * already belongs to another token (because another process reclaimed the endpoint while
      * this instance was tearing down or releasing), it is left in place so the new owner's
      * descriptor and listening socket are not unlinked.
+     *
+     * Inode-checked: on POSIX systems, comparing the socket file's device/inode before unlinking
+     * ensures that even if publication interleaved, a socket replaced by a new instance is never unlinked.
      */
     fun withdraw(descriptor: InstanceDescriptor?) {
-        try {
-            val onDisk = read()
-            if (descriptor != null && onDisk != null && onDisk.token != descriptor.token) {
-                logger.info(
-                    LogCategory.SYSTEM,
-                    "Single-instance descriptor was reclaimed by another owner; leaving it in place",
-                )
-                return
+        if (descriptor == null) return
+        withCrossProcessLock {
+            try {
+                val onDisk = read()
+                if (onDisk != null && onDisk.token != descriptor.token) {
+                    logger.info(
+                        LogCategory.SYSTEM,
+                        "Single-instance descriptor was reclaimed by another owner; leaving it in place",
+                    )
+                    return@withCrossProcessLock
+                }
+                Files.deleteIfExists(descriptorFile.toPath())
+                if (descriptor.transport == SingleInstanceTransport.UNIX) {
+                    val socketPath = File(descriptor.endpoint).toPath()
+                    if (Files.exists(socketPath)) {
+                        val currentKey =
+                            try {
+                                Files.readAttributes(socketPath, BasicFileAttributes::class.java).fileKey()
+                            } catch (_: Exception) {
+                                null
+                            }
+                        val boundKey = SingleInstanceManager.boundSocketFileKey
+                        if (boundKey == null || currentKey == null || currentKey == boundKey) {
+                            Files.deleteIfExists(socketPath)
+                        } else {
+                            logger.info(
+                                LogCategory.SYSTEM,
+                                "Socket file was replaced by another owner (inode mismatch); leaving it in place",
+                            )
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                logger.warn(LogCategory.SYSTEM, "Error removing single-instance files", error = e)
             }
-            Files.deleteIfExists(descriptorFile.toPath())
-            if (descriptor?.transport == SingleInstanceTransport.UNIX) {
-                Files.deleteIfExists(File(descriptor.endpoint).toPath())
-            }
-        } catch (e: IOException) {
-            logger.warn(LogCategory.SYSTEM, "Error removing single-instance files", error = e)
         }
     }
 }
@@ -758,6 +825,12 @@ internal object SingleInstanceWire {
             val channel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
             channel.bind(UnixDomainSocketAddress.of(path))
             SingleInstanceFiles.restrictToOwner(path, ownerOnlyFilePermissions)
+            SingleInstanceManager.boundSocketFileKey =
+                try {
+                    Files.readAttributes(path, BasicFileAttributes::class.java).fileKey()
+                } catch (_: Exception) {
+                    null
+                }
             channel to
                 InstanceDescriptor(
                     transport = SingleInstanceTransport.UNIX,
@@ -1451,6 +1524,10 @@ object SingleInstanceManager {
     @Volatile
     private var published: InstanceDescriptor? = null
 
+    /** Recorded fileKey (device/inode) of the bound Unix domain socket, if available. */
+    @Volatile
+    internal var boundSocketFileKey: Any? = null
+
     /**
      * Whether this process holds the single-instance claim - it won
      * [acquireLock] and has not been [release]d. Destructive startup cleanup
@@ -1477,6 +1554,15 @@ object SingleInstanceManager {
         SingleInstanceFiles.withdraw(descriptor)
     }
 
+    /** Test-only access to current listener epoch. */
+    internal val listenerEpochForTest: Long
+        get() = listenerEpoch
+
+    /** Test-only seam to invoke faulted listener teardown directly. */
+    internal fun teardownFaultedListenerForTest(epoch: Long) {
+        teardownFaultedListener(epoch)
+    }
+
     /**
      * Check whether another instance of BOSS is already running, by asking it.
      * Does not take ownership - use [acquireLock] for that.
@@ -1493,17 +1579,39 @@ object SingleInstanceManager {
      * the channel. On success the channel is listening and the descriptor is
      * published.
      */
-    fun acquireLock(): Boolean =
-        synchronized(lifecycleLock) {
-            SingleInstanceFiles.prepare()
+    fun acquireLock(): Boolean {
+        joinPreviousListener()
 
-            val existing = SingleInstanceFiles.read()
-            if (existing != null && !shouldReclaimExisting(existing)) {
-                return false
+        return synchronized(lifecycleLock) {
+            SingleInstanceFiles.withCrossProcessLock {
+                SingleInstanceFiles.prepare()
+
+                val existing = SingleInstanceFiles.read()
+                if (existing != null && !shouldReclaimExisting(existing)) {
+                    return@withCrossProcessLock false
+                }
+
+                return@withCrossProcessLock startServer()
             }
-
-            return startServer()
         }
+    }
+
+    /**
+     * Drains any previous listener thread outside the lifecycle lock so a faulted
+     * listener attempting [teardownFaultedListener] can acquire the monitor and exit
+     * cleanly without stalling (#1326).
+     */
+    private fun joinPreviousListener() {
+        val previous = listenerThread
+        if (previous != null && previous.isAlive && previous != Thread.currentThread()) {
+            try {
+                previous.join(1000L)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                logger.warn(LogCategory.SYSTEM, "Interrupted waiting for previous listener thread", error = e)
+            }
+        }
+    }
 
     private fun shouldReclaimExisting(existing: InstanceDescriptor): Boolean {
         if (existing.pid != null && !isProcessAlive(existing.pid)) {
@@ -1571,67 +1679,54 @@ object SingleInstanceManager {
     /**
      * Bind the channel, publish the descriptor and start accepting.
      * Returns false when there is nothing a second launch could reach.
+     * Caller must hold [lifecycleLock] and [SingleInstanceFiles.withCrossProcessLock].
      */
     private fun startServer(): Boolean {
-        listenerThread?.let {
-            if (it.isAlive && it != Thread.currentThread()) {
-                try {
-                    it.join(1000L)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    logger.warn(LogCategory.SYSTEM, "Interrupted waiting for previous listener thread", error = e)
-                }
-            }
+        listenerThread = null
+        try {
+            serverChannel?.close()
+        } catch (e: IOException) {
+            logger.warn(LogCategory.SYSTEM, "Error closing previous server channel", error = e)
         }
-        val started =
-            synchronized(lifecycleLock) {
-                listenerThread = null
-                try {
-                    serverChannel?.close()
-                } catch (e: IOException) {
-                    logger.warn(LogCategory.SYSTEM, "Error closing previous server channel", error = e)
-                }
-                serverChannel = null
+        serverChannel = null
 
-                val token = newChannelToken()
-                val bound =
-                    SingleInstanceWire.openUnixServer(SingleInstanceFiles.socketFile, token)
-                        ?: SingleInstanceWire.openTcpServer(token)
-                serverChannel = bound?.first
+        val token = newChannelToken()
+        val bound =
+            SingleInstanceWire.openUnixServer(SingleInstanceFiles.socketFile, token)
+                ?: SingleInstanceWire.openTcpServer(token)
+        serverChannel = bound?.first
 
-                // Without a published descriptor no second launch could reach us, and the
-                // token would be unknowable, so failing to publish is failing to start
-                // rather than listening on something nobody can address.
-                val descriptor = bound?.second?.takeIf { SingleInstanceFiles.write(it) }
-                if (descriptor == null) {
-                    logger.error(
-                        LogCategory.SYSTEM,
-                        if (bound == null) {
-                            "Failed to bind the single-instance channel on any endpoint"
-                        } else {
-                            "Failed to publish the single-instance descriptor"
-                        },
-                    )
-                    release()
-                    false
+        // Without a published descriptor no second launch could reach us, and the
+        // token would be unknowable, so failing to publish is failing to start
+        // rather than listening on something nobody can address.
+        val descriptor = bound?.second?.takeIf { SingleInstanceFiles.write(it) }
+        return if (descriptor == null) {
+            logger.error(
+                LogCategory.SYSTEM,
+                if (bound == null) {
+                    "Failed to bind the single-instance channel on any endpoint"
                 } else {
-                    published = descriptor
-                    logger.info(
-                        LogCategory.SYSTEM,
-                        "Single-instance channel listening",
-                        mapOf("transport" to descriptor.transport.name, "endpoint" to descriptor.endpoint),
-                    )
+                    "Failed to publish the single-instance descriptor"
+                },
+            )
+            release()
+            false
+        } else {
+            published = descriptor
+            logger.info(
+                LogCategory.SYSTEM,
+                "Single-instance channel listening",
+                mapOf("transport" to descriptor.transport.name, "endpoint" to descriptor.endpoint),
+            )
 
-                    startAcceptLoop()
-                    true
-                }
-            }
-        return started
+            startAcceptLoop()
+            true
+        }
     }
 
     @Suppress("TooGenericExceptionCaught")
     private fun startAcceptLoop() {
-        val epoch = synchronized(lifecycleLock) { ++listenerEpoch }
+        val epoch = ++listenerEpoch
         isListening = true
         listenerThread =
             thread(isDaemon = true, name = "BOSS-IPC-Listener") {
@@ -1669,7 +1764,7 @@ object SingleInstanceManager {
 
     private fun teardownFaultedListener(epoch: Long) =
         synchronized(lifecycleLock) {
-            if (epoch != listenerEpoch) {
+            if (epoch != listenerEpoch || !isListening) {
                 logger.info(
                     LogCategory.SYSTEM,
                     "Faulted listener teardown ignored: current epoch $listenerEpoch superseded $epoch",
@@ -2301,13 +2396,16 @@ object SingleInstanceManager {
      * Stop the channel and withdraw the descriptor.
      * Should be called on application shutdown.
      */
-    fun release() =
+    fun release() {
+        val threadToJoin: Thread?
         synchronized(lifecycleLock) {
             logger.info(LogCategory.SYSTEM, "Releasing the single-instance channel...")
 
             isListening = false
             val descriptor = published
             published = null
+            SingleInstanceFiles.withdraw(descriptor)
+
             acceptNextClientOverride = null
             llmTokenProviderOverride = null
             statusProviderOverride = null
@@ -2326,18 +2424,19 @@ object SingleInstanceManager {
             }
             serverChannel = null
 
-            try {
-                if (listenerThread != Thread.currentThread()) {
-                    listenerThread?.join(1000)
-                }
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                logger.warn(LogCategory.SYSTEM, "Interrupted waiting for the listener thread", error = e)
-            }
+            threadToJoin = listenerThread
             listenerThread = null
-
-            SingleInstanceFiles.withdraw(descriptor)
-
-            logger.info(LogCategory.SYSTEM, "Single-instance channel released")
         }
+
+        try {
+            if (threadToJoin != null && threadToJoin != Thread.currentThread()) {
+                threadToJoin.join(1000)
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logger.warn(LogCategory.SYSTEM, "Interrupted waiting for the listener thread", error = e)
+        }
+
+        logger.info(LogCategory.SYSTEM, "Single-instance channel released")
+    }
 }
