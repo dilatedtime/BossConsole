@@ -14,9 +14,10 @@ import java.nio.file.attribute.PosixFilePermission
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-internal const val WINDOWS_PATH_TIMEOUT_SECONDS = 30L
-internal const val STREAM_DRAIN_TIMEOUT_SECONDS = 2L
-internal const val MAX_PROCESS_OUTPUT_CHARS = 8192
+private const val WINDOWS_PATH_TIMEOUT_SECONDS = 30L
+private const val STREAM_DRAIN_TIMEOUT_SECONDS = 2L
+private const val MAX_PROCESS_OUTPUT_CHARS = 8192
+private const val DRAIN_BUFFER_CHARS = 512
 
 actual object CLIInstaller {
     private val logger = BossLogger.forComponent("CLIInstaller")
@@ -362,12 +363,13 @@ actual object CLIInstaller {
     private fun drainAsync(
         stream: InputStream,
         sink: StringBuilder,
+        streamName: String,
         capChars: Int = MAX_PROCESS_OUTPUT_CHARS,
     ): Thread =
-        thread(isDaemon = true, name = "BOSS-CLI-WindowsPath-Drain") {
+        thread(isDaemon = true, name = "BOSS-CLI-WindowsPath-Drain-$streamName") {
             try {
                 BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8)).use { reader ->
-                    val buf = CharArray(512)
+                    val buf = CharArray(DRAIN_BUFFER_CHARS)
                     while (true) {
                         val read = reader.read(buf)
                         if (read < 0) break
@@ -394,6 +396,7 @@ actual object CLIInstaller {
         currentPathProvider: () -> String = { System.getenv("PATH") ?: "" },
         processStarter: (List<String>) -> Process = { cmd -> ProcessBuilder(cmd).start() },
     ): Boolean {
+        require(timeoutSeconds > 0) { "timeoutSeconds must be positive: $timeoutSeconds" }
         if (currentPathProvider().contains(binPath)) {
             return true
         }
@@ -404,20 +407,28 @@ actual object CLIInstaller {
         binPath: String,
         timeoutSeconds: Long,
         processStarter: (List<String>) -> Process,
-    ): Boolean =
-        try {
-            val process = processStarter(listOf("cmd", "/c", "setx", "PATH", "$binPath;%PATH%"))
+    ): Boolean {
+        var process: Process? = null
+        return try {
+            process = processStarter(listOf("cmd", "/c", "setx", "PATH", "$binPath;%PATH%"))
+            runCatching { process.outputStream.close() }
             val stdout = StringBuilder()
             val stderr = StringBuilder()
-            val outDrain = drainAsync(process.inputStream, stdout)
-            val errDrain = drainAsync(process.errorStream, stderr)
+            val outDrain = drainAsync(process.inputStream, stdout, "stdout")
+            val errDrain = drainAsync(process.errorStream, stderr, "stderr")
 
             val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!finished) {
                 process.destroyForcibly()
                 process.waitFor(STREAM_DRAIN_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                val outStr = synchronized(stdout) { stdout.toString().trim() }
-                val errStr = synchronized(stderr) { stderr.toString().trim() }
+            }
+            outDrain.join(STREAM_DRAIN_TIMEOUT_SECONDS * 1000)
+            errDrain.join(STREAM_DRAIN_TIMEOUT_SECONDS * 1000)
+
+            val outStr = synchronized(stdout) { stdout.toString().trim() }
+            val errStr = synchronized(stderr) { stderr.toString().trim() }
+
+            if (!finished) {
                 logger.warn(
                     LogCategory.SYSTEM,
                     "Windows setx command timed out after ${timeoutSeconds}s; process forcibly terminated",
@@ -429,13 +440,8 @@ actual object CLIInstaller {
                 )
                 false
             } else {
-                outDrain.join(STREAM_DRAIN_TIMEOUT_SECONDS * 1000)
-                errDrain.join(STREAM_DRAIN_TIMEOUT_SECONDS * 1000)
-
                 val exitCode = process.exitValue()
                 if (exitCode != 0) {
-                    val outStr = synchronized(stdout) { stdout.toString().trim() }
-                    val errStr = synchronized(stderr) { stderr.toString().trim() }
                     logger.warn(
                         LogCategory.SYSTEM,
                         "Windows setx command exited with non-zero exit code $exitCode",
@@ -448,10 +454,19 @@ actual object CLIInstaller {
                 }
                 exitCode == 0
             }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logger.warn(LogCategory.SYSTEM, "Interrupted while updating Windows PATH", error = e)
+            false
         } catch (e: Exception) {
             logger.warn(LogCategory.SYSTEM, "Failed to update Windows PATH", error = e)
             false
+        } finally {
+            if (process?.isAlive == true) {
+                runCatching { process.destroyForcibly() }
+            }
         }
+    }
 
     private data class ShellConfigResult(
         val success: Boolean,

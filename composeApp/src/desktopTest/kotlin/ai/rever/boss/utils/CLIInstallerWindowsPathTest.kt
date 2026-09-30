@@ -10,6 +10,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -101,15 +102,91 @@ class CLIInstallerWindowsPathTest {
         assertFalse(result)
     }
 
+    @Test
+    fun `when stdout blocks until destroyForcibly bounded wait completes and returns false`() {
+        val fakeProc = FakeProcess(hang = true, blockStdoutUntilDestroy = true)
+        val startedAt = System.currentTimeMillis()
+
+        val result =
+            CLIInstaller.updateWindowsPath(
+                binPath = "C:\\Users\\test\\bin",
+                timeoutSeconds = 1L,
+                currentPathProvider = { "C:\\Windows\\system32" },
+                processStarter = { fakeProc },
+            )
+
+        val elapsedMs = System.currentTimeMillis() - startedAt
+        assertFalse(result, "Process with blocking stdout must return false on timeout")
+        assertTrue(fakeProc.wasDestroyedForcibly.get(), "Process must be destroyed forcibly upon timeout")
+        assertTrue(elapsedMs < 5_000, "Bounded wait must complete within timeout plus drain grace")
+    }
+
+    @Test
+    fun `when interrupted during execution process is destroyed and interrupt flag restored`() {
+        val fakeProc = FakeProcess(hang = true, throwOnWaitFor = InterruptedException("test interrupt"))
+
+        val result =
+            CLIInstaller.updateWindowsPath(
+                binPath = "C:\\Users\\test\\bin",
+                timeoutSeconds = 1L,
+                currentPathProvider = { "C:\\Windows\\system32" },
+                processStarter = { fakeProc },
+            )
+
+        assertFalse(result)
+        assertTrue(fakeProc.wasDestroyedForcibly.get(), "Process must be destroyed forcibly on interruption")
+        assertTrue(Thread.interrupted(), "Thread interrupt flag must be restored")
+    }
+
+    @Test
+    fun `when timeoutSeconds is zero or negative throws IllegalArgumentException`() {
+        assertFailsWith<IllegalArgumentException> {
+            CLIInstaller.updateWindowsPath(
+                binPath = "C:\\Users\\test\\bin",
+                timeoutSeconds = 0L,
+                currentPathProvider = { "C:\\Windows\\system32" },
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            CLIInstaller.updateWindowsPath(
+                binPath = "C:\\Users\\test\\bin",
+                timeoutSeconds = -1L,
+                currentPathProvider = { "C:\\Windows\\system32" },
+            )
+        }
+    }
+
     private class FakeProcess(
         private val exitCode: Int = 0,
         hang: Boolean = false,
         stdout: String = "",
         stderr: String = "",
+        blockStdoutUntilDestroy: Boolean = false,
+        private val throwOnWaitFor: Exception? = null,
     ) : Process() {
         val wasDestroyedForcibly = AtomicBoolean(false)
         private val exitLatch = CountDownLatch(if (hang) 1 else 0)
-        private val inStream: InputStream = ByteArrayInputStream(stdout.toByteArray(StandardCharsets.UTF_8))
+        private val streamUnblockLatch = CountDownLatch(if (blockStdoutUntilDestroy) 1 else 0)
+        private val inStream: InputStream =
+            if (blockStdoutUntilDestroy) {
+                object : InputStream() {
+                    override fun read(): Int {
+                        streamUnblockLatch.await()
+                        return -1
+                    }
+
+                    override fun read(
+                        b: ByteArray,
+                        off: Int,
+                        len: Int,
+                    ): Int {
+                        streamUnblockLatch.await()
+                        return -1
+                    }
+                }
+            } else {
+                ByteArrayInputStream(stdout.toByteArray(StandardCharsets.UTF_8))
+            }
         private val errStream: InputStream = ByteArrayInputStream(stderr.toByteArray(StandardCharsets.UTF_8))
         private val outStream: OutputStream = ByteArrayOutputStream()
 
@@ -119,7 +196,10 @@ class CLIInstallerWindowsPathTest {
 
         override fun getErrorStream(): InputStream = errStream
 
+        override fun isAlive(): Boolean = exitLatch.count > 0
+
         override fun waitFor(): Int {
+            if (throwOnWaitFor != null) throw throwOnWaitFor
             exitLatch.await()
             return exitCode
         }
@@ -127,7 +207,10 @@ class CLIInstallerWindowsPathTest {
         override fun waitFor(
             timeout: Long,
             unit: TimeUnit,
-        ): Boolean = exitLatch.await(timeout, unit)
+        ): Boolean {
+            if (throwOnWaitFor != null) throw throwOnWaitFor
+            return exitLatch.await(timeout, unit)
+        }
 
         override fun exitValue(): Int {
             if (exitLatch.count > 0) throw IllegalThreadStateException("Process has not exited")
@@ -140,6 +223,7 @@ class CLIInstallerWindowsPathTest {
 
         override fun destroyForcibly(): Process {
             wasDestroyedForcibly.set(true)
+            streamUnblockLatch.countDown()
             exitLatch.countDown()
             return this
         }
