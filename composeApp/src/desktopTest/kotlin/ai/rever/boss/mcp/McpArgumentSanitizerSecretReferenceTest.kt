@@ -47,4 +47,27 @@ class McpArgumentSanitizerSecretReferenceTest {
         val out = McpArgumentSanitizer.sanitize(mapOf("token" to "{{secret:$id}}"))
         assertEquals("[REDACTED]", out["token"])
     }
+
+    @Test
+    fun `a malformed reference with trailing characters is fully redacted`() {
+        val out = McpArgumentSanitizer.sanitizeMessage("TOKEN={{secret:ghp_realtokenhere}}tail")
+        assertFalse(out.contains("ghp_realtokenhere"), out)
+        assertFalse(out.contains("tail"), out)
+    }
+
+    @Test
+    fun `a malformed reference with no keyword prefix is redacted`() {
+        val out = McpArgumentSanitizer.sanitizeMessage("note={{secret:hunter2}} and {{secret:hunter3}}")
+        assertFalse(out.contains("hunter2"), out)
+        assertFalse(out.contains("hunter3"), out)
+        assertTrue(out.contains("{{secret:[REDACTED]}}"), out)
+    }
+
+    @Test
+    fun `case-insensitive valid reference prefix is preserved while malformed is redacted`() {
+        val out = McpArgumentSanitizer.sanitizeMessage("note={{SECRET:$id}} and {{SECRET:hunter2}}")
+        assertTrue(out.contains("{{SECRET:$id}}"), out)
+        assertFalse(out.contains("hunter2"), out)
+        assertTrue(out.contains("{{secret:[REDACTED]}}"), out)
+    }
 }

@@ -186,6 +186,7 @@ class McpArgumentSanitizerStackSafetyTest {
                 "postgres://admin:",
                 "https://",
                 "TOKEN={{secret:",
+                "{{secret:",
             )
 
         /** Repeated after a trigger until the input reaches its size. */

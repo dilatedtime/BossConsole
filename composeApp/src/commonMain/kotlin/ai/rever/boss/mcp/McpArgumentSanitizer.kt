@@ -115,8 +115,11 @@ object McpArgumentSanitizer {
      */
     private const val KEY_CLOSE = """(?:\\?["'])?"""
 
-    /** A value: quoted whole, or up to the next delimiter. The closing quote of a JSON value rides along. */
-    private const val VALUE = """(?:"[^"]*"|'[^']*'|[^\s&,;}]+)"""
+    /**
+     * A value: quoted whole, a double-braced template, or up to the next delimiter.
+     * The closing quote of a JSON value rides along.
+     */
+    private const val VALUE = """(?:"[^"]*"|'[^']*'|(?:\{\{[^{}]*+\}\}|[^\s&,;}])++)"""
 
     /** Authorization is special: consume generic scheme words before the credential value. */
     private val authorizationHeader =
@@ -143,9 +146,22 @@ object McpArgumentSanitizer {
      *   reference; the value is kept. Nothing real starts with `{{secret:`.
      * See `ai.rever.boss.mcp.secrets`.
      */
+    private const val validSecretReferenceId =
+        """[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"""
     private const val validSecretReference =
-        """\{\{secret:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""" +
-            """(?:\.(?:password|username|notes))?\}\}"""
+        """\{\{secret:$validSecretReferenceId(?:\.(?:password|username|notes))?\}\}"""
+
+    /**
+     * A candidate `{{secret:...}}` that is not a valid secret reference. A valid reference
+     * (`{{secret:<uuid>}}`) is preserved in cleartext so operators and audits can see which secret
+     * was authorized; any invalid candidate (e.g. `{{secret:hunter2}}`) may be an agent-authored
+     * plaintext credential with no keyword prefix, so it is redacted before reaching refusal
+     * messages, dialogs, or disk.
+     */
+    private val malformedSecretReference =
+        Regex(
+            """(?i)\{\{secret:(?!$validSecretReferenceId(?:\.(?:password|username|notes))?\}\})[^{}]*+(?:\}\}|$)""",
+        )
 
     // `*+`, not `*`: see STACK SAFETY on [sanitizeMessage]. Nothing that may follow the name
     // (a quote, a backslash, whitespace, `:` or `=`) can be a character the group consumed, so
@@ -292,4 +308,5 @@ object McpArgumentSanitizer {
             .replace(redisAuthFlag, "$1 [REDACTED]")
             .replace(npmAuthToken, "$1 [REDACTED]")
             .replace(bearer, "Bearer [REDACTED]")
+            .replace(malformedSecretReference, "{{secret:[REDACTED]}}")
 }

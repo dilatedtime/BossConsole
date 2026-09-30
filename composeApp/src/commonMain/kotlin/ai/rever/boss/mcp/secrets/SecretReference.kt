@@ -102,11 +102,15 @@ object SecretReferenceParser {
 
     private val uuid = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-    /** Every candidate, well-formed or not: anything between `{{secret:` and the next `}}`. */
-    private val candidate = Regex("\\{\\{secret:([^{}]*)\\}\\}")
+    /**
+     * Every candidate, well-formed or not: anything between `{{secret:` and the next `}}`.
+     * The `{{secret:` prefix is case-insensitive so an agent or operator typing `{{SECRET:...}}`
+     * is normalized rather than reaching the handler as literal placeholder text.
+     */
+    private val candidate = Regex("""(?i)\{\{secret:([^{}]*)\}\}""")
 
     /** Whether [text] contains anything worth parsing. */
-    fun mayContain(text: String): Boolean = text.contains(MARKER)
+    fun mayContain(text: String): Boolean = text.contains("{{") && text.contains(MARKER, ignoreCase = true)
 
     /**
      * Parse one candidate body (the text between `{{secret:` and `}}`).
@@ -170,7 +174,7 @@ object SecretReferenceParser {
                 if (ref != null) found.add(ref)
             }
             val unmatchedText = candidate.replace(text, "")
-            val unmatchedMarker = unmatchedText.indexOf(MARKER)
+            val unmatchedMarker = unmatchedText.indexOf(MARKER, ignoreCase = true)
             if (unmatchedMarker >= 0) {
                 return SecretReferenceScan.Malformed(
                     unmatchedText.substring(unmatchedMarker).take(120),

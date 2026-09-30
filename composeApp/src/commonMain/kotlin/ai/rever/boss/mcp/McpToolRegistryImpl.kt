@@ -1651,7 +1651,7 @@ internal fun parseMcpToolArgs(
                 logger.debug(
                     LogCategory.SYSTEM,
                     "MCP tool arguments are not a JSON object - using empty args",
-                    mapOf("error" to t.toString()),
+                    mapOf("error" to (t::class.simpleName ?: "Throwable")),
                 )
                 emptyMap()
             }
