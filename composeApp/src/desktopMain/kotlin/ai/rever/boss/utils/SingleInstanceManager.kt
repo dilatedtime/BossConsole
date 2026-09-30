@@ -130,6 +130,15 @@ private const val OPEN_ACTION_TIMEOUT_MS = 5000L
 internal const val PLUGIN_DEV_RELOAD_TIMEOUT_MS = 45_000L
 
 /**
+ * Maximum number of in-flight client handler threads. Bounds a local-thread flood
+ * against the host (#1326). With this at 32 and the per-connection budget at
+ * CONNECTION_TIMEOUT_MS (10s), the worst case a flood can park is 32 threads for
+ * 10s, and the next accepted connection is dropped immediately rather than
+ * spawning a 33rd.
+ */
+internal const val MAX_CLIENT_HANDLERS = 32
+
+/**
  * Ceiling on a single request. Bounds what one caller can make the app buffer,
  * sized to accommodate Base64-encoded tool arguments and payloads.
  */
@@ -1223,6 +1232,19 @@ object SingleInstanceManager {
     private var serverChannel: ServerSocketChannel? = null
     private var listenerThread: Thread? = null
 
+    /**
+     * Bounds the in-flight client handler threads so a local flood cannot park
+     * N daemons per request (#1326). When the budget is exhausted, the listener
+     * thread closes the freshly-accepted connection without spawning a handler:
+     * the worst case for the rejected caller is a closed socket, and the worst
+     * case for the host is `MAX_CLIENT_HANDLERS` parked handler threads.
+     */
+    private val clientSlots = java.util.concurrent.Semaphore(MAX_CLIENT_HANDLERS)
+
+    /** Number of client handler permits currently available (test seam). */
+    internal val availableClientSlots: Int
+        get() = clientSlots.availablePermits()
+
     /** Test seam; production serves credentials from the running BOSS session. */
     internal var llmTokenProviderOverride: (() -> Result<String>)? = null
 
@@ -1381,36 +1403,58 @@ object SingleInstanceManager {
      * cannot present it gets a refusal and nothing else.
      */
     private fun handleClient(client: SocketChannel) {
-        thread(isDaemon = true, name = "BOSS-IPC-Client-Handler") {
-            var budget = SingleInstanceWire.closeAfterBudget(client)
-            try {
-                client.use { channel ->
-                    val line =
-                        SingleInstanceWire.readBoundedLine(
-                            BufferedInputStream(Channels.newInputStream(channel)),
-                            MAX_REQUEST_BYTES,
-                        )
-                    val request = line?.let { parseRequestLine(it) }
-                    // Only a caller that presented the live token gets the longer
-                    // budget: minting a credential is a round trip to the gateway,
-                    // and nothing an unauthenticated caller sends should change what
-                    // this process is willing to spend on it.
-                    if (request != null && isLongerBudgetCandidate(request)) {
-                        budget.cancel(false)
-                        val timeout =
-                            if (request.verb == VERB_LLM_TOKEN) LLM_TOKEN_TIMEOUT_MS else MCP_INVOKE_TIMEOUT_MS
-                        budget = SingleInstanceWire.closeAfterBudget(channel, timeout)
+        // Acquire a handler slot before spawning a thread. A local flood that
+        // exceeds MAX_CLIENT_HANDLERS in-flight requests is dropped immediately,
+        // so a single attacker cannot park an unbounded number of daemons by
+        // holding the channel open. See #1326.
+        if (!clientSlots.tryAcquire()) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Single-instance handler at capacity; dropping connection without reading",
+            )
+            runCatching { client.close() }
+            return
+        }
+        var spawned = false
+        try {
+            thread(isDaemon = true, name = "BOSS-IPC-Client-Handler") {
+                var budget = SingleInstanceWire.closeAfterBudget(client)
+                try {
+                    client.use { channel ->
+                        val line =
+                            SingleInstanceWire.readBoundedLine(
+                                BufferedInputStream(Channels.newInputStream(channel)),
+                                MAX_REQUEST_BYTES,
+                            )
+                        val request = line?.let { parseRequestLine(it) }
+                        // Only a caller that presented the live token gets the longer
+                        // budget: minting a credential is a round trip to the gateway,
+                        // and nothing an unauthenticated caller sends should change what
+                        // this process is willing to spend on it.
+                        if (request != null && isLongerBudgetCandidate(request)) {
+                            budget.cancel(false)
+                            val timeout =
+                                if (request.verb == VERB_LLM_TOKEN) LLM_TOKEN_TIMEOUT_MS else MCP_INVOKE_TIMEOUT_MS
+                            budget = SingleInstanceWire.closeAfterBudget(channel, timeout)
+                        }
+                        SingleInstanceWire.writeLine(channel, responseFor(request))
                     }
-                    SingleInstanceWire.writeLine(channel, responseFor(request))
+                } catch (e: IOException) {
+                    logger.debug(
+                        LogCategory.SYSTEM,
+                        "Single-instance connection ended early",
+                        mapOf("reason" to (e.message ?: "io error")),
+                    )
+                } finally {
+                    budget.cancel(false)
+                    clientSlots.release()
                 }
-            } catch (e: IOException) {
-                logger.debug(
-                    LogCategory.SYSTEM,
-                    "Single-instance connection ended early",
-                    mapOf("reason" to (e.message ?: "io error")),
-                )
-            } finally {
-                budget.cancel(false)
+            }
+            spawned = true
+        } finally {
+            if (!spawned) {
+                clientSlots.release()
+                runCatching { client.close() }
             }
         }
     }
