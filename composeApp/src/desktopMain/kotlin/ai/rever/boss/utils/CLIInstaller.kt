@@ -455,8 +455,8 @@ actual object CLIInstaller {
                 exitCode == 0
             }
         } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
             logger.warn(LogCategory.SYSTEM, "Interrupted while updating Windows PATH", error = e)
+            Thread.currentThread().interrupt()
             false
         } catch (e: Exception) {
             logger.warn(LogCategory.SYSTEM, "Failed to update Windows PATH", error = e)

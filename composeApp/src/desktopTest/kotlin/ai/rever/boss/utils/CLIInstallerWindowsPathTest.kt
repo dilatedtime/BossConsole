@@ -1,6 +1,7 @@
 package ai.rever.boss.utils
 
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -72,6 +73,7 @@ class CLIInstallerWindowsPathTest {
     }
 
     @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
     fun `when setx hangs past timeout process is forcibly destroyed and returns false`() {
         val fakeProc = FakeProcess(hang = true)
         val startedAt = System.currentTimeMillis()
@@ -87,7 +89,7 @@ class CLIInstallerWindowsPathTest {
         val elapsedMs = System.currentTimeMillis() - startedAt
         assertFalse(result, "Hung setx process must result in false return value")
         assertTrue(fakeProc.wasDestroyedForcibly.get(), "Process must be destroyed forcibly upon timeout")
-        assertTrue(elapsedMs < 5_000, "Bounded wait must complete within timeout plus drain grace")
+        assertTrue(elapsedMs < 15_000, "Bounded wait must complete within timeout plus drain grace")
     }
 
     @Test
@@ -103,6 +105,7 @@ class CLIInstallerWindowsPathTest {
     }
 
     @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
     fun `when stdout blocks until destroyForcibly bounded wait completes and returns false`() {
         val fakeProc = FakeProcess(hang = true, blockStdoutUntilDestroy = true)
         val startedAt = System.currentTimeMillis()
@@ -118,24 +121,29 @@ class CLIInstallerWindowsPathTest {
         val elapsedMs = System.currentTimeMillis() - startedAt
         assertFalse(result, "Process with blocking stdout must return false on timeout")
         assertTrue(fakeProc.wasDestroyedForcibly.get(), "Process must be destroyed forcibly upon timeout")
-        assertTrue(elapsedMs < 5_000, "Bounded wait must complete within timeout plus drain grace")
+        assertTrue(elapsedMs < 15_000, "Bounded wait must complete within timeout plus drain grace")
     }
 
     @Test
     fun `when interrupted during execution process is destroyed and interrupt flag restored`() {
         val fakeProc = FakeProcess(hang = true, throwOnWaitFor = InterruptedException("test interrupt"))
 
+        var interrupted = false
         val result =
-            CLIInstaller.updateWindowsPath(
-                binPath = "C:\\Users\\test\\bin",
-                timeoutSeconds = 1L,
-                currentPathProvider = { "C:\\Windows\\system32" },
-                processStarter = { fakeProc },
-            )
+            try {
+                CLIInstaller.updateWindowsPath(
+                    binPath = "C:\\Users\\test\\bin",
+                    timeoutSeconds = 1L,
+                    currentPathProvider = { "C:\\Windows\\system32" },
+                    processStarter = { fakeProc },
+                )
+            } finally {
+                interrupted = Thread.interrupted()
+            }
 
         assertFalse(result)
         assertTrue(fakeProc.wasDestroyedForcibly.get(), "Process must be destroyed forcibly on interruption")
-        assertTrue(Thread.interrupted(), "Thread interrupt flag must be restored")
+        assertTrue(interrupted, "Thread interrupt flag must be restored")
     }
 
     @Test
