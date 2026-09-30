@@ -12,9 +12,16 @@ import java.net.SocketAddress
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -25,8 +32,8 @@ import kotlin.test.assertTrue
  * of short-lived daemon threads.
  *
  * The fix gates `handleClient` behind a semaphore bounded by `MAX_CLIENT_HANDLERS` (32).
- * Any connection accepted when all 32 handler slots are occupied is immediately closed
- * without spawning a thread.
+ * Any connection accepted when all 32 handler slots are occupied is answered with `BUSY`
+ * and immediately closed without spawning a thread.
  */
 class SingleInstanceFloodCapTest {
     @TempDir
@@ -41,8 +48,10 @@ class SingleInstanceFloodCapTest {
     @AfterEach
     fun releaseChannel() {
         SingleInstanceManager.release()
+        SingleInstanceManager.watchdogSchedulerOverride = null
         SingleInstanceManager.llmTokenProviderOverride = null
         SingleInstanceManager.runtimeDirOverride = null
+        waitForSlotsRecovery()
     }
 
     @Test
@@ -63,6 +72,14 @@ class SingleInstanceFloodCapTest {
 
             assertOverflowConnectionsRejected(targetAddress, count = 5)
 
+            // Saturated instance must preserve single-instance ownership against a second launch
+            val secondAcquire = SingleInstanceManager.acquireLock()
+            assertFalse(secondAcquire, "Second acquireLock must fail while first host is saturated")
+            val currentDescriptor = readPublishedDescriptor()
+            assertNotNull(currentDescriptor)
+            assertEquals(descriptor.endpoint, currentDescriptor.endpoint, "Endpoint must stay with first host")
+            assertEquals(descriptor.pid, currentDescriptor.pid, "PID must stay with first host")
+
             val parkedThreadsAfter = parkedThreadCount()
             val spawned = parkedThreadsAfter - parkedThreadsBefore
             assertTrue(
@@ -79,6 +96,45 @@ class SingleInstanceFloodCapTest {
             SingleInstanceManager.availableClientSlots,
             "Client handler slots must fully recover after connections close",
         )
+
+        val ping = formatPingRequest(descriptor.token)
+        val pong = SingleInstanceWire.exchange(descriptor, ping)
+        assertEquals(RESPONSE_PONG, pong, "Server must respond with PONG after slots recovery")
+    }
+
+    @Test
+    fun `failing watchdog setup does not leak socket or client slots`() {
+        val failingScheduler =
+            object : ScheduledExecutorService by Executors.newSingleThreadScheduledExecutor() {
+                override fun schedule(
+                    command: Runnable,
+                    delay: Long,
+                    unit: TimeUnit,
+                ): ScheduledFuture<*> = throw RejectedExecutionException("Watchdog scheduling rejected")
+            }
+        SingleInstanceManager.watchdogSchedulerOverride = failingScheduler
+        try {
+            assertTrue(SingleInstanceManager.acquireLock(), "Failed to bind")
+            val descriptor = assertNotNull(readPublishedDescriptor(), "Published descriptor must exist")
+            val targetAddress = toSocketAddress(descriptor)
+
+            val ch = SocketChannel.open(targetAddress)
+            ch.configureBlocking(false)
+            val buf = ByteBuffer.allocate(16)
+            val readBytes = readWithTimeout(ch, buf, timeoutMs = 2000L)
+            assertEquals(-1, readBytes, "Socket must be closed when watchdog setup fails")
+            ch.close()
+
+            waitForSlotsRecovery()
+            assertEquals(
+                MAX_CLIENT_HANDLERS,
+                SingleInstanceManager.availableClientSlots,
+                "Slots must recover even if watchdog setup throws",
+            )
+        } finally {
+            failingScheduler.shutdownNow()
+            SingleInstanceManager.watchdogSchedulerOverride = null
+        }
     }
 
     private fun waitForSlotsExhaustion() {
@@ -113,10 +169,14 @@ class SingleInstanceFloodCapTest {
                 }
             }
 
-            val buf = ByteBuffer.allocate(16)
+            val buf = ByteBuffer.allocate(32)
             overflowSockets.forEach { ch ->
                 val readBytes = runCatching { readWithTimeout(ch, buf) }.getOrDefault(-1)
-                assertEquals(-1, readBytes, "Overflow connection must be immediately closed by server")
+                assertTrue(readBytes > 0 || readBytes == -1, "Must read BUSY response or immediate close")
+                if (readBytes > 0) {
+                    val msg = String(buf.array(), 0, readBytes, StandardCharsets.UTF_8).trim()
+                    assertEquals(RESPONSE_BUSY, msg, "Overflow connection must receive BUSY")
+                }
             }
         } finally {
             overflowSockets.forEach { runCatching { it.close() } }

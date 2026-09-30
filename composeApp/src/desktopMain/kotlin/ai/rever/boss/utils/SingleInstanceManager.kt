@@ -38,9 +38,12 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.HexFormat
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 private val logger = BossLogger.forComponent("SingleInstanceManager")
@@ -101,6 +104,7 @@ sealed interface ReloadResult {
 internal const val RESPONSE_OK = "OK"
 internal const val RESPONSE_PONG = "PONG"
 internal const val RESPONSE_REJECTED = "REJECTED"
+internal const val RESPONSE_BUSY = "BUSY"
 private const val RESPONSE_LLM_TOKEN_PREFIX = "LLM_TOKEN "
 internal const val RESPONSE_STATUS_PREFIX = "STATUS "
 internal const val RESPONSE_MCP_LIST_PREFIX = "MCP_LIST "
@@ -131,10 +135,13 @@ internal const val PLUGIN_DEV_RELOAD_TIMEOUT_MS = 45_000L
 
 /**
  * Maximum number of in-flight client handler threads. Bounds a local-thread flood
- * against the host (#1326). With this at 32 and the per-connection budget at
- * CONNECTION_TIMEOUT_MS (10s), the worst case a flood can park is 32 threads for
- * 10s, and the next accepted connection is dropped immediately rather than
- * spawning a 33rd.
+ * against the host (#1326). For unauthenticated connections, each connection is capped
+ * at [CONNECTION_TIMEOUT_MS] (10s). For authenticated requests presenting the published
+ * token, [isLongerBudgetCandidate] may grant up to [MCP_INVOKE_TIMEOUT_MS] (60s) or
+ * [LLM_TOKEN_TIMEOUT_MS] (90s). Furthermore, the watchdog closes the socket channel
+ * rather than interrupting the thread, so a handler waiting on a blocking gateway or plugin
+ * action may hold its permit until the operation returns. At capacity, incoming connections
+ * are immediately answered with [RESPONSE_BUSY] and closed without spawning additional threads.
  */
 internal const val MAX_CLIENT_HANDLERS = 32
 
@@ -683,11 +690,12 @@ private object SingleInstanceFiles {
  * The 10-second budget is enforced by closing the channel underneath a blocked
  * read, because a blocking [SocketChannel] has no read timeout of its own.
  */
-private object SingleInstanceWire {
+internal object SingleInstanceWire {
     private val watchdog =
         Executors.newSingleThreadScheduledExecutor(
             ThreadFactory { runnable -> Thread(runnable, "BOSS-IPC-Watchdog").apply { isDaemon = true } },
         )
+    internal var watchdogSchedulerOverride: ScheduledExecutorService? = null
 
     /**
      * Binds the Unix-domain socket, or returns null when this platform or path
@@ -760,10 +768,10 @@ private object SingleInstanceWire {
         return null
     }
 
-    /** True when something on [descriptor]'s endpoint answers a probe with the published token. */
+    /** True when something on [descriptor]'s endpoint answers a probe with the published token or is busy. */
     fun respondsToPing(descriptor: InstanceDescriptor): Boolean {
         val response = exchange(descriptor, formatPingRequest(descriptor.token))
-        return response == RESPONSE_PONG
+        return response == RESPONSE_PONG || response == RESPONSE_BUSY
     }
 
     /** Sends one line and reads one bounded line back, within the connection budget. */
@@ -862,8 +870,9 @@ private object SingleInstanceWire {
     fun closeAfterBudget(
         channel: SocketChannel,
         timeoutMs: Long = CONNECTION_TIMEOUT_MS,
-    ): ScheduledFuture<*> =
-        watchdog.schedule(
+    ): ScheduledFuture<*> {
+        val scheduler = watchdogSchedulerOverride ?: watchdog
+        return scheduler.schedule(
             Runnable {
                 if (channel.isOpen) {
                     logger.warn(LogCategory.SYSTEM, "Closing a single-instance connection that overran its budget")
@@ -873,6 +882,24 @@ private object SingleInstanceWire {
             timeoutMs,
             TimeUnit.MILLISECONDS,
         )
+    }
+
+    fun respondBusyAndClose(client: SocketChannel) {
+        runCatching {
+            client.configureBlocking(false)
+            val bytes = ByteBuffer.wrap("$RESPONSE_BUSY\n".toByteArray(StandardCharsets.UTF_8))
+            client.write(bytes)
+            runCatching { client.shutdownOutput() }
+            val scheduler = watchdogSchedulerOverride ?: watchdog
+            scheduler.schedule(
+                Runnable { runCatching { client.close() } },
+                100L,
+                TimeUnit.MILLISECONDS,
+            )
+        }.onFailure {
+            runCatching { client.close() }
+        }
+    }
 
     private fun closeQuietly(channel: SocketChannel) {
         try {
@@ -1260,6 +1287,16 @@ object SingleInstanceManager {
     /** Test seam / host hook for dev plugin reload response. */
     internal var pluginReloadHandlerOverride: ((String) -> Boolean)? = null
 
+    internal var watchdogSchedulerOverride: ScheduledExecutorService?
+        get() = SingleInstanceWire.watchdogSchedulerOverride
+        set(value) {
+            SingleInstanceWire.watchdogSchedulerOverride = value
+        }
+
+    private val droppedConnectionsCount = AtomicInteger(0)
+    private val lastDroppedWarningLogNanos = AtomicLong(0L)
+    private const val DROPPED_LOG_INTERVAL_NANOS = 1_000_000_000L
+
     @Volatile
     private var isListening: Boolean = false
 
@@ -1402,17 +1439,15 @@ object SingleInstanceManager {
      * The token is checked before the request means anything, so a caller that
      * cannot present it gets a refusal and nothing else.
      */
+    @Suppress("TooGenericExceptionCaught")
     private fun handleClient(client: SocketChannel) {
         // Acquire a handler slot before spawning a thread. A local flood that
-        // exceeds MAX_CLIENT_HANDLERS in-flight requests is dropped immediately,
-        // so a single attacker cannot park an unbounded number of daemons by
-        // holding the channel open. See #1326.
+        // exceeds MAX_CLIENT_HANDLERS in-flight requests is answered with BUSY
+        // and dropped immediately, so a single attacker cannot park an unbounded
+        // number of daemons by holding the channel open. See #1326.
         if (!clientSlots.tryAcquire()) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "Single-instance handler at capacity; dropping connection without reading",
-            )
-            runCatching { client.close() }
+            recordDroppedConnection()
+            SingleInstanceWire.respondBusyAndClose(client)
             return
         }
         var spawned = false
@@ -1420,8 +1455,8 @@ object SingleInstanceManager {
             thread(isDaemon = true, name = "BOSS-IPC-Client-Handler") {
                 var budget: ScheduledFuture<*>? = null
                 try {
-                    budget = SingleInstanceWire.closeAfterBudget(client)
                     client.use { channel ->
+                        budget = SingleInstanceWire.closeAfterBudget(channel)
                         val line =
                             SingleInstanceWire.readBoundedLine(
                                 BufferedInputStream(Channels.newInputStream(channel)),
@@ -1433,7 +1468,7 @@ object SingleInstanceManager {
                         // and nothing an unauthenticated caller sends should change what
                         // this process is willing to spend on it.
                         if (request != null && isLongerBudgetCandidate(request)) {
-                            budget?.cancel(false)
+                            budget.cancel(false)
                             val timeout =
                                 if (request.verb == VERB_LLM_TOKEN) LLM_TOKEN_TIMEOUT_MS else MCP_INVOKE_TIMEOUT_MS
                             budget = SingleInstanceWire.closeAfterBudget(channel, timeout)
@@ -1446,8 +1481,15 @@ object SingleInstanceManager {
                         "Single-instance connection ended early",
                         mapOf("reason" to (e.message ?: "io error")),
                     )
+                } catch (e: Throwable) {
+                    logger.debug(
+                        LogCategory.SYSTEM,
+                        "Single-instance connection failed",
+                        mapOf("reason" to (e.message ?: "error")),
+                    )
                 } finally {
                     budget?.cancel(false)
+                    runCatching { client.close() }
                     clientSlots.release()
                 }
             }
@@ -1457,6 +1499,18 @@ object SingleInstanceManager {
                 clientSlots.release()
                 runCatching { client.close() }
             }
+        }
+    }
+
+    private fun recordDroppedConnection() {
+        val total = droppedConnectionsCount.incrementAndGet()
+        val now = System.nanoTime()
+        val last = lastDroppedWarningLogNanos.get()
+        if (now - last >= DROPPED_LOG_INTERVAL_NANOS && lastDroppedWarningLogNanos.compareAndSet(last, now)) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Single-instance handler at capacity; dropping connection without reading (total: $total)",
+            )
         }
     }
 
@@ -1969,6 +2023,9 @@ object SingleInstanceManager {
         mcpListProviderOverride = null
         mcpInvokeHandlerOverride = null
         pluginReloadHandlerOverride = null
+        watchdogSchedulerOverride = null
+        droppedConnectionsCount.set(0)
+        lastDroppedWarningLogNanos.set(0L)
 
         try {
             serverChannel?.close()
