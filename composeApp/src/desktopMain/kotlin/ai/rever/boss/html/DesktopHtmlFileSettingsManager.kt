@@ -5,17 +5,23 @@ package ai.rever.boss.html
 import ai.rever.boss.plugin.pathutils.BossDirectories
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
+import ai.rever.boss.utils.logging.decodeFailure
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.serialization.SerializationException
 
 /** Desktop persistence. Routing waits for loading; UI can observe defaults immediately. */
 actual object HtmlFileSettingsManager {
     private val logger = BossLogger.forComponent("HtmlFileSettingsManager")
     private val store =
         HtmlFileSettingsStore(BossDirectories.resolve("html-file-settings.json")) { error ->
-            logger.warn(LogCategory.UI, "Unable to read or save HTML file settings", error = error)
+            if (error is SerializationException) {
+                logger.warn(LogCategory.UI, "Unable to read or save HTML file settings", decodeFailure(error))
+            } else {
+                logger.warn(LogCategory.UI, "Unable to read or save HTML file settings", error = error)
+            }
         }
     actual val currentSettings = store.currentSettings
 

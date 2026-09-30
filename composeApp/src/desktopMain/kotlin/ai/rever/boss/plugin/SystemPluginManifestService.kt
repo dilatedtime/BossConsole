@@ -6,6 +6,7 @@ import ai.rever.boss.services.supabase.SupabaseConfig
 import ai.rever.boss.utils.atomicWriteText
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
+import ai.rever.boss.utils.logging.decodeFailure
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.realtime.PostgresAction
 import io.github.jan.supabase.realtime.RealtimeChannel
@@ -24,6 +25,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -66,6 +68,7 @@ data class SystemPluginManifestEntry(
  *    next launch — the same "never swap under a live session" convention as
  *    the JAR updater.
  */
+@Suppress("TooManyFunctions")
 object SystemPluginManifestService {
     private val logger = BossLogger.forComponent("SystemPluginManifest")
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -416,6 +419,13 @@ object SystemPluginManifestService {
             } else {
                 FALLBACK
             }
+        } catch (e: SerializationException) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "System-plugins cache unreadable; using built-in fallback",
+                decodeFailure(e),
+            )
+            FALLBACK
         } catch (e: Exception) {
             logger.warn(
                 LogCategory.SYSTEM,
@@ -442,6 +452,10 @@ object SystemPluginManifestService {
                 ),
             )
         }
+    }
+
+    internal fun reloadForTest() {
+        entries.value = loadCacheOrFallback()
     }
 }
 
