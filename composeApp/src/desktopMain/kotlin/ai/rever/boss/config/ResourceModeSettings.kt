@@ -107,6 +107,8 @@ object ResourceModeSettings {
      * where one unmodelled field emptied whole lists on installed builds.
      */
     internal fun decode(raw: String): ResourceModeSettingsData =
+        // runCatching preserves Throwable-to-defaults parity: load initializes lazy state and
+        // an escaping Error would be retried on later current() calls.
         runCatching {
             json.decodeFromString(serializer, raw)
         }.getOrElse { e ->
