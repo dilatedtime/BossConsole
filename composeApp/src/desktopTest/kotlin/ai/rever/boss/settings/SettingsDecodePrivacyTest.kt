@@ -7,7 +7,9 @@ import ai.rever.boss.config.ChromiumFlagsSettingsManager
 import ai.rever.boss.config.ResourceModeSettings
 import ai.rever.boss.config.ResourceModeSettingsData
 import ai.rever.boss.config.SwipeNavSettingsManager
+import ai.rever.boss.dashboard.DashboardStatsManager
 import ai.rever.boss.filetypes.DefaultAppsSettingsManager
+import ai.rever.boss.focusmode.FocusModeSettingsManager
 import ai.rever.boss.html.HtmlFileSettingsStore
 import ai.rever.boss.html.logHtmlSettingsFailure
 import ai.rever.boss.mcp.secrets.captureHostLogs
@@ -54,6 +56,8 @@ class SettingsDecodePrivacyTest {
         }
         filesToCleanup.clear()
         PluginPersistence.resetForTest()
+        FocusModeSettingsManager.resetForTest()
+        DashboardStatsManager.resetForTest()
     }
 
     private fun track(file: File): File {
@@ -408,5 +412,43 @@ class SettingsDecodePrivacyTest {
             }
 
         assertDecodeFailureRedacted(logged, "System-plugins cache unreadable; using built-in fallback", secret)
+    }
+
+    @Test
+    fun `focus mode settings decode failure is redacted`() {
+        val secret = "leak-secret-focus-mode-${System.nanoTime()}"
+        val file = track(BossDirectories.resolve("focus-mode-settings.json"))
+        file.parentFile?.mkdirs()
+        file.writeText("{\"activeProfile\": \"profile-$secret")
+
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    FocusModeSettingsManager.reloadForTest()
+                }
+
+            assertDecodeFailureRedacted(logged, "Failed to decode settings, falling back to defaults", secret)
+        } finally {
+            FocusModeSettingsManager.resetForTest()
+        }
+    }
+
+    @Test
+    fun `dashboard stats manager decode failure is redacted`() {
+        val secret = "leak-secret-dashboard-stats-${System.nanoTime()}"
+        val file = track(BossDirectories.resolve("dashboard-stats.json"))
+        file.parentFile?.mkdirs()
+        file.writeText("{\"today\": \"2026-10-01\", \"secret\": \"$secret")
+
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    runBlocking { DashboardStatsManager.reloadForTest() }
+                }
+
+            assertDecodeFailureRedacted(logged, "Failed to decode stats", secret)
+        } finally {
+            DashboardStatsManager.resetForTest()
+        }
     }
 }

@@ -107,23 +107,22 @@ object ResourceModeSettings {
      * where one unmodelled field emptied whole lists on installed builds.
      */
     internal fun decode(raw: String): ResourceModeSettingsData =
-        try {
+        runCatching {
             json.decodeFromString(serializer, raw)
-        } catch (e: SerializationException) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "Could not read resource-mode settings - using defaults",
-                decodeFailure(e),
-            )
-            ResourceModeSettingsData()
-        } catch (
-            @Suppress("TooGenericExceptionCaught") e: Exception,
-        ) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "Could not read resource-mode settings - using defaults",
-                error = e,
-            )
+        }.getOrElse { e ->
+            if (e is SerializationException) {
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "Could not read resource-mode settings - using defaults",
+                    decodeFailure(e),
+                )
+            } else {
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "Could not read resource-mode settings - using defaults",
+                    error = e,
+                )
+            }
             ResourceModeSettingsData()
         }
 
