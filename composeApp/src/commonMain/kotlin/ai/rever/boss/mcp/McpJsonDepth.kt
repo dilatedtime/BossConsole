@@ -9,7 +9,7 @@ package ai.rever.boss.mcp
  * Every parse of agent-supplied arguments on the invoke path checks [mcpJsonNestingExceeds] first:
  * the registry's shape gate (`invalidArguments`) and argument parse (`parseMcpToolArgs`), the risk
  * evaluator's shell scan (`shellPayloads`), the argument sanitizer (`parseArguments`), the secret
- * substitution pre-pass (`McpArgumentSubstitution`), and schema validation (`parseJsonObject`).
+ * substitution pre-pass (`parseElement`), and schema validation (`parseJsonObject`).
  * A payload that would overflow is rejected before the parser sees it, and the ledger row is still
  * written. One constant and one guard, so the six call sites cannot drift apart.
  *
