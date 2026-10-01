@@ -68,7 +68,6 @@ data class SystemPluginManifestEntry(
  *    next launch — the same "never swap under a live session" convention as
  *    the JAR updater.
  */
-@Suppress("TooManyFunctions")
 object SystemPluginManifestService {
     private val logger = BossLogger.forComponent("SystemPluginManifest")
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -245,21 +244,6 @@ object SystemPluginManifestService {
             merged.putIfAbsent(remote.pluginId, remote)
         }
         return merged.values.toList()
-    }
-
-    /** The higher of two optional semver floors (unparseable/null = no floor). */
-    private fun highestVersion(
-        a: String?,
-        b: String?,
-    ): String? {
-        val va = a?.let { Version.parse(it) }
-        val vb = b?.let { Version.parse(it) }
-        return when {
-            va == null -> b ?: a
-            vb == null -> a
-            va >= vb -> a
-            else -> b
-        }
     }
 
     /**
@@ -462,4 +446,19 @@ object SystemPluginManifestService {
 /** Suspend startup work until the client is ready, including an offline boot with late initialization. */
 internal suspend fun awaitSupabaseInitialized(initialized: StateFlow<Boolean> = SupabaseConfig.isInitialized) {
     initialized.first { it }
+}
+
+/** The higher of two optional semver floors (unparseable/null = no floor). */
+private fun highestVersion(
+    a: String?,
+    b: String?,
+): String? {
+    val va = a?.let { Version.parse(it) }
+    val vb = b?.let { Version.parse(it) }
+    return when {
+        va == null -> b ?: a
+        vb == null -> a
+        va >= vb -> a
+        else -> b
+    }
 }

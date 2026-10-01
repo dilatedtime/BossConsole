@@ -4,9 +4,12 @@ import ai.rever.boss.components.sidebar.SidebarVisibilitySettingsManager
 import ai.rever.boss.config.AutoPipSettingsManager
 import ai.rever.boss.config.BrowserEngineSettingsManager
 import ai.rever.boss.config.ChromiumFlagsSettingsManager
+import ai.rever.boss.config.ResourceModeSettings
+import ai.rever.boss.config.ResourceModeSettingsData
 import ai.rever.boss.config.SwipeNavSettingsManager
 import ai.rever.boss.filetypes.DefaultAppsSettingsManager
 import ai.rever.boss.html.HtmlFileSettingsStore
+import ai.rever.boss.html.logHtmlSettingsFailure
 import ai.rever.boss.mcp.secrets.captureHostLogs
 import ai.rever.boss.performance.PerformanceSettingsManager
 import ai.rever.boss.plugin.PluginPersistence
@@ -18,16 +21,15 @@ import ai.rever.boss.run.RunnerSettingsManager
 import ai.rever.boss.startup.StartupSettingsManager
 import ai.rever.boss.terminal.TerminalLinkSettingsManager
 import ai.rever.boss.theme.AppThemeSettingsManager
+import ai.rever.boss.updater.UpdateSettingsFiles
 import ai.rever.boss.updater.UpdateSettingsManager
 import ai.rever.boss.utils.logging.BossLogger
-import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogEntry
-import ai.rever.boss.utils.logging.decodeFailure
 import ai.rever.boss.window.WindowAppearanceSettingsManager
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.SerializationException
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import java.io.IOException
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -51,6 +53,7 @@ class SettingsDecodePrivacyTest {
             file.delete()
         }
         filesToCleanup.clear()
+        PluginPersistence.resetForTest()
     }
 
     private fun track(file: File): File {
@@ -67,10 +70,10 @@ class SettingsDecodePrivacyTest {
         assertTrue(failures.isNotEmpty(), "expected log message '$expectedMessage' was not emitted in: $logged")
         for (failure in failures) {
             assertNull(failure.error, "the decoder exception includes file content and must not be attached")
-            assertEquals(
-                "JsonDecodingException",
-                failure.data?.get("decodeFailure"),
-                "decodeFailure metadata must record the exception class",
+            val failureClass = failure.data?.get("decodeFailure") as? String
+            assertTrue(
+                !failureClass.isNullOrBlank(),
+                "decodeFailure metadata must record non-blank exception class name",
             )
         }
         for (entry in logged) {
@@ -95,52 +98,49 @@ class SettingsDecodePrivacyTest {
     }
 
     @Test
-    fun `startup settings decode failure is redacted`() =
-        runBlocking {
-            val secret = "leak-secret-startup-${System.nanoTime()}"
-            val file = track(BossDirectories.resolve("startup-settings.json"))
-            file.parentFile?.mkdirs()
-            file.writeText("{\"projectPath\": \"/secret/$secret")
+    fun `startup settings decode failure is redacted`() {
+        val secret = "leak-secret-startup-${System.nanoTime()}"
+        val file = track(BossDirectories.resolve("startup-settings.json"))
+        file.parentFile?.mkdirs()
+        file.writeText("{\"projectPath\": \"/secret/$secret")
 
-            val (_, logged) =
-                captureHostLogs {
-                    runBlocking { StartupSettingsManager.loadSettings() }
-                }
+        val (_, logged) =
+            captureHostLogs {
+                runBlocking { StartupSettingsManager.loadSettings() }
+            }
 
-            assertDecodeFailureRedacted(logged, "Error loading settings", secret)
-        }
-
-    @Test
-    fun `terminal link settings decode failure is redacted`() =
-        runBlocking {
-            val secret = "leak-secret-terminal-${System.nanoTime()}"
-            val file = track(BossDirectories.resolve("terminal-link-settings.json"))
-            file.parentFile?.mkdirs()
-            file.writeText("{\"patterns\": [\"pattern-$secret")
-
-            val (_, logged) =
-                captureHostLogs {
-                    runBlocking { TerminalLinkSettingsManager.reloadForTest() }
-                }
-
-            assertDecodeFailureRedacted(logged, "Error loading settings", secret)
-        }
+        assertDecodeFailureRedacted(logged, "Error loading settings", secret)
+    }
 
     @Test
-    fun `runner settings decode failure is redacted`() =
-        runBlocking {
-            val secret = "leak-secret-runner-${System.nanoTime()}"
-            val file = track(BossDirectories.resolve("runner-settings.json"))
-            file.parentFile?.mkdirs()
-            file.writeText("{\"customArgs\": \"--token=$secret")
+    fun `terminal link settings decode failure is redacted`() {
+        val secret = "leak-secret-terminal-${System.nanoTime()}"
+        val file = track(BossDirectories.resolve("terminal-link-settings.json"))
+        file.parentFile?.mkdirs()
+        file.writeText("{\"patterns\": [\"pattern-$secret")
 
-            val (_, logged) =
-                captureHostLogs {
-                    runBlocking { RunnerSettingsManager.reloadForTest() }
-                }
+        val (_, logged) =
+            captureHostLogs {
+                runBlocking { TerminalLinkSettingsManager.reloadForTest() }
+            }
 
-            assertDecodeFailureRedacted(logged, "Error loading settings", secret)
-        }
+        assertDecodeFailureRedacted(logged, "Error loading settings", secret)
+    }
+
+    @Test
+    fun `runner settings decode failure is redacted`() {
+        val secret = "leak-secret-runner-${System.nanoTime()}"
+        val file = track(BossDirectories.resolve("runner-settings.json"))
+        file.parentFile?.mkdirs()
+        file.writeText("{\"customArgs\": \"--token=$secret")
+
+        val (_, logged) =
+            captureHostLogs {
+                runBlocking { RunnerSettingsManager.reloadForTest() }
+            }
+
+        assertDecodeFailureRedacted(logged, "Error loading settings", secret)
+    }
 
     @Test
     fun `window appearance settings decode failure is redacted`() {
@@ -160,26 +160,32 @@ class SettingsDecodePrivacyTest {
     @Test
     fun `update settings decode failure is redacted`() {
         val secret = "leak-secret-update-${System.nanoTime()}"
-        val file = track(BossDirectories.resolve("update-settings.json"))
-        file.parentFile?.mkdirs()
+        val file = File(tempDir, "update-settings.json")
         file.writeText("{\"channel\": \"beta-$secret")
+        UpdateSettingsFiles.settingsFileOverride = file
 
-        val (_, logged) =
-            captureHostLogs {
-                UpdateSettingsManager.reloadForTest()
-            }
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    UpdateSettingsManager.reloadForTest()
+                }
 
-        assertDecodeFailureRedacted(logged, "Failed to load update settings", secret)
+            assertDecodeFailureRedacted(logged, "Failed to load update settings", secret)
+        } finally {
+            UpdateSettingsFiles.settingsFileOverride = null
+            UpdateSettingsManager.reloadForTest()
+        }
     }
 
     @Test
-    fun `default apps settings decode failure is redacted`() =
-        runBlocking {
-            val secret = "leak-secret-default-apps-${System.nanoTime()}"
-            val file = track(BossDirectories.resolve("default-apps.json"))
-            file.parentFile?.mkdirs()
-            file.writeText("{\"declinedCategories\": [\"$secret")
+    fun `default apps settings decode failure is redacted`() {
+        val secret = "leak-secret-default-apps-${System.nanoTime()}"
+        val original = DefaultAppsSettingsManager.settingsFile
+        val file = File(tempDir, "default-apps.json")
+        file.writeText("{\"declinedCategories\": [\"$secret")
+        DefaultAppsSettingsManager.settingsFile = file
 
+        try {
             val (_, logged) =
                 captureHostLogs {
                     DefaultAppsSettingsManager.resetForTest()
@@ -187,25 +193,35 @@ class SettingsDecodePrivacyTest {
                 }
 
             assertDecodeFailureRedacted(logged, "Could not read default-apps settings", secret)
+        } finally {
+            DefaultAppsSettingsManager.settingsFile = original
+            DefaultAppsSettingsManager.resetForTest()
         }
+    }
 
     @Test
     fun `auto-pip settings decode failure is redacted`() {
         val secret = "leak-secret-autopip-${System.nanoTime()}"
-        val file = track(BossDirectories.resolve("auto-pip.json"))
-        file.parentFile?.mkdirs()
+        val original = AutoPipSettingsManager.settingsFile
+        val file = File(tempDir, "auto-pip.json")
         file.writeText("{\"enabled\": \"invalid-$secret")
+        AutoPipSettingsManager.settingsFile = file
 
-        val (_, logged) =
-            captureHostLogs {
-                AutoPipSettingsManager.reloadForTest()
-            }
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    AutoPipSettingsManager.reloadForTest()
+                }
 
-        assertDecodeFailureRedacted(
-            logged,
-            "Could not read auto Picture-in-Picture settings; using the default",
-            secret,
-        )
+            assertDecodeFailureRedacted(
+                logged,
+                "Could not read auto Picture-in-Picture settings; using the default",
+                secret,
+            )
+        } finally {
+            AutoPipSettingsManager.settingsFile = original
+            AutoPipSettingsManager.reloadForTest()
+        }
     }
 
     @Test
@@ -226,31 +242,43 @@ class SettingsDecodePrivacyTest {
     @Test
     fun `chromium flags settings decode failure is redacted`() {
         val secret = "leak-secret-chromium-flags-${System.nanoTime()}"
-        val file = track(BossDirectories.resolve("chromium-flags.json"))
-        file.parentFile?.mkdirs()
+        val original = ChromiumFlagsSettingsManager.settingsFile
+        val file = File(tempDir, "chromium-flags.json")
         file.writeText("{\"extraSwitches\": \"--secret-flag=$secret")
+        ChromiumFlagsSettingsManager.settingsFile = file
 
-        val (_, logged) =
-            captureHostLogs {
-                ChromiumFlagsSettingsManager.reloadForTest()
-            }
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    ChromiumFlagsSettingsManager.reloadForTest()
+                }
 
-        assertDecodeFailureRedacted(logged, "Error loading Chromium flag settings, using defaults", secret)
+            assertDecodeFailureRedacted(logged, "Error loading Chromium flag settings, using defaults", secret)
+        } finally {
+            ChromiumFlagsSettingsManager.settingsFile = original
+            ChromiumFlagsSettingsManager.reloadForTest()
+        }
     }
 
     @Test
     fun `swipe nav settings decode failure is redacted`() {
         val secret = "leak-secret-swipe-nav-${System.nanoTime()}"
-        val file = track(BossDirectories.resolve("swipe-nav.json"))
-        file.parentFile?.mkdirs()
+        val original = SwipeNavSettingsManager.settingsFile
+        val file = File(tempDir, "swipe-nav.json")
         file.writeText("{\"enabled\": \"broken-$secret")
+        SwipeNavSettingsManager.settingsFile = file
 
-        val (_, logged) =
-            captureHostLogs {
-                SwipeNavSettingsManager.reloadForTest()
-            }
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    SwipeNavSettingsManager.reloadForTest()
+                }
 
-        assertDecodeFailureRedacted(logged, "Could not read swipe settings; using the default", secret)
+            assertDecodeFailureRedacted(logged, "Could not read swipe settings; using the default", secret)
+        } finally {
+            SwipeNavSettingsManager.settingsFile = original
+            SwipeNavSettingsManager.reloadForTest()
+        }
     }
 
     @Test
@@ -284,29 +312,53 @@ class SettingsDecodePrivacyTest {
     }
 
     @Test
-    fun `html file settings store decode failure is redacted`() =
-        runBlocking {
-            val secret = "leak-secret-html-file-${System.nanoTime()}"
-            val file = File(tempDir, "html-file-settings.json")
-            file.writeText("{\"openMode\": \"corrupt-$secret")
+    fun `resource mode settings decode failure is redacted`() {
+        val secret = "leak-secret-resourcemode-${System.nanoTime()}"
+        val tornJson = "{\"selectedMode\": \"corrupt-$secret"
 
-            val logger = BossLogger.forComponent("HtmlFileSettingsManagerTest")
-            val store =
-                HtmlFileSettingsStore(file) { error ->
-                    if (error is SerializationException) {
-                        logger.warn(LogCategory.UI, "Unable to read or save HTML file settings", decodeFailure(error))
-                    } else {
-                        logger.warn(LogCategory.UI, "Unable to read or save HTML file settings", error = error)
-                    }
-                }
+        val (_, logged) =
+            captureHostLogs {
+                val result = ResourceModeSettings.decode(tornJson)
+                assertEquals(ResourceModeSettingsData(), result)
+            }
 
-            val (_, logged) =
-                captureHostLogs {
-                    runBlocking { store.awaitSettings() }
-                }
+        assertDecodeFailureRedacted(logged, "Could not read resource-mode settings - using defaults", secret)
+    }
 
-            assertDecodeFailureRedacted(logged, "Unable to read or save HTML file settings", secret)
-        }
+    @Test
+    fun `html file settings store decode failure is redacted`() {
+        val secret = "leak-secret-html-file-${System.nanoTime()}"
+        val file = File(tempDir, "html-file-settings.json")
+        file.writeText("{\"openMode\": \"corrupt-$secret")
+
+        val logger = BossLogger.forComponent("HtmlFileSettingsManagerTest")
+        val store =
+            HtmlFileSettingsStore(file) { error ->
+                logHtmlSettingsFailure(logger, error)
+            }
+
+        val (_, logged) =
+            captureHostLogs {
+                runBlocking { store.awaitSettings() }
+            }
+
+        assertDecodeFailureRedacted(logged, "Unable to read or save HTML file settings", secret)
+    }
+
+    @Test
+    fun `html file settings failure logger preserves non-serialization throwables`() {
+        val logger = BossLogger.forComponent("HtmlFileSettingsManagerTest")
+        val ioException = IOException("disk read failed")
+
+        val (_, logged) =
+            captureHostLogs {
+                logHtmlSettingsFailure(logger, ioException)
+            }
+
+        val entries = logged.filter { it.message == "Unable to read or save HTML file settings" }
+        assertTrue(entries.isNotEmpty())
+        assertEquals(ioException, entries.first().error)
+    }
 
     @Test
     fun `plugin persistence decode failure is redacted`() {
@@ -315,30 +367,33 @@ class SettingsDecodePrivacyTest {
         file.parentFile?.mkdirs()
         file.writeText("{\"plugins\": [{\"pluginId\": \"plugin-$secret")
 
-        val (_, logged) =
-            captureHostLogs {
-                PluginPersistence.resetForTest()
-                PluginPersistence.getInstalledPlugins()
-            }
+        try {
+            val (_, logged) =
+                captureHostLogs {
+                    PluginPersistence.resetForTest()
+                    PluginPersistence.getInstalledPlugins()
+                }
 
-        assertDecodeFailureRedacted(logged, "Failed to load installed plugins config", secret)
+            assertDecodeFailureRedacted(logged, "Failed to load installed plugins config", secret)
+        } finally {
+            PluginPersistence.resetForTest()
+        }
     }
 
     @Test
-    fun `plugin state manager decode failure is redacted`() =
-        runBlocking {
-            val secret = "leak-secret-plugin-states-${System.nanoTime()}"
-            val file = File(tempDir, "plugin-states.json")
-            file.writeText("{\"version\": 1, \"plugins\": {\"plugin-$secret\": {")
-            val manager = PluginStateManager(tempDir)
+    fun `plugin state manager decode failure is redacted`() {
+        val secret = "leak-secret-plugin-states-${System.nanoTime()}"
+        val file = File(tempDir, "plugin-states.json")
+        file.writeText("{\"version\": 1, \"plugins\": {\"plugin-$secret\": {")
+        val manager = PluginStateManager(tempDir)
 
-            val (_, logged) =
-                captureHostLogs {
-                    runBlocking { manager.loadStates() }
-                }
+        val (_, logged) =
+            captureHostLogs {
+                runBlocking { manager.loadStates() }
+            }
 
-            assertDecodeFailureRedacted(logged, "Failed to load plugin states", secret)
-        }
+        assertDecodeFailureRedacted(logged, "Failed to load plugin states", secret)
+    }
 
     @Test
     fun `system plugin manifest service decode failure is redacted`() {

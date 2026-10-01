@@ -4,10 +4,12 @@ import ai.rever.boss.plugin.pathutils.BossDirectories
 import ai.rever.boss.utils.atomicWriteText
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
+import ai.rever.boss.utils.logging.decodeFailure
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import java.io.File
 
@@ -105,13 +107,22 @@ object ResourceModeSettings {
      * where one unmodelled field emptied whole lists on installed builds.
      */
     internal fun decode(raw: String): ResourceModeSettingsData =
-        runCatching {
+        try {
             json.decodeFromString(serializer, raw)
-        }.getOrElse { e ->
+        } catch (e: SerializationException) {
             logger.warn(
                 LogCategory.SYSTEM,
                 "Could not read resource-mode settings - using defaults",
-                mapOf("error" to (e.message ?: "unknown")),
+                decodeFailure(e),
+            )
+            ResourceModeSettingsData()
+        } catch (
+            @Suppress("TooGenericExceptionCaught") e: Exception,
+        ) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Could not read resource-mode settings - using defaults",
+                error = e,
             )
             ResourceModeSettingsData()
         }
