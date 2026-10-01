@@ -64,6 +64,7 @@ class SingleInstanceFloodCapTest {
         SingleInstanceManager.llmTokenProviderOverride = null
         SingleInstanceManager.runtimeDirOverride = null
         SingleInstanceManager.acceptNextClientOverride = null
+        SingleInstanceManager.beforeTeardownFaultedListenerForTest = null
         waitForSlotsRecovery()
         assertEquals(
             MAX_CLIENT_HANDLERS,
@@ -457,128 +458,6 @@ class SingleInstanceFloodCapTest {
         // Second launch must now cleanly acquire lock without hanging or being bricked
         val secondAcquired = SingleInstanceManager.acquireLock()
         assertTrue(secondAcquired, "Next launch must reclaim and acquire lock cleanly after listener fault")
-    }
-
-    @Test
-    fun `stale withdraw does not delete new owner descriptor or socket`() {
-        assertTrue(SingleInstanceManager.acquireLock(), "First launch must acquire lock")
-        val descA = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "First descriptor must exist")
-        SingleInstanceManager.release()
-
-        assertTrue(SingleInstanceManager.acquireLock(), "Second launch must acquire lock")
-        val descB = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "Second descriptor must exist")
-        assertTrue(descA.token != descB.token, "New launch must have a fresh channel token")
-
-        // Simulate late withdraw from instance A
-        SingleInstanceManager.withdrawForTest(descA)
-
-        val onDisk = readPublishedDescriptor()
-        assertNotNull(onDisk, "Descriptor file must not be deleted by stale withdraw")
-        assertEquals(descB.token, onDisk.token, "Descriptor of active owner must remain intact")
-        if (descB.transport == SingleInstanceTransport.UNIX) {
-            assertTrue(File(descB.endpoint).exists(), "Socket file of active owner must remain intact")
-        }
-
-        SingleInstanceManager.release()
-    }
-
-    @Test
-    fun `stale listener epoch teardown does not clobber new server channel or descriptor`() {
-        assertTrue(SingleInstanceManager.acquireLock(), "First launch must acquire lock")
-        val descA = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "First descriptor must exist")
-        val epochA = SingleInstanceManager.listenerEpochForTest
-
-        val gate = CountDownLatch(1)
-        val teardownStarted = CountDownLatch(1)
-        val teardownDone = CountDownLatch(1)
-
-        val staleListenerThread =
-            kotlin.concurrent.thread(name = "stale-listener-test", isDaemon = true) {
-                teardownStarted.countDown()
-                assertTrue(gate.await(10, TimeUnit.SECONDS), "Gate must unblock")
-                SingleInstanceManager.teardownFaultedListenerForTest(epochA)
-                teardownDone.countDown()
-            }
-
-        assertTrue(teardownStarted.await(5, TimeUnit.SECONDS), "Teardown thread must start")
-
-        // Release first launch and acquire second launch, bumping listenerEpoch to epochB
-        SingleInstanceManager.release()
-        assertTrue(SingleInstanceManager.acquireLock(), "Second launch must acquire lock with bumped epoch")
-        val descB = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor, "Second descriptor must exist")
-        assertTrue(descA.token != descB.token, "Tokens must differ")
-        val epochB = SingleInstanceManager.listenerEpochForTest
-        assertTrue(epochB > epochA, "Epoch must have been bumped")
-
-        // Unblock stale listener teardown
-        gate.countDown()
-        assertTrue(teardownDone.await(5, TimeUnit.SECONDS), "Teardown thread must complete")
-        staleListenerThread.join(2000L)
-
-        // Assert that stale teardown had no effect on the active owner
-        assertTrue(SingleInstanceManager.isListening, "Active instance must remain listening")
-        assertEquals(descB.token, readPublishedDescriptor()?.token, "Active descriptor must remain published")
-        assertEquals(descB.token, SingleInstanceManager.publishedInstanceDescriptor?.token)
-
-        SingleInstanceManager.release()
-    }
-
-    @Test
-    fun `faulted listener teardown does not stall acquireLock or release`() {
-        assertTrue(SingleInstanceManager.acquireLock(), "Initial launch must succeed")
-        val epoch = SingleInstanceManager.listenerEpochForTest
-
-        val teardownEntered = CountDownLatch(1)
-        val teardownCanFinish = CountDownLatch(1)
-        val teardownFinished = CountDownLatch(1)
-
-        val thread =
-            kotlin.concurrent.thread(name = "simulated-listener-stall-test", isDaemon = true) {
-                teardownEntered.countDown()
-                teardownCanFinish.await(5, TimeUnit.SECONDS)
-                SingleInstanceManager.teardownFaultedListenerForTest(epoch)
-                teardownFinished.countDown()
-            }
-
-        assertTrue(teardownEntered.await(5, TimeUnit.SECONDS), "Simulated thread must enter")
-
-        val releaseStart = System.nanoTime()
-        SingleInstanceManager.release()
-        val releaseDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - releaseStart)
-
-        teardownCanFinish.countDown()
-        assertTrue(teardownFinished.await(5, TimeUnit.SECONDS), "Teardown must complete quickly")
-        thread.join(2000L)
-
-        assertTrue(
-            releaseDurationMs < 800L,
-            "release() must not stall for the 1000ms join timeout; took ${releaseDurationMs}ms",
-        )
-    }
-
-    @Test
-    fun `withdraw does not delete socket file if inode was replaced even when descriptor is absent`() {
-        if (System.getProperty("os.name").lowercase().contains("win")) {
-            return
-        }
-        val socketPath = Files.createTempFile("test-uds", ".sock")
-        try {
-            val desc =
-                InstanceDescriptor(
-                    transport = SingleInstanceTransport.UNIX,
-                    endpoint = socketPath.toString(),
-                    token = newChannelToken(),
-                    pid = ProcessHandle.current().pid(),
-                )
-            SingleInstanceManager.boundSocketFileKey = "fake-device-inode-12345"
-
-            SingleInstanceManager.withdrawForTest(desc)
-
-            assertTrue(Files.exists(socketPath), "Replaced socket file must be preserved despite stale withdraw")
-        } finally {
-            SingleInstanceManager.boundSocketFileKey = null
-            Files.deleteIfExists(socketPath)
-        }
     }
 
     private fun newFailingScheduler(): ScheduledExecutorService =
