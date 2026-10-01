@@ -15,7 +15,9 @@ class McpJsonDepthTest {
 
     @Test
     fun `default limit parameter is MAX_MCP_ARGUMENT_DEPTH`() {
+        // Guard against test fixture drift:
         assertEquals(MAX_MCP_ARGUMENT_DEPTH, limit)
+        // Calling with the limit parameter omitted pins that the default parameter is MAX_MCP_ARGUMENT_DEPTH:
         val overLimit = "[".repeat(MAX_MCP_ARGUMENT_DEPTH + 1) + "]".repeat(MAX_MCP_ARGUMENT_DEPTH + 1)
         val atLimit = "[".repeat(MAX_MCP_ARGUMENT_DEPTH) + "]".repeat(MAX_MCP_ARGUMENT_DEPTH)
         assertTrue(mcpJsonNestingExceeds(overLimit))
