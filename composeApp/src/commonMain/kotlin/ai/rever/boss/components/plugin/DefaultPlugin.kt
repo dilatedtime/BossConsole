@@ -736,9 +736,11 @@ class DefaultPlugin(
     }
 
     // File system data provider for codebase plugin
-    override val fileSystemDataProvider: FileSystemDataProvider by lazy {
-        FileSystemDataProviderImpl()
-    }
+    private val fileSystemDataProviderDelegate =
+        lazy {
+            FileSystemDataProviderImpl()
+        }
+    override val fileSystemDataProvider: FileSystemDataProvider by fileSystemDataProviderDelegate
 
     // Workspace data provider for plugins that manage workspaces
     override val workspaceDataProvider: WorkspaceDataProvider? by lazy {
@@ -1358,6 +1360,9 @@ class DefaultPlugin(
                         }
                         if (splitViewOperationsDelegate.isInitialized()) {
                             (splitViewOperations as? DisposableProvider)?.dispose()
+                        }
+                        if (fileSystemDataProviderDelegate.isInitialized()) {
+                            (fileSystemDataProvider as? DisposableProvider)?.dispose()
                         }
                         pluginScope.cancel()
                     }

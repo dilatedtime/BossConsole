@@ -9,8 +9,12 @@ import ai.rever.boss.plugin.api.FileSystemDataProvider
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.revealInFileManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
@@ -24,11 +28,14 @@ import ai.rever.boss.components.plugin.panels.left_top.scanDirectoryWithDepth as
  * Implementation of FileSystemDataProvider that wraps platform-specific file operations.
  * This allows plugins to access file system without direct platform coupling.
  */
+@Suppress("TooManyFunctions")
 class FileSystemDataProviderImpl(
+    dispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val downloadsDirectory: () -> String = ::getDefaultDownloadsDirectory,
-) : FileSystemDataProvider {
+) : FileSystemDataProvider,
+    DisposableProvider {
     private val logger = BossLogger.forComponent("FileSystemDataProvider")
-    private val ioScope = CoroutineScope(Dispatchers.IO)
+    internal val ioScope = CoroutineScope(dispatcher + SupervisorJob())
 
     override suspend fun scanDirectory(path: String): FileNodeData? =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
@@ -85,7 +92,13 @@ class FileSystemDataProviderImpl(
         windowId: String,
     ) {
         ioScope.launch {
-            FileEventBus.openFile(path, sourceWindowId = windowId)
+            try {
+                FileEventBus.openFile(path, sourceWindowId = windowId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(LogCategory.FILE, "Failed to open file at path $path", error = e)
+            }
         }
     }
 
@@ -363,4 +376,8 @@ class FileSystemDataProviderImpl(
 
             existing?.toPath()?.toRealPath()?.resolve(existing.toPath().relativize(file.toPath()))
         }.getOrNull()
+
+    override fun dispose() {
+        ioScope.cancel()
+    }
 }
