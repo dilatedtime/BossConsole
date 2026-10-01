@@ -146,15 +146,26 @@ class MasteryServiceImpl(
                 .build()
 
     override suspend fun generateMastery(request: GenerateMasteryRequest): PMasteryDef {
-        // AI integration point: future — generate definition from task description + available capabilities
+        // AI integration point: future - generate definition from task description + available capabilities
         logger.info("GenerateMastery stub: task={}", request.taskDescription)
-        return KMasteryDef(
-            id = UUID.randomUUID().toString(),
-            name = "Generated: ${request.taskDescription.take(40)}",
-            description = request.taskDescription,
-            nodes = emptyList(),
-            edges = emptyList(),
-        ).toProto()
+        val id = UUID.randomUUID().toString()
+        val kotlinDef =
+            KMasteryDef(
+                id = id,
+                name = "Generated: ${request.taskDescription.take(40)}",
+                description = request.taskDescription,
+                nodes = emptyList(),
+                edges = emptyList(),
+            )
+        synchronized(stateLock) {
+            if (id !in definitions && definitions.size >= definitionLimit) {
+                throw Status.RESOURCE_EXHAUSTED
+                    .withDescription("Mastery definition limit reached")
+                    .asRuntimeException()
+            }
+            definitions[id] = kotlinDef
+        }
+        return kotlinDef.toProto()
     }
 
     override suspend fun listMasteries(request: ListMasteriesRequest): ListMasteriesResponse {

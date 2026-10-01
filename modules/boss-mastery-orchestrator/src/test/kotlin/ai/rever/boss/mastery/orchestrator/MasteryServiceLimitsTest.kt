@@ -1,6 +1,7 @@
 package ai.rever.boss.mastery.orchestrator
 
 import ai.rever.boss.ipc.proto.ExecuteMasteryRequest
+import ai.rever.boss.ipc.proto.GenerateMasteryRequest
 import ai.rever.boss.ipc.proto.MasteryDefinition
 import ai.rever.boss.ipc.proto.MasteryExecutionId
 import ai.rever.boss.ipc.proto.MasteryId
@@ -111,6 +112,39 @@ class MasteryServiceLimitsTest {
             assertEquals(Status.Code.RESOURCE_EXHAUSTED, failure.status.code)
             service.deleteMastery(MasteryId.newBuilder().setId("one").build())
             service.createMastery(definition("two"))
+        }
+
+    @Test
+    fun `generateMastery persists definition and executeMastery resolves it`() =
+        runTest {
+            val service = service()
+            val generated =
+                service.generateMastery(
+                    GenerateMasteryRequest.newBuilder().setTaskDescription("test pipeline").build(),
+                )
+            val events =
+                service
+                    .executeMastery(
+                        ExecuteMasteryRequest.newBuilder().setMasteryId(generated.id).build(),
+                    ).toList()
+            assertTrue(events.isNotEmpty())
+            assertTrue(events.last().hasCompleted())
+        }
+
+    @Test
+    fun `generateMastery obeys definitionLimit and throws RESOURCE_EXHAUSTED when full`() =
+        runTest {
+            val service = service(definitions = 1)
+            service.generateMastery(
+                GenerateMasteryRequest.newBuilder().setTaskDescription("first").build(),
+            )
+            val failure =
+                assertFailsWith<StatusRuntimeException> {
+                    service.generateMastery(
+                        GenerateMasteryRequest.newBuilder().setTaskDescription("second").build(),
+                    )
+                }
+            assertEquals(Status.Code.RESOURCE_EXHAUSTED, failure.status.code)
         }
 
     @Test
