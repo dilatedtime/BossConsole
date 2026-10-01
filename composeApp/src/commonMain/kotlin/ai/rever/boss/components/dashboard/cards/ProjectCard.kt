@@ -172,9 +172,12 @@ internal fun formatRelativeTime(
     now: Long = System.currentTimeMillis(),
     zone: ZoneId = ZoneId.systemDefault(),
 ): String {
+    if (timestamp == 0L) return "Never"
+
     val diff = now - timestamp
     val elapsedLabel =
         when {
+            diff < 0 -> null
             diff < 60_000 -> "Just now"
             diff < 3600_000 -> "${diff / 60_000}m ago"
             diff < 86400_000 -> "${diff / 3600_000}h ago"
@@ -217,7 +220,6 @@ internal fun formatRelativeTime(
         }
 
     return when {
-        timestamp == 0L -> "Never"
         elapsedLabel != null -> elapsedLabel
         else -> calendarLabel
     }

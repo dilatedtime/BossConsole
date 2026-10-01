@@ -85,6 +85,22 @@ class ProjectCardYesterdayTest {
     }
 
     @Test
+    fun `future or clock-skewed timestamp does not display Just now and formats honest calendar date`() {
+        val today = LocalDate.of(2026, 9, 19)
+        val now = at(today, 12, 0)
+        val future = now + 60_000
+
+        val label = formatRelativeTime(future, now, zone)
+
+        assertEquals("Sep 19", label)
+    }
+
+    @Test
+    fun `timestamp of zero returns Never even when now is near epoch`() {
+        assertEquals("Never", formatRelativeTime(0L, now = 30_000L, zone = zone))
+    }
+
+    @Test
     fun `a far-east zone formats the fallback label in that zone's calendar day`() {
         // Pacific/Kiritimati sits at UTC+14, east of the +06:30 edge where the fallback-label
         // bug used to show a date one day off: with a host default of UTC the SimpleDateFormat
