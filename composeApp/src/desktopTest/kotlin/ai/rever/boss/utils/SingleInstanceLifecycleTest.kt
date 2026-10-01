@@ -5,8 +5,10 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
+import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
+import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketAddress
@@ -25,6 +27,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -93,23 +96,10 @@ class SingleInstanceLifecycleTest {
             )
             assertFalse(SingleInstanceManager.isInstanceOwner, "Must not be owner after publication failure")
             assertNull(SingleInstanceFiles.read(), "Descriptor must be absent after cleanup")
-            val socketKey =
-                try {
-                    val attrs =
-                        Files.readAttributes(
-                            SingleInstanceFiles.socketFile.toPath(),
-                            BasicFileAttributes::class.java,
-                        )
-                    attrs.fileKey()
-                } catch (_: Exception) {
-                    null
-                }
-            if (socketKey != null) {
-                assertFalse(
-                    SingleInstanceFiles.socketFile.exists(),
-                    "Socket file must be unlinked after publication failure cleanup",
-                )
-            }
+            assertFalse(
+                SingleInstanceFiles.socketFile.exists(),
+                "Socket file must be unlinked after publication failure cleanup",
+            )
         } finally {
             Files.deleteIfExists(blockerFile.toPath())
             Files.deleteIfExists(blockerDir.toPath())
@@ -151,7 +141,9 @@ class SingleInstanceLifecycleTest {
         assertTrue(epochB > epochA, "Epoch must have been bumped")
 
         allowTeardownProceed.countDown()
-        staleListenerThread.get()?.join(2000L)
+        val stale = assertNotNull(staleListenerThread.get(), "Stale listener thread must be captured")
+        stale.join(5000L)
+        assertFalse(stale.isAlive, "Stale listener thread must have terminated")
 
         assertTrue(SingleInstanceManager.isListening, "Active instance must remain listening")
         assertEquals(descB.token, readPublishedDescriptor()?.token, "Active descriptor must remain published")
@@ -178,18 +170,26 @@ class SingleInstanceLifecycleTest {
 
         assertTrue(teardownBlocked.await(5, TimeUnit.SECONDS), "Real listener thread must enter fault path")
 
-        kotlin.concurrent.thread(isDaemon = true) {
-            Thread.sleep(50L)
-            teardownProceed.countDown()
-        }
-        val releaseStart = System.nanoTime()
-        SingleInstanceManager.release()
-        val releaseDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - releaseStart)
+        val releaseThread =
+            kotlin.concurrent.thread(name = "test-release-thread", isDaemon = true) {
+                SingleInstanceManager.release()
+            }
 
-        assertTrue(
-            releaseDurationMs < 800L,
-            "release() must not stall for the 1000ms join timeout; took ${releaseDurationMs}ms",
-        )
+        val deadline = System.currentTimeMillis() + 5000L
+        var reachedJoin = false
+        while (System.currentTimeMillis() < deadline && !reachedJoin) {
+            val trace = releaseThread.stackTrace
+            if (trace.any { it.className == "java.lang.Thread" && it.methodName == "join" }) {
+                reachedJoin = true
+                break
+            }
+            Thread.sleep(10L)
+        }
+        assertTrue(reachedJoin, "release() thread must reach Thread.join waiting for old listener")
+        teardownProceed.countDown()
+
+        releaseThread.join(2000L)
+        assertFalse(releaseThread.isAlive, "release() thread must complete promptly once teardown proceeds")
     }
 
     @Test
@@ -294,33 +294,36 @@ class SingleInstanceLifecycleTest {
     }
 
     private fun verifyRealUnixSocketReplacementIfSupported(runDir: File) {
-        val realSocketPath = File(runDir, "real-replacement.sock").toPath()
+        val realSocketPath1 = File(runDir, "real-replacement-1.sock").toPath()
+        val realSocketPath2 = File(runDir, "real-replacement-2.sock").toPath()
         try {
             val server1 = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
-            server1.bind(UnixDomainSocketAddress.of(realSocketPath))
-            val key1 = Files.readAttributes(realSocketPath, BasicFileAttributes::class.java).fileKey()
-            server1.close()
-            Files.deleteIfExists(realSocketPath)
+            server1.bind(UnixDomainSocketAddress.of(realSocketPath1))
+            val key1 = Files.readAttributes(realSocketPath1, BasicFileAttributes::class.java).fileKey()
 
             val server2 = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
-            server2.bind(UnixDomainSocketAddress.of(realSocketPath))
-            val key2 = Files.readAttributes(realSocketPath, BasicFileAttributes::class.java).fileKey()
+            server2.bind(UnixDomainSocketAddress.of(realSocketPath2))
+            val key2 = Files.readAttributes(realSocketPath2, BasicFileAttributes::class.java).fileKey()
+
             try {
-                if (key1 != null && key2 != null && key1 != key2) {
+                if (key1 != null && key2 != null) {
+                    assertNotEquals(key1, key2, "Two distinct bound sockets must have distinct file keys")
                     val staleDesc =
                         InstanceDescriptor(
                             transport = SingleInstanceTransport.UNIX,
-                            endpoint = realSocketPath.toString(),
+                            endpoint = realSocketPath2.toString(),
                             token = newChannelToken(),
                             pid = ProcessHandle.current().pid(),
                             socketFileKey = key1,
                         )
                     SingleInstanceManager.withdrawForTest(staleDesc)
-                    assertTrue(Files.exists(realSocketPath), "Live socket with key2 must survive withdraw of key1")
+                    assertTrue(Files.exists(realSocketPath2), "Live socket with key2 must survive withdraw of key1")
                 }
             } finally {
+                server1.close()
                 server2.close()
-                Files.deleteIfExists(realSocketPath)
+                Files.deleteIfExists(realSocketPath1)
+                Files.deleteIfExists(realSocketPath2)
             }
         } catch (_: UnsupportedOperationException) {
             // Unix domain sockets not supported on this platform/kernel
@@ -359,6 +362,72 @@ class SingleInstanceLifecycleTest {
         }
     }
 
+    @Test
+    fun `forked process holding OS lock causes withdraw to time out and preserve files`() {
+        SingleInstanceFiles.prepare()
+        val desc =
+            InstanceDescriptor(
+                transport = SingleInstanceTransport.TCP,
+                endpoint = "127.0.0.1:9999",
+                token = newChannelToken(),
+                pid = ProcessHandle.current().pid(),
+            )
+        SingleInstanceFiles.write(desc)
+        assertTrue(Files.exists(descriptorPath()), "Descriptor must exist before test")
+
+        val javaCmd =
+            ProcessHandle.current().info().command().orElseGet {
+                System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
+            }
+        val classPath = System.getProperty("java.class.path")
+        val lockFile = SingleInstanceFiles.lifecycleLockFile
+
+        val argFile = File.createTempFile("forked-lock-args", ".txt")
+        val escapedCp = classPath.replace("\\", "\\\\").replace("\"", "\\\"")
+        argFile.writeText("-cp\n\"$escapedCp\"\n")
+
+        val process =
+            try {
+                ProcessBuilder(
+                    javaCmd,
+                    "@" + argFile.absolutePath,
+                    "ai.rever.boss.utils.ForkedLockHolder",
+                    lockFile.absolutePath,
+                    "4000",
+                ).redirectErrorStream(true).start()
+            } finally {
+                argFile.deleteOnExit()
+            }
+
+        try {
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val line = reader.readLine()
+            assertEquals("LOCKED", line, "Forked process must acquire lock and output LOCKED")
+
+            // Child holds the OS FileLock in a separate OS process.
+            // Withdraw from parent must time out (fail closed) and preserve the published descriptor.
+            val withdrawStart = System.nanoTime()
+            SingleInstanceManager.withdrawForTest(desc)
+            val withdrawDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - withdrawStart)
+
+            assertTrue(
+                withdrawDurationMs >= 1800L,
+                "withdraw must wait for lock deadline before timing out; took ${withdrawDurationMs}ms",
+            )
+            val onDisk = readPublishedDescriptor()
+            assertNotNull(onDisk, "Descriptor must be preserved when withdraw times out")
+            assertEquals(desc.token, onDisk.token, "Published token must remain intact")
+        } finally {
+            process.destroyForcibly()
+            process.waitFor(5, TimeUnit.SECONDS)
+            argFile.delete()
+        }
+
+        // Subsequent reclaim after lock release succeeds cleanly:
+        SingleInstanceManager.withdrawForTest(desc)
+        assertNull(readPublishedDescriptor(), "Descriptor must be removed once lock is available")
+    }
+
     private fun toSocketAddress(descriptor: InstanceDescriptor): SocketAddress =
         when (descriptor.transport) {
             SingleInstanceTransport.UNIX -> {
@@ -379,6 +448,43 @@ class SingleInstanceLifecycleTest {
             parseInstanceDescriptor(Files.readString(path))
         } else {
             null
+        }
+    }
+}
+
+object ForkedLockHolder {
+    @JvmStatic
+    fun main(args: Array<String>) {
+        if (args.isEmpty()) return
+        val lockFile = File(args[0])
+        val durationMs = args.getOrNull(1)?.toLongOrNull() ?: 3000L
+        lockFile.parentFile?.mkdirs()
+        val channel =
+            FileChannel.open(
+                lockFile.toPath(),
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE,
+            )
+        val lock = channel.tryLock()
+        if (lock != null) {
+            println("LOCKED")
+            System.out.flush()
+            try {
+                Thread.sleep(durationMs)
+            } catch (_: InterruptedException) {
+            }
+            try {
+                lock.release()
+            } catch (_: IOException) {
+            }
+        } else {
+            println("FAILED")
+            System.out.flush()
+        }
+        try {
+            channel.close()
+        } catch (_: IOException) {
         }
     }
 }

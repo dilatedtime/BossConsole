@@ -49,6 +49,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
@@ -608,8 +609,8 @@ internal object SingleInstanceFiles {
      *
      * The OS lock is acquired using [FileChannel.tryLock] with a bounded deadline ([timeoutMs]).
      * If the deadline is exceeded and [onTimeout] is supplied, [onTimeout] is returned.
-     * Otherwise, a warning is logged and [block] runs as a best-effort fallback to prevent
-     * wedging shutdown when an external process holds a stale lock.
+     * Otherwise, a [TimeoutException] is thrown to fail closed, ensuring destructive actions
+     * are never executed unlocked.
      */
     fun <T> withCrossProcessLock(
         timeoutMs: Long = CROSS_PROCESS_LOCK_TIMEOUT_MS,
@@ -632,8 +633,11 @@ internal object SingleInstanceFiles {
         onTimeout: (() -> T)?,
         block: () -> T,
     ): T {
-        prepare()
         val path = lifecycleLockFile.toPath()
+        val parent = lifecycleLockFile.parentFile
+        if (parent != null && !parent.exists()) {
+            parent.mkdirs()
+        }
         val channel =
             FileChannel.open(
                 path,
@@ -649,20 +653,21 @@ internal object SingleInstanceFiles {
                 LogCategory.SYSTEM,
                 "Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms",
             )
+            try {
+                channel.close()
+            } catch (_: IOException) {
+            }
             if (onTimeout != null) {
-                try {
-                    channel.close()
-                } catch (_: IOException) {
-                }
                 return onTimeout()
             }
+            throw TimeoutException("Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms")
         }
 
         return try {
             block()
         } finally {
             try {
-                lock?.release()
+                lock.release()
             } catch (_: IOException) {
             }
             try {
@@ -678,21 +683,28 @@ internal object SingleInstanceFiles {
     ): FileLock? {
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         var acquiredLock: FileLock? = null
-        while (acquiredLock == null && System.nanoTime() < deadlineNanos) {
+        var shouldStop = false
+        while (acquiredLock == null && !shouldStop && System.nanoTime() < deadlineNanos) {
             acquiredLock =
                 try {
                     channel.tryLock()
                 } catch (_: OverlappingFileLockException) {
                     null
-                } catch (_: IOException) {
+                } catch (e: IOException) {
+                    logger.warn(
+                        LogCategory.SYSTEM,
+                        "OS file locking failed with IOException on single-instance lock file",
+                        error = e,
+                    )
+                    shouldStop = true
                     null
                 }
-            if (acquiredLock == null) {
+            if (acquiredLock == null && !shouldStop) {
                 try {
                     Thread.sleep(LOCK_POLL_INTERVAL_MS)
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
-                    return null
+                    shouldStop = true
                 }
             }
         }
@@ -751,6 +763,10 @@ internal object SingleInstanceFiles {
     /** Publishes [descriptor] owner-only, replacing whatever was there atomically. */
     fun write(descriptor: InstanceDescriptor): Boolean {
         val path = descriptorFile.toPath()
+        val parent = descriptorFile.parentFile
+        if (parent != null && !parent.exists()) {
+            parent.mkdirs()
+        }
         val tempPath = File(runtimeDir, "$DESCRIPTOR_FILE_NAME.tmp").toPath()
         val bytes = descriptor.encode().toByteArray(StandardCharsets.UTF_8)
         return try {
@@ -812,7 +828,14 @@ internal object SingleInstanceFiles {
      */
     fun withdraw(descriptor: InstanceDescriptor?) {
         if (descriptor == null) return
-        withCrossProcessLock {
+        withCrossProcessLock(
+            onTimeout = {
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "Timed out waiting for cross-process lock during withdrawal; preserving shared files",
+                )
+            },
+        ) {
             withdrawLocked(descriptor)
         }
     }
@@ -945,14 +968,27 @@ internal object SingleInstanceWire {
                 } catch (_: Exception) {
                     null
                 }
-            channel to
-                InstanceDescriptor(
-                    transport = SingleInstanceTransport.UNIX,
-                    endpoint = path.toString(),
-                    token = token,
-                    pid = ProcessHandle.current().pid(),
-                    socketFileKey = socketFileKey,
+            if (socketFileKey == null) {
+                logger.debug(
+                    LogCategory.SYSTEM,
+                    "Unix-domain socket file key unavailable; using loopback TCP for verifiable ownership",
                 )
+                try {
+                    channel.close()
+                } catch (_: IOException) {
+                }
+                Files.deleteIfExists(path)
+                null
+            } else {
+                channel to
+                    InstanceDescriptor(
+                        transport = SingleInstanceTransport.UNIX,
+                        endpoint = path.toString(),
+                        token = token,
+                        pid = ProcessHandle.current().pid(),
+                        socketFileKey = socketFileKey,
+                    )
+            }
         } catch (e: UnsupportedOperationException) {
             logger.debug(
                 LogCategory.SYSTEM,
