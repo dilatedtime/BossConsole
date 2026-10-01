@@ -27,6 +27,8 @@ import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
@@ -126,6 +128,8 @@ private const val IPC_PORT_RANGE = 10 // Try ports 56789-56798
 private const val TCP_BACKLOG = 5
 
 private const val CONNECTION_TIMEOUT_MS = 10000L // 10 seconds - important for auth deep links
+private const val CROSS_PROCESS_LOCK_TIMEOUT_MS = 2000L
+private const val LOCK_POLL_INTERVAL_MS = 25L
 private const val LLM_TOKEN_TIMEOUT_MS = 90000L
 private const val MCP_INVOKE_TIMEOUT_MS = 60000L
 
@@ -593,43 +597,106 @@ internal object SingleInstanceFiles {
      * socket unlinked by a concurrent stale withdraw, and that publication never exposes
      * a half-written or momentarily absent descriptor.
      *
+     * Lock acquisition hierarchy: [lifecycleLock] -> [crossProcessJvmLock] -> [FileLock].
+     * Callers entering via [SingleInstanceManager] hold [lifecycleLock] before entering here.
+     * Direct callers (e.g. withdrawForTest or test fixtures) acquire [crossProcessJvmLock]
+     * and the file lock without [lifecycleLock].
+     *
      * Re-entrant on the current thread: nested invocations reuse the acquired file lock
-     * instead of throwing [java.nio.channels.OverlappingFileLockException].
-     * Synchronized within the JVM via [crossProcessJvmLock] before acquiring the OS file lock.
+     * instead of throwing [OverlappingFileLockException]. Synchronized within the JVM
+     * via [crossProcessJvmLock] before acquiring the OS file lock.
+     *
+     * The OS lock is acquired using [FileChannel.tryLock] with a bounded deadline ([timeoutMs]).
+     * If the deadline is exceeded and [onTimeout] is supplied, [onTimeout] is returned.
+     * Otherwise, a warning is logged and [block] runs as a best-effort fallback to prevent
+     * wedging shutdown when an external process holds a stale lock.
      */
-    fun <T> withCrossProcessLock(block: () -> T): T {
+    fun <T> withCrossProcessLock(
+        timeoutMs: Long = CROSS_PROCESS_LOCK_TIMEOUT_MS,
+        onTimeout: (() -> T)? = null,
+        block: () -> T,
+    ): T {
         crossProcessJvmLock.lock()
         try {
             if (crossProcessJvmLock.holdCount > 1) {
                 return block()
             }
+            return acquireOsLockAndExecute(timeoutMs, onTimeout, block)
+        } finally {
+            crossProcessJvmLock.unlock()
+        }
+    }
 
-            prepare()
-            val path = lifecycleLockFile.toPath()
-            val channel =
-                FileChannel.open(
-                    path,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE,
-                )
-            restrictToOwner(path, ownerOnlyFilePermissions)
-            val lock = channel.lock()
-            return try {
-                block()
-            } finally {
-                try {
-                    lock.release()
-                } catch (_: IOException) {
-                }
+    private fun <T> acquireOsLockAndExecute(
+        timeoutMs: Long,
+        onTimeout: (() -> T)?,
+        block: () -> T,
+    ): T {
+        prepare()
+        val path = lifecycleLockFile.toPath()
+        val channel =
+            FileChannel.open(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE,
+            )
+        restrictToOwner(path, ownerOnlyFilePermissions)
+
+        val lock = tryAcquireFileLock(channel, timeoutMs)
+        if (lock == null) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms",
+            )
+            if (onTimeout != null) {
                 try {
                     channel.close()
                 } catch (_: IOException) {
                 }
+                return onTimeout()
             }
-        } finally {
-            crossProcessJvmLock.unlock()
         }
+
+        return try {
+            block()
+        } finally {
+            try {
+                lock?.release()
+            } catch (_: IOException) {
+            }
+            try {
+                channel.close()
+            } catch (_: IOException) {
+            }
+        }
+    }
+
+    private fun tryAcquireFileLock(
+        channel: FileChannel,
+        timeoutMs: Long,
+    ): FileLock? {
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        var acquiredLock: FileLock? = null
+        while (acquiredLock == null && System.nanoTime() < deadlineNanos) {
+            acquiredLock =
+                try {
+                    channel.tryLock()
+                } catch (_: OverlappingFileLockException) {
+                    null
+                } catch (_: IOException) {
+                    null
+                }
+            if (acquiredLock == null) {
+                try {
+                    Thread.sleep(LOCK_POLL_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return null
+                }
+            }
+        }
+        return acquiredLock
     }
 
     /**
@@ -773,6 +840,12 @@ internal object SingleInstanceFiles {
         }
     }
 
+    /**
+     * Unlinks the Unix domain socket if the on-disk file key matches the bound key.
+     * Note on inode reuse: unlinking and rebinding a socket at the same path may land
+     * on the same device/inode if freed. The cross-process lock is the primary serialization;
+     * this inode identity check provides defence-in-depth rather than an absolute guarantee.
+     */
     private fun withdrawUnixSocket(descriptor: InstanceDescriptor) {
         val socketPath = File(descriptor.endpoint).toPath()
         if (!Files.exists(socketPath)) return
@@ -1566,10 +1639,6 @@ object SingleInstanceManager {
     @Volatile
     private var published: InstanceDescriptor? = null
 
-    /** Recorded fileKey (device/inode) of the active ownership generation ([published]), if available. */
-    internal val boundSocketFileKey: Any?
-        get() = published?.socketFileKey
-
     /** Test seam to intercept right before [teardownFaultedListener] is called in the accept loop. */
     internal var beforeTeardownFaultedListenerForTest: ((Long) -> Unit)? = null
 
@@ -1623,18 +1692,36 @@ object SingleInstanceManager {
      * Returns true if we are the one, false if another instance is answering on
      * the channel. On success the channel is listening and the descriptor is
      * published.
+     *
+     * Note: Not safe to call twice on a running, healthy instance. Re-invoking [acquireLock]
+     * while an instance is already listening will tear down and withdraw the existing
+     * instance if publication fails.
      */
     fun acquireLock(): Boolean {
         joinPreviousListener()
 
+        val preLock = SingleInstanceFiles.read()
+        if (preLock != null && !shouldReclaimExisting(preLock)) {
+            return false
+        }
+
         var listenerToJoinOnFailure: Thread? = null
         val acquired =
             synchronized(lifecycleLock) {
-                SingleInstanceFiles.withCrossProcessLock {
+                SingleInstanceFiles.withCrossProcessLock(
+                    onTimeout = {
+                        logger.warn(LogCategory.SYSTEM, "Timed out waiting for lock in acquireLock")
+                        false
+                    },
+                ) {
                     SingleInstanceFiles.prepare()
 
-                    val existing = SingleInstanceFiles.read()
-                    if (existing != null && !shouldReclaimExisting(existing)) {
+                    val underLock = SingleInstanceFiles.read()
+                    if (underLock?.token != preLock?.token) {
+                        logger.info(
+                            LogCategory.SYSTEM,
+                            "Single-instance descriptor changed during lock acquisition; aborting startup",
+                        )
                         return@withCrossProcessLock false
                     }
 
@@ -1659,7 +1746,9 @@ object SingleInstanceManager {
      * cleanly without stalling (#1326).
      */
     private fun joinPreviousListener() {
-        joinListenerThread(listenerThread)
+        if (!isListening) {
+            joinListenerThread(listenerThread)
+        }
     }
 
     private fun joinListenerThread(thread: Thread?) {
@@ -1774,8 +1863,8 @@ object SingleInstanceManager {
                     "Failed to publish the single-instance descriptor"
                 },
             )
-            val threadToJoin = cleanupFailedStartLocked(bound?.second)
-            StartServerResult(success = false, threadToJoin = threadToJoin ?: previousListener)
+            cleanupFailedStartLocked(bound?.second)
+            StartServerResult(success = false, threadToJoin = previousListener)
         } else {
             published = descriptor
             logger.info(
@@ -1794,12 +1883,25 @@ object SingleInstanceManager {
      * Must be called while holding [lifecycleLock] and [SingleInstanceFiles.withCrossProcessLock].
      * Never re-acquires the file lock and defers joining [listenerThread] until caller exits monitors.
      */
-    private fun cleanupFailedStartLocked(boundDescriptor: InstanceDescriptor?): Thread? {
+    private fun cleanupFailedStartLocked(boundDescriptor: InstanceDescriptor?) {
         isListening = false
         val descriptorToWithdraw = boundDescriptor ?: published
         published = null
-        SingleInstanceFiles.withdrawLocked(descriptorToWithdraw)
 
+        resetSeamsAndCounters()
+
+        try {
+            serverChannel?.close()
+        } catch (e: IOException) {
+            logger.warn(LogCategory.SYSTEM, "Error closing server channel on startup failure", error = e)
+        }
+        serverChannel = null
+        listenerThread = null
+
+        SingleInstanceFiles.withdrawLocked(descriptorToWithdraw)
+    }
+
+    private fun resetSeamsAndCounters() {
         acceptNextClientOverride = null
         llmTokenProviderOverride = null
         statusProviderOverride = null
@@ -1811,17 +1913,6 @@ object SingleInstanceManager {
         beforeTeardownFaultedListenerForTest = null
         droppedConnectionsCount.set(0)
         lastDroppedWarningLogNanos.set(Long.MIN_VALUE)
-
-        try {
-            serverChannel?.close()
-        } catch (e: IOException) {
-            logger.warn(LogCategory.SYSTEM, "Error closing server channel on startup failure", error = e)
-        }
-        serverChannel = null
-
-        val threadToJoin = listenerThread
-        listenerThread = null
-        return threadToJoin
     }
 
     @Suppress("TooGenericExceptionCaught")
@@ -2507,17 +2598,7 @@ object SingleInstanceManager {
             published = null
             SingleInstanceFiles.withdraw(descriptor)
 
-            acceptNextClientOverride = null
-            llmTokenProviderOverride = null
-            statusProviderOverride = null
-            mcpListProviderOverride = null
-            mcpInvokeHandlerOverride = null
-            pluginReloadHandlerOverride = null
-            watchdogSchedulerOverride = null
-            connectionBudgetMsOverride = null
-            beforeTeardownFaultedListenerForTest = null
-            droppedConnectionsCount.set(0)
-            lastDroppedWarningLogNanos.set(Long.MIN_VALUE)
+            resetSeamsAndCounters()
 
             try {
                 serverChannel?.close()

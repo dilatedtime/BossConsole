@@ -3,21 +3,30 @@ package ai.rever.boss.utils
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketAddress
+import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
+import java.nio.channels.FileChannel
+import java.nio.channels.OverlappingFileLockException
+import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SingleInstanceLifecycleTest {
@@ -74,9 +83,33 @@ class SingleInstanceLifecycleTest {
         Files.deleteIfExists(descriptorPath())
 
         try {
+            val acquireStart = System.nanoTime()
             val reacquired = SingleInstanceManager.acquireLock()
+            val acquireDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - acquireStart)
             assertFalse(reacquired, "Re-acquire must fail cleanly when publication fails")
+            assertTrue(
+                acquireDurationMs < 800L,
+                "Failing acquireLock must not stall joining listener; took ${acquireDurationMs}ms",
+            )
             assertFalse(SingleInstanceManager.isInstanceOwner, "Must not be owner after publication failure")
+            assertNull(SingleInstanceFiles.read(), "Descriptor must be absent after cleanup")
+            val socketKey =
+                try {
+                    val attrs =
+                        Files.readAttributes(
+                            SingleInstanceFiles.socketFile.toPath(),
+                            BasicFileAttributes::class.java,
+                        )
+                    attrs.fileKey()
+                } catch (_: Exception) {
+                    null
+                }
+            if (socketKey != null) {
+                assertFalse(
+                    SingleInstanceFiles.socketFile.exists(),
+                    "Socket file must be unlinked after publication failure cleanup",
+                )
+            }
         } finally {
             Files.deleteIfExists(blockerFile.toPath())
             Files.deleteIfExists(blockerDir.toPath())
@@ -95,9 +128,11 @@ class SingleInstanceLifecycleTest {
 
         val acceptFaultPaused = CountDownLatch(1)
         val allowTeardownProceed = CountDownLatch(1)
+        val staleListenerThread = AtomicReference<Thread>()
 
         SingleInstanceManager.beforeTeardownFaultedListenerForTest = { epoch ->
             if (epoch == epochA) {
+                staleListenerThread.set(Thread.currentThread())
                 acceptFaultPaused.countDown()
                 allowTeardownProceed.await(5, TimeUnit.SECONDS)
             }
@@ -116,7 +151,7 @@ class SingleInstanceLifecycleTest {
         assertTrue(epochB > epochA, "Epoch must have been bumped")
 
         allowTeardownProceed.countDown()
-        Thread.sleep(100)
+        staleListenerThread.get()?.join(2000L)
 
         assertTrue(SingleInstanceManager.isListening, "Active instance must remain listening")
         assertEquals(descB.token, readPublishedDescriptor()?.token, "Active descriptor must remain published")
@@ -143,7 +178,10 @@ class SingleInstanceLifecycleTest {
 
         assertTrue(teardownBlocked.await(5, TimeUnit.SECONDS), "Real listener thread must enter fault path")
 
-        teardownProceed.countDown()
+        kotlin.concurrent.thread(isDaemon = true) {
+            Thread.sleep(50L)
+            teardownProceed.countDown()
+        }
         val releaseStart = System.nanoTime()
         SingleInstanceManager.release()
         val releaseDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - releaseStart)
@@ -155,7 +193,7 @@ class SingleInstanceLifecycleTest {
     }
 
     @Test
-    fun `two-process publication versus withdraw serializes cross-process locks`() {
+    fun `concurrent caller serializes cross-process lock and holds real file lock`() {
         val lockHeldLatch = CountDownLatch(1)
         val lockCanReleaseLatch = CountDownLatch(1)
         val lockAcquiredByThread2 = CountDownLatch(1)
@@ -168,24 +206,45 @@ class SingleInstanceLifecycleTest {
                 }
             }
 
-        assertTrue(lockHeldLatch.await(5, TimeUnit.SECONDS), "Thread 1 must acquire cross-process lock")
+        try {
+            assertTrue(lockHeldLatch.await(5, TimeUnit.SECONDS), "Thread 1 must acquire cross-process lock")
 
-        val lockWaiterThread =
-            kotlin.concurrent.thread(name = "test-proc2-lock", isDaemon = true) {
-                SingleInstanceFiles.withCrossProcessLock {
-                    lockAcquiredByThread2.countDown()
+            // Discriminating proof that a real OS FileLock is held: another channel in the same JVM
+            // attempting to lock the region throws OverlappingFileLockException.
+            val probeChannel =
+                FileChannel.open(
+                    SingleInstanceFiles.lifecycleLockFile.toPath(),
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE,
+                )
+            try {
+                assertThrows<OverlappingFileLockException> {
+                    probeChannel.tryLock()
                 }
+            } finally {
+                probeChannel.close()
             }
 
-        assertFalse(
-            lockAcquiredByThread2.await(200, TimeUnit.MILLISECONDS),
-            "Thread 2 must wait while Thread 1 holds cross-process lock",
-        )
+            val lockWaiterThread =
+                kotlin.concurrent.thread(name = "test-proc2-lock", isDaemon = true) {
+                    SingleInstanceFiles.withCrossProcessLock {
+                        lockAcquiredByThread2.countDown()
+                    }
+                }
 
-        lockCanReleaseLatch.countDown()
-        assertTrue(lockAcquiredByThread2.await(5, TimeUnit.SECONDS), "Thread 2 must acquire lock after release")
-        lockThread.join(2000L)
-        lockWaiterThread.join(2000L)
+            assertFalse(
+                lockAcquiredByThread2.await(200, TimeUnit.MILLISECONDS),
+                "Thread 2 must wait while Thread 1 holds cross-process lock",
+            )
+
+            lockCanReleaseLatch.countDown()
+            assertTrue(lockAcquiredByThread2.await(5, TimeUnit.SECONDS), "Thread 2 must acquire lock after release")
+            lockThread.join(2000L)
+            lockWaiterThread.join(2000L)
+        } finally {
+            lockCanReleaseLatch.countDown()
+        }
     }
 
     @Test
@@ -229,6 +288,45 @@ class SingleInstanceLifecycleTest {
         assertTrue(Files.exists(socketPath), "Socket must be preserved when descriptor absent and key mismatches")
 
         verifyPositiveMatchingKeyOrPreserve(currentKey, socketPath)
+
+        // Exercise real Unix domain socket rebind and replacement if supported on this runtime
+        verifyRealUnixSocketReplacementIfSupported(runDir)
+    }
+
+    private fun verifyRealUnixSocketReplacementIfSupported(runDir: File) {
+        val realSocketPath = File(runDir, "real-replacement.sock").toPath()
+        try {
+            val server1 = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+            server1.bind(UnixDomainSocketAddress.of(realSocketPath))
+            val key1 = Files.readAttributes(realSocketPath, BasicFileAttributes::class.java).fileKey()
+            server1.close()
+            Files.deleteIfExists(realSocketPath)
+
+            val server2 = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+            server2.bind(UnixDomainSocketAddress.of(realSocketPath))
+            val key2 = Files.readAttributes(realSocketPath, BasicFileAttributes::class.java).fileKey()
+            try {
+                if (key1 != null && key2 != null && key1 != key2) {
+                    val staleDesc =
+                        InstanceDescriptor(
+                            transport = SingleInstanceTransport.UNIX,
+                            endpoint = realSocketPath.toString(),
+                            token = newChannelToken(),
+                            pid = ProcessHandle.current().pid(),
+                            socketFileKey = key1,
+                        )
+                    SingleInstanceManager.withdrawForTest(staleDesc)
+                    assertTrue(Files.exists(realSocketPath), "Live socket with key2 must survive withdraw of key1")
+                }
+            } finally {
+                server2.close()
+                Files.deleteIfExists(realSocketPath)
+            }
+        } catch (_: UnsupportedOperationException) {
+            // Unix domain sockets not supported on this platform/kernel
+        } catch (_: IOException) {
+            // Environment restricted Unix domain socket creation
+        }
     }
 
     private fun verifyPositiveMatchingKeyOrPreserve(
