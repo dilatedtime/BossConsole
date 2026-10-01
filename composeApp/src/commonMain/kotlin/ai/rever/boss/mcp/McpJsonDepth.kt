@@ -36,7 +36,7 @@ internal fun mcpJsonNestingExceeds(
             c == '"' -> inString = !inString
             inString -> Unit
             c == '[' || c == '{' -> if (++depth > limit) return true
-            c == ']' || c == '}' -> depth = maxOf(0, depth - 1)
+            c == ']' || c == '}' -> if (depth > 0) depth--
         }
     }
     return false
