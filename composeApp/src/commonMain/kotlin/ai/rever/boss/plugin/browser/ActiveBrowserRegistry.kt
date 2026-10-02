@@ -215,6 +215,20 @@ object ActiveBrowserRegistry {
      * Callers that care about liveness still filter on [BrowserHandle.isValid].
      */
     fun handleById(handleId: String): BrowserHandle? = handles[handleId]
+
+    /**
+     * Resets registry state and sequence counter to pristine initial conditions.
+     * Intended strictly for test isolation to prevent cross-test pollution (#1576).
+     */
+    internal fun resetForTest() {
+        synchronized(publishLock) {
+            entries.clear()
+            handles.clear()
+            sequencer.set(0)
+            _windowsWithActiveBrowser.value = emptySet()
+            _activeHandleIdByWindow.value = emptyMap()
+        }
+    }
 }
 
 /**

@@ -131,6 +131,48 @@ class GitCloneUrlSafetyTest {
     }
 
     @Test
+    fun `clone argv places option-shaped target directory after end-of-options separator`() {
+        val dangerousTargets =
+            listOf(
+                "--upload-pack=touch /tmp/pwned",
+                "-target",
+                "--bare",
+                "-o",
+            )
+        for (target in dangerousTargets) {
+            val cmd = GitService.buildCloneCommand("https://example.invalid/repo.git", target)
+            val separatorIndex = cmd.indexOf("--")
+            val targetIndex = cmd.indexOf(target)
+            assertTrue(separatorIndex >= 0, "argv must contain -- separator")
+            assertTrue(targetIndex > separatorIndex, "target $target must be placed after -- separator")
+            assertEquals(
+                listOf("git", "clone", "--progress", "--", "https://example.invalid/repo.git", target),
+                cmd,
+            )
+        }
+    }
+
+    @Test
+    fun `clone argv places option-shaped repository url after end-of-options separator`() {
+        val dangerousUrls =
+            listOf(
+                "https://github.com/org/-repo.git",
+                "https://github.com/org/--upload-pack=evil.git",
+            )
+        for (url in dangerousUrls) {
+            val cmd = GitService.buildCloneCommand(url, "/tmp/safe-dir")
+            val separatorIndex = cmd.indexOf("--")
+            val urlIndex = cmd.indexOf(url)
+            assertTrue(separatorIndex >= 0, "argv must contain -- separator")
+            assertTrue(urlIndex > separatorIndex, "url $url must be placed after -- separator")
+            assertEquals(
+                listOf("git", "clone", "--progress", "--", url, "/tmp/safe-dir"),
+                cmd,
+            )
+        }
+    }
+
+    @Test
     fun `the clone process is still built from the guarded command list`() {
         val service = source("composeApp/src/desktopMain/kotlin/ai/rever/boss/git/DesktopGitService.kt")
         assertTrue(
