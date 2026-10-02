@@ -32,11 +32,12 @@ import kotlin.test.assertTrue
  * Covers the single-instance channel: the descriptor it publishes, the wire
  * format, and the live behaviour a second launch depends on.
  *
- * The channel is what a second launch hands its URL to — including the auth
- * callback — so the cases here are the ones whose regression would be quiet: a
+ * The channel is what a second launch hands its URL to - including the auth
+ * callback - so the cases here are the ones whose regression would be quiet: a
  * caller that presents no token being listened to, a descriptor nothing answers
  * on stopping the app from starting, and a token reaching a log line.
  */
+@Suppress("LargeClass")
 class SingleInstanceChannelTest {
     @TempDir
     lateinit var tempDir: Path
@@ -476,6 +477,25 @@ class SingleInstanceChannelTest {
         assertTrue(resultJson.contains("\"success\":false"))
         assertTrue(resultJson.contains("\"isError\":true"))
         assertTrue(resultJson.contains("Malformed JSON arguments"))
+
+        // Channel must stay open and alive
+        val resultJson2 = SingleInstanceManager.invokeMcpTool("any_tool", "{}").getOrThrow()
+        assertTrue(resultJson2.contains("\"success\":true"))
+    }
+
+    @Test
+    fun `mcp invoke with deeply nested JSON arguments returns isError true without stack overflow`() {
+        SingleInstanceManager.mcpInvokeHandlerOverride = { tool, _ ->
+            ai.rever.boss.plugin.api
+                .McpToolResult("Executed $tool")
+        }
+        assertTrue(SingleInstanceManager.acquireLock())
+
+        val deeplyNested = "{\"a\":".repeat(150) + "1" + "}".repeat(150)
+        val resultJson = SingleInstanceManager.invokeMcpTool("any_tool", deeplyNested).getOrThrow()
+        assertTrue(resultJson.contains("\"success\":false"))
+        assertTrue(resultJson.contains("\"isError\":true"))
+        assertTrue(resultJson.contains("Arguments exceed maximum supported nesting depth"))
 
         // Channel must stay open and alive
         val resultJson2 = SingleInstanceManager.invokeMcpTool("any_tool", "{}").getOrThrow()

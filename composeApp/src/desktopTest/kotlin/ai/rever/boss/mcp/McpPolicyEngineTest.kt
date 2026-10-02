@@ -196,4 +196,87 @@ class McpPolicyEngineTest {
         // DENY always wins, even when session-trusted
         assertEquals(McpPolicyAction.DENY, engine.policyFor("danger_tool", "terminal-tab"))
     }
+
+    @Test
+    fun `setting explicit ASK tool policy revokes prior session trust so tool asks again`() {
+        val file = createTempPolicyFile()
+        val engine = McpPolicyEngine(policyFile = file)
+
+        engine.trustForSession("deploy_app", "terminal-tab")
+        assertEquals(McpPolicyAction.ALLOW, engine.policyFor("deploy_app", "terminal-tab"))
+
+        assertTrue(engine.setToolPolicy("deploy_app", McpPolicyAction.ASK, providerId = "terminal-tab"))
+        assertEquals(McpPolicyAction.ASK, engine.policyFor("deploy_app", "terminal-tab"))
+    }
+
+    @Test
+    fun `setToolPolicy increments revocationVersion and invalidates in-flight authorizations`() {
+        val file = createTempPolicyFile()
+        val engine = McpPolicyEngine(policyFile = file)
+
+        val initialRevocation = engine.revocationVersion("deploy_app", "terminal-tab")
+        assertTrue(engine.setToolPolicy("deploy_app", McpPolicyAction.ALLOW, providerId = "terminal-tab"))
+
+        assertEquals(initialRevocation + 1, engine.revocationVersion("deploy_app", "terminal-tab"))
+        assertFalse(
+            engine.confirmInvocation(
+                toolName = "deploy_app",
+                expectedRevocation = initialRevocation,
+                grantSessionTrust = false,
+                providerId = "terminal-tab",
+            ),
+        )
+    }
+
+    @Test
+    fun `setting explicit provider policy revokes prior session trust for that provider`() {
+        val file = createTempPolicyFile()
+        val engine = McpPolicyEngine(policyFile = file)
+
+        engine.trustForSession("tool_a", "plugin::aws")
+        engine.trustForSession("tool_b", "plugin::aws")
+        engine.trustForSession("tool_c", "plugin::git")
+
+        assertTrue(McpSessionTrust("plugin::aws", "tool_a") in engine.sessionTrustedTools.value)
+        assertTrue(McpSessionTrust("plugin::aws", "tool_b") in engine.sessionTrustedTools.value)
+        assertTrue(McpSessionTrust("plugin::git", "tool_c") in engine.sessionTrustedTools.value)
+
+        assertTrue(engine.setProviderPolicy("plugin::aws", McpPolicyAction.DENY))
+
+        assertFalse(McpSessionTrust("plugin::aws", "tool_a") in engine.sessionTrustedTools.value)
+        assertFalse(McpSessionTrust("plugin::aws", "tool_b") in engine.sessionTrustedTools.value)
+        assertTrue(McpSessionTrust("plugin::git", "tool_c") in engine.sessionTrustedTools.value)
+        assertEquals(McpPolicyAction.DENY, engine.policyFor("tool_a", "plugin::aws"))
+        assertEquals(McpPolicyAction.DENY, engine.policyFor("tool_b", "plugin::aws"))
+        assertEquals(McpPolicyAction.ALLOW, engine.policyFor("tool_c", "plugin::git"))
+    }
+
+    @Test
+    fun `setProviderPolicy increments providerRevocationVersion and invalidates queued authorizations`() {
+        val file = createTempPolicyFile()
+        val engine = McpPolicyEngine(policyFile = file)
+
+        val initialRevocation = engine.providerRevocationVersion("plugin::k8s")
+        assertTrue(engine.setProviderPolicy("plugin::k8s", McpPolicyAction.DENY))
+
+        assertEquals(initialRevocation + 1, engine.providerRevocationVersion("plugin::k8s"))
+    }
+
+    @Test
+    fun `setToolPolicyIfAbsent and setProviderPolicyIfAbsent increment revocation versions on save`() {
+        val file = createTempPolicyFile()
+        val engine = McpPolicyEngine(policyFile = file)
+
+        val toolRev = engine.revocationVersion("absent_tool", "provider-1")
+        val toolOutcome =
+            engine.setToolPolicyIfAbsent("absent_tool", McpPolicyAction.ALLOW, toolRev, "provider-1")
+        assertEquals(McpProactivePolicyOutcome.Saved, toolOutcome)
+        assertEquals(toolRev + 1, engine.revocationVersion("absent_tool", "provider-1"))
+
+        val providerRev = engine.providerRevocationVersion("provider-1")
+        val providerOutcome =
+            engine.setProviderPolicyIfAbsent("provider-1", McpPolicyAction.ALLOW, providerRev)
+        assertEquals(McpProactivePolicyOutcome.Saved, providerOutcome)
+        assertEquals(providerRev + 1, engine.providerRevocationVersion("provider-1"))
+    }
 }

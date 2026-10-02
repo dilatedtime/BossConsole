@@ -443,4 +443,35 @@ class McpLedgerChainTest {
         assertEquals(listOf(file.name), verification.coverageGaps)
         assertTrue(verification.totalRecords > 0, "surviving backups must still be read")
     }
+
+    @Test
+    fun `a malformed line sanitizes exception message and does not leak raw secret tokens`() {
+        val file = createTempLedgerFile()
+        val secretToken = "ghp_1234567890abcdefghijklmnopqrstuvwxyz"
+        val corruptedLine = "{\"toolName\":\"k8s\",\"token\":\"$secretToken\" corrupted"
+        file.writeText(corruptedLine + "\n")
+
+        val failure =
+            assertFailsWith<McpLedgerReadException> {
+                McpOperationLedger(ledgerFile = file).readEntries()
+            }
+
+        assertTrue(failure.message?.contains("line 1") == true)
+        assertTrue(failure.message?.contains(secretToken) == false, "Raw secret token must not leak in error")
+    }
+
+    @Test
+    fun `readEntries streams across multiple rotated files and retains correct line numbers`() {
+        val file = createTempLedgerFile()
+        val ledger = McpOperationLedger(ledgerFile = file, maxFileSizeBytes = 250L, maxBackupIndex = 10)
+        repeat(8) { record(ledger, "stream_tool_$it") }
+
+        assertTrue(ledger.ledgerFilesOldestFirst().size > 1, "Should have rotated into multiple files")
+        val entries = ledger.readEntries()
+        assertEquals(8, entries.size)
+        entries.forEach { entry ->
+            assertTrue(entry.lineNumber >= 1)
+            assertTrue(entry.record.toolName.startsWith("stream_tool_"))
+        }
+    }
 }
