@@ -3,11 +3,13 @@ package ai.rever.boss.mcp
 import ai.rever.boss.plugin.logging.LogSanitizer
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
+import ai.rever.boss.utils.logging.decodeFailure
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.ByteArrayOutputStream
@@ -772,9 +774,17 @@ internal class McpLedgerStore(
     private fun decode(file: File, lineNumber: Int, line: String): McpOperationRecord =
         try {
             json.decodeFromString<McpOperationRecord>(line)
-        } catch (t: Exception) {
+        } catch (t: SerializationException) {
+            val failure = decodeFailure(t)
+            val detail = failure.entries.joinToString(", ") { "${it.key}=${it.value}" }
             throw McpLedgerReadException(
-                "Malformed record in ${file.absolutePath} at line $lineNumber: ${t.message}",
+                "Malformed record in ${file.absolutePath} at line $lineNumber: $detail",
+                t,
+            )
+        } catch (t: Exception) {
+            val sanitized = t.message?.substringBefore("\n")?.take(100) ?: (t::class.simpleName ?: "Exception")
+            throw McpLedgerReadException(
+                "Malformed record in ${file.absolutePath} at line $lineNumber: $sanitized",
                 t,
             )
         }
