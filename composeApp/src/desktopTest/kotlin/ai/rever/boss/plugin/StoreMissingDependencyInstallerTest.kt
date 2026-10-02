@@ -2,6 +2,7 @@ package ai.rever.boss.plugin
 
 import ai.rever.boss.mcp.ApprovedArtifact
 import ai.rever.boss.plugin.api.PluginManifest
+import ai.rever.boss.plugin.loader.FileHashing
 import ai.rever.boss.plugin.loader.PluginManifestReader
 import ai.rever.boss.plugin.loader.PluginSignatureSidecar
 import ai.rever.boss.plugin.repository.PluginInfo
@@ -113,6 +114,7 @@ class StoreMissingDependencyInstallerTest {
         declaredId: String? = PLUGIN_ID,
         onPersistVersion: (String) -> Unit = {},
         promoteFiles: ((String, File) -> Unit)? = null,
+        hashFile: ((String) -> String)? = null,
     ): StoreMissingDependencyInstaller {
         temp.mkdirs()
         var loaded = false
@@ -124,6 +126,7 @@ class StoreMissingDependencyInstallerTest {
                     installedNow = { id -> id in installed || (loaded && installedAfterLoad) },
                     load = { jarPath -> load(jarPath).also { if (it.isSuccess) loaded = true } },
                     readManifest = { _ -> declaredId?.let { jarManifest(it) } },
+                    hashFile = hashFile ?: { FileHashing.sha256(File(it)) },
                     promoteFiles =
                         promoteFiles ?: { downloaded, target ->
                             target.atomicMoveFrom(File(downloaded))
@@ -675,4 +678,87 @@ class StoreMissingDependencyInstallerTest {
         /** Deliberately different from the store row's 1.2.3, so tests can tell them apart. */
         const val JAR_VERSION = "1.2.4"
     }
+
+    @Test
+    fun `installArtifact with tampered download bytes discards target and fails`(): Unit =
+        runTest {
+            val approvedHash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            val info = info().copy(sha256 = approvedHash)
+            val store = FakeStore(info, downloadBytes = ByteArray(16) { 0x42 })
+            var loaded = false
+            val result =
+                installer(
+                    store,
+                    load = {
+                        loaded = true
+                        Result.success(Unit)
+                    },
+                ).installArtifact(
+                    ApprovedArtifact(PLUGIN_ID, "1.2.3", approvedHash),
+                )
+
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message.orEmpty()
+            assertTrue(
+                message.contains("failed hash verification"),
+                "expected hash verification failure, got: $message",
+            )
+            assertFalse(jar().exists(), "tampered jar must be discarded")
+            assertFalse(sidecar().exists(), "sidecar must be discarded")
+            assertFalse(loaded, "tampered jar must never be loaded into runtime")
+        }
+
+    @Test
+    fun `installArtifact with matching hash succeeds and loads`(): Unit =
+        runTest {
+            val testBytes = ByteArray(16) { 0x42 }
+            val tempFile = File.createTempFile("dep-match", ".tmp")
+            tempFile.writeBytes(testBytes)
+            tempFile.deleteOnExit()
+            val matchingHash = FileHashing.sha256(tempFile)
+
+            val info = info().copy(sha256 = matchingHash)
+            val store = FakeStore(info, downloadBytes = testBytes)
+            var loaded = false
+            val result =
+                installer(
+                    store,
+                    load = {
+                        loaded = true
+                        Result.success(Unit)
+                    },
+                ).installArtifact(
+                    ApprovedArtifact(PLUGIN_ID, "1.2.3", matchingHash),
+                )
+
+            assertTrue(result.isSuccess, "expected success, got: ${result.exceptionOrNull()}")
+            assertTrue(loaded, "matching jar must be loaded")
+            assertTrue(jar().exists(), "jar must be preserved")
+        }
+
+    @Test
+    fun `install missing dependency verifies store sha256 on downloaded bytes`(): Unit =
+        runTest {
+            val mismatchHash = "1111222233334444555566667777888811112222333344445555666677778888"
+            val info = info().copy(sha256 = mismatchHash)
+            val store = FakeStore(info, downloadBytes = ByteArray(10))
+            var loaded = false
+            val result =
+                installer(
+                    store,
+                    load = {
+                        loaded = true
+                        Result.success(Unit)
+                    },
+                ).install(PLUGIN_ID)
+
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message.orEmpty()
+            assertTrue(
+                message.contains("failed hash verification"),
+                "expected hash verification failure, got: $message",
+            )
+            assertFalse(jar().exists())
+            assertFalse(loaded)
+        }
 }

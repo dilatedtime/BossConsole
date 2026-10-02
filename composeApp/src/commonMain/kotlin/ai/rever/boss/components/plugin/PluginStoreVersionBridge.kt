@@ -47,5 +47,6 @@ expect object PluginStoreVersionBridge {
         version: String,
         sourceUrl: String?,
         manager: DynamicPluginManager,
+        expectedSha256: String? = null,
     ): Result<String>
 }

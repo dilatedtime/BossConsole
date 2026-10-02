@@ -151,6 +151,7 @@ class DesktopPluginPackEffects(
         val repository = store() ?: return Result.failure(IllegalStateException(STORE_UNAVAILABLE))
         val hashError = verifyApprovedArtifactHash(repository, pluginId, version, approvedArtifacts)
         if (hashError != null) return hashError
+        val expectedSha = approvedArtifacts.firstOrNull { it.pluginId == pluginId }?.sha256
         return StoreVersionInstaller(pluginDir = { PluginStoreSetup.getPluginDir() })
             .install(
                 store = repository,
@@ -162,6 +163,7 @@ class DesktopPluginPackEffects(
                         runningJarPath = null,
                         hasLiveInstance = false,
                         firstInstall = true,
+                        expectedSha256 = expectedSha,
                     ),
                 unload = { Result.success(Unit) },
                 load = { path -> window.installPlugin(path, enabled = true).map { it.state == PluginState.LOADED } },
@@ -178,9 +180,15 @@ class DesktopPluginPackEffects(
         val repository = store() ?: return Result.failure(IllegalStateException(STORE_UNAVAILABLE))
         val hashError = verifyApprovedArtifactHash(repository, pluginId, version, approvedArtifacts)
         if (hashError != null) return hashError
+        val expectedSha = approvedArtifacts.firstOrNull { it.pluginId == pluginId }?.sha256
         return PluginStoreVersionBridge
-            .installStoreVersion(pluginId, version, sourceUrl = null, manager = window)
-            .map { }
+            .installStoreVersion(
+                pluginId = pluginId,
+                version = version,
+                sourceUrl = null,
+                manager = window,
+                expectedSha256 = expectedSha,
+            ).map { }
     }
 
     override suspend fun enable(pluginId: String): Result<Unit> {

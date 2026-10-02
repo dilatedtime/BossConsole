@@ -3,12 +3,14 @@ package ai.rever.boss.components.plugin
 import ai.rever.boss.components.bars.horizontal.StatusMessageManager
 import ai.rever.boss.plugin.PluginPersistence
 import ai.rever.boss.plugin.api.PluginManifest
+import ai.rever.boss.plugin.loader.FileHashing
 import ai.rever.boss.plugin.loader.PluginManifestReader
 import ai.rever.boss.plugin.loader.PluginSignatureSidecar
 import ai.rever.boss.plugin.repository.PluginRepository
 import ai.rever.boss.plugin.requireDeferredVersion
 import ai.rever.boss.utils.atomicMoveFrom
 import ai.rever.boss.utils.logging.BossLogger
+import ai.rever.boss.utils.logging.ComponentLogger
 import ai.rever.boss.utils.logging.LogCategory
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -22,9 +24,13 @@ import java.io.File
  * rollback and cleanup rules can only be reasoned about, never tested. The two installers now differ
  * in what they do, not in how they are reached.
  */
+@Suppress("LongParameterList")
 class StoreVersionHooks(
     val readManifest: (jarPath: String) -> PluginManifest? = { jarPath ->
         runCatching { PluginManifestReader.readFromJar(jarPath) }.getOrNull()
+    },
+    val hashFile: (jarPath: String) -> String = { jarPath ->
+        FileHashing.sha256(File(jarPath))
     },
     val promoteFiles: (downloaded: String, target: File) -> Unit = { downloaded, target ->
         target.atomicMoveFrom(File(downloaded))
@@ -72,6 +78,7 @@ data class StoreVersionRequest(
     val runningJarPath: String?,
     val hasLiveInstance: Boolean,
     val firstInstall: Boolean = false,
+    val expectedSha256: String? = null,
 )
 
 /**
@@ -223,12 +230,16 @@ internal class StoreVersionInstaller(
      * Split from the download half so neither is long enough to hide a step, and so a test can reach
      * this side without standing up a repository.
      */
+    @Suppress("ReturnCount")
     private suspend fun activate(
         request: StoreVersionRequest,
         target: File,
         unload: suspend (String) -> Result<Unit>,
         load: suspend (String) -> Result<Boolean>,
     ): Result<String> {
+        val hashError = verifyDownloadedHash(request, target, hooks, logger)
+        if (hashError != null) return hashError
+
         val pluginId = request.pluginId
         val runningJarPath = request.runningJarPath
         // Vet before loading, for the same reason the dependency installer does: nothing binds a
@@ -370,4 +381,30 @@ internal class StoreVersionInstaller(
 
     /** Keeps only what a jar name needs, so no store value can name a path. */
     private fun safe(part: String) = part.replace(Regex("[^A-Za-z0-9.-]"), "_")
+}
+
+@Suppress("ReturnCount")
+private fun verifyDownloadedHash(
+    request: StoreVersionRequest,
+    target: File,
+    hooks: StoreVersionHooks,
+    logger: ComponentLogger,
+): Result<String>? {
+    val expectedSha = request.expectedSha256?.takeIf { it.isNotBlank() } ?: return null
+    val actualSha = runCatching { hooks.hashFile(target.absolutePath) }.getOrNull().orEmpty()
+    if (!actualSha.equals(expectedSha, ignoreCase = true)) {
+        hooks.discardFiles(target.absolutePath)
+        logger.warn(
+            LogCategory.SYSTEM,
+            "Refusing a store jar with mismatched SHA-256 hash",
+            mapOf("expected" to expectedSha, "actual" to actualSha, "pluginId" to request.pluginId),
+        )
+        return Result.failure(
+            IllegalStateException(
+                "The store copy of ${request.pluginId} failed hash verification. The downloaded file did not " +
+                    "match the approved SHA-256 hash.",
+            ),
+        )
+    }
+    return null
 }

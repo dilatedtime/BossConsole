@@ -1,6 +1,7 @@
 package ai.rever.boss.components.plugin
 
 import ai.rever.boss.plugin.api.PluginManifest
+import ai.rever.boss.plugin.loader.FileHashing
 import ai.rever.boss.plugin.repository.PluginInfo
 import ai.rever.boss.plugin.repository.PluginRepository
 import ai.rever.boss.plugin.repository.PluginSearchFilter
@@ -76,6 +77,7 @@ class StoreVersionInstallerTest {
         readManifestId: String? = PLUGIN,
         promoteThrows: Boolean = false,
         runningVersion: String = VERSION,
+        hashFile: ((String) -> String)? = null,
     ) = StoreVersionInstaller(
         pluginDir = { dir },
         hooks =
@@ -91,6 +93,7 @@ class StoreVersionInstallerTest {
                         ).takeIf { File(path).exists() }
                     }
                 },
+                hashFile = hashFile ?: { FileHashing.sha256(File(it)) },
                 promoteFiles = { downloaded, target ->
                     if (promoteThrows) error("move failed")
                     target.writeText(File(downloaded).readText())
@@ -113,6 +116,7 @@ class StoreVersionInstallerTest {
         loadSucceeds: Boolean = true,
         hasLiveInstance: Boolean = true,
         firstInstall: Boolean = false,
+        expectedSha256: String? = null,
     ) = install(
         store = repository,
         request =
@@ -123,6 +127,7 @@ class StoreVersionInstallerTest {
                 runningJarPath = runningJarPath,
                 hasLiveInstance = hasLiveInstance,
                 firstInstall = firstInstall,
+                expectedSha256 = expectedSha256,
             ),
         unload = { id ->
             unloaded += id
@@ -365,5 +370,39 @@ class StoreVersionInstallerTest {
             assertEquals(emptyList<String>(), deferredNotices, "no notice for an update that never actually landed")
             // Nothing to show for the download: it is neither installed nor recorded.
             assertTrue(discarded.any { it.contains(notHotReloadablePlugin.replace('.', '_')) })
+        }
+
+    @Test
+    fun `a downloaded jar matching expectedSha256 succeeds`(): Unit =
+        runTest {
+            val tempFile = File.createTempFile("store-hash-match", ".tmp")
+            tempFile.writeText("store bytes")
+            tempFile.deleteOnExit()
+            val expectedHash = FileHashing.sha256(tempFile)
+
+            val result = installer().run(expectedSha256 = expectedHash)
+
+            assertTrue(result.isSuccess, "expected success, got: ${result.exceptionOrNull()}")
+            assertEquals(listOf(PLUGIN), unloaded)
+            assertEquals(1, loaded.size)
+            assertTrue(File(dir, EXPECTED_NAME).isFile)
+        }
+
+    @Test
+    fun `a downloaded jar with mismatched SHA-256 is discarded and refused`(): Unit =
+        runTest {
+            val wrongHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            val result = installer().run(expectedSha256 = wrongHash)
+
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message.orEmpty()
+            assertTrue(
+                message.contains("failed hash verification"),
+                "expected hash verification failure message, got: $message",
+            )
+            assertFalse(File(dir, EXPECTED_NAME).isFile, "tampered file must be deleted")
+            assertTrue(discarded.any { it.endsWith(EXPECTED_NAME) }, "target must be discarded")
+            assertTrue(unloaded.isEmpty(), "running plugin must not be unloaded on hash failure")
+            assertTrue(loaded.isEmpty(), "tampered file must never be loaded into classloader")
         }
 }

@@ -8,6 +8,7 @@ import ai.rever.boss.mcp.ApprovedArtifact
 import ai.rever.boss.plugin.api.PluginManifest
 import ai.rever.boss.plugin.api.TransferKind
 import ai.rever.boss.plugin.api.TransferPhase
+import ai.rever.boss.plugin.loader.FileHashing
 import ai.rever.boss.plugin.loader.PluginManifestReader
 import ai.rever.boss.plugin.loader.PluginSignatureSidecar
 import ai.rever.boss.plugin.repository.PluginInfo
@@ -334,7 +335,7 @@ class StoreMissingDependencyInstaller(
                         // suffix exists to prevent, reached by another door.
                         withContext(NonCancellable) {
                             promoted = true
-                            promoteAndLoad(pluginId, downloaded, target, info)
+                            promoteAndLoad(pluginId, downloaded, target, info, expectedSha256)
                         }
                     },
                     onFailure = { error ->
@@ -367,6 +368,7 @@ class StoreMissingDependencyInstaller(
         downloaded: String,
         target: File,
         info: PluginInfo,
+        expectedSha256: String? = null,
     ): Result<Unit> {
         val error = promote(downloaded, target).exceptionOrNull()
         if (error != null) {
@@ -378,7 +380,7 @@ class StoreMissingDependencyInstaller(
             logger.error(LogCategory.SYSTEM, "Could not move a downloaded dependency into place", error = error)
             return failure("Downloaded ${info.displayName} but could not put it in place.")
         }
-        return vetAndLoad(pluginId, target.absolutePath, info)
+        return vetAndLoad(pluginId, target.absolutePath, info, expectedSha256)
     }
 
     /**
@@ -390,11 +392,26 @@ class StoreMissingDependencyInstaller(
      * result covers the store metadata available when the user answered; dependencies absent
      * from that metadata are not silently added to the accepted plan.
      */
+    @Suppress("ReturnCount")
     private suspend fun vetAndLoad(
         pluginId: String,
         jarPath: String,
         info: PluginInfo,
+        expectedSha256: String? = null,
     ): Result<Unit> {
+        val targetSha = expectedSha256?.takeIf { it.isNotBlank() } ?: info.sha256.takeIf { it.isNotBlank() }
+        if (targetSha != null) {
+            val actualSha = runCatching { hooks.hashFile(jarPath) }.getOrNull().orEmpty()
+            if (!actualSha.equals(targetSha, ignoreCase = true)) {
+                discard(jarPath)
+                logger.warn(
+                    LogCategory.SYSTEM,
+                    "Refusing a dependency jar with mismatched SHA-256 hash",
+                    mapOf("expected" to targetSha, "actual" to actualSha, "pluginId" to pluginId),
+                )
+                return failure("${info.displayName} failed hash verification.")
+            }
+        }
         // Vet the bytes BEFORE loading them. The id filter in `missingFor` only covers the id a
         // manifest *names*; nothing binds a store row to the id its jar *declares* (the
         // signature binds the hash to the row and the row to the store's key, not the plugin
@@ -540,6 +557,9 @@ class InstallerHooks(
     val load: suspend (jarPath: String) -> Result<*>,
     val readManifest: (jarPath: String) -> PluginManifest? = { jarPath ->
         runCatching { PluginManifestReader.readFromJar(jarPath) }.getOrNull()
+    },
+    val hashFile: (jarPath: String) -> String = { jarPath ->
+        FileHashing.sha256(File(jarPath))
     },
     val promoteFiles: (downloaded: String, target: File) -> Unit = { downloaded, target ->
         target.atomicMoveFrom(File(downloaded))
