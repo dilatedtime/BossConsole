@@ -206,4 +206,80 @@ class CrashHandlerIgnorableTest {
     fun `generic runtime exception is not ignorable`() {
         assertFalse(CrashHandler.isIgnorable(RuntimeException("actual crash")))
     }
+
+    @Test
+    fun `plugin classloader post-unload refusal is ignorable`() {
+        val refusal =
+            ClassNotFoundException(
+                "Plugin classloader for 'terminal' is UNLOADED; refusing to resolve " +
+                    "'ai.rever.boss.plugin.terminal.TerminalView' against the host classloader. " +
+                    "Something still referenced the plugin after it was unloaded - that reference is the bug.",
+            )
+        assertTrue(CrashHandler.isIgnorable(refusal))
+    }
+
+    @Test
+    fun `plugin classloader unload-in-progress refusal is ignorable`() {
+        val refusal =
+            ClassNotFoundException(
+                "Plugin classloader for 'browser' is UNLOAD_IN_PROGRESS; refusing to resolve " +
+                    "'ai.rever.boss.plugin.browser.BrowserSession' against the host classloader.",
+            )
+        assertTrue(CrashHandler.isIgnorable(refusal))
+    }
+
+    @Test
+    fun `wrapped no class def found error from unloaded classloader is ignorable`() {
+        val refusal =
+            ClassNotFoundException(
+                "Plugin classloader for 'terminal' is UNLOADED; refusing to resolve " +
+                    "'ai.rever.boss.plugin.terminal.StrayWorker' against the host classloader.",
+            )
+        val wrapped =
+            NoClassDefFoundError("ai/rever/boss/plugin/terminal/StrayWorker").apply {
+                initCause(refusal)
+            }
+        assertTrue(CrashHandler.isIgnorable(wrapped))
+    }
+
+    @Test
+    fun `direct no class def found error with refusal message is ignorable`() {
+        val error =
+            NoClassDefFoundError(
+                "Plugin classloader for 'terminal' is UNLOADED; refusing to resolve " +
+                    "'ai.rever.boss.plugin.terminal.StrayWorker' against the host classloader.",
+            )
+        assertTrue(CrashHandler.isIgnorable(error))
+    }
+
+    @Test
+    fun `plugin classloader refusal nested in background worker failure is ignorable`() {
+        val refusal =
+            ClassNotFoundException(
+                "Plugin classloader for 'editor' is UNLOADED; refusing to resolve " +
+                    "'ai.rever.boss.plugin.editor.Buffer' against the host classloader.",
+            )
+        val failure = RuntimeException("Background worker crashed", refusal)
+        assertTrue(CrashHandler.isIgnorable(failure))
+    }
+
+    @Test
+    fun `unrelated class not found exception remains reportable`() {
+        assertFalse(CrashHandler.isIgnorable(ClassNotFoundException("com.example.MissingClass")))
+    }
+
+    @Test
+    fun `unrelated no class def found error remains reportable`() {
+        assertFalse(CrashHandler.isIgnorable(NoClassDefFoundError("com/example/MissingClass")))
+    }
+
+    @Test
+    fun `refusal lookalike on wrong exception type remains reportable`() {
+        val wrongType =
+            IllegalStateException(
+                "Plugin classloader for 'terminal' is UNLOADED; refusing to resolve " +
+                    "'ai.rever.boss.plugin.terminal.TerminalView' against the host classloader.",
+            )
+        assertFalse(CrashHandler.isIgnorable(wrongType))
+    }
 }

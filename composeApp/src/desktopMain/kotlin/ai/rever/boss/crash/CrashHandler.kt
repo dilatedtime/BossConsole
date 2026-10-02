@@ -200,12 +200,13 @@ object CrashHandler {
      * Whether [throwable] (or anything in its cause chain) is a benign, expected
      * exception that should be logged and swallowed rather than reported as a
      * crash: dropped network sockets (broken pipe / connection reset), closed
-     * ktor channels, coroutine cancellations, and Supabase session-refresh
-     * failures (supabase-kt throws TokenExpiredException into its own internal
-     * coroutines when an authenticated request races an expired session — the
-     * auth layer recovers on its own, see CoreAuthService.startSessionRecovery).
-     * Matched by class-name suffix + message so we don't need a compile
-     * dependency on ktor/coroutines here.
+     * ktor channels, coroutine cancellations, post-unload plugin classloader
+     * teardown refusals, and Supabase session-refresh failures (supabase-kt
+     * throws TokenExpiredException into its own internal coroutines when an
+     * authenticated request races an expired session — the auth layer recovers
+     * on its own, see CoreAuthService.startSessionRecovery). Matched by
+     * class-name suffix + message so we don't need a compile dependency on
+     * ktor/coroutines here.
      */
     internal fun isIgnorable(throwable: Throwable): Boolean =
         throwable.chainOfCauses().any { t ->
@@ -219,6 +220,7 @@ object CrashHandler {
                     name == "io.github.jan.supabase.auth.exception.TokenExpiredException" ||
                     isStaleRealtimeRejoin(t) ||
                     isRealtimeHeartbeatRace(t) ||
+                    isUnloadedPluginClassLoaderRefusal(t) ||
                     (
                         t is java.io.IOException && (
                             msg.contains("Broken pipe", ignoreCase = true) ||
