@@ -2443,7 +2443,7 @@ object SingleInstanceManager {
             readSafeDescriptor(requireVerified = true)
                 ?: return Result.failure(IllegalStateException("BOSS is not running. Launch BOSS to invoke MCP tools."))
         val response =
-            SingleInstanceWire.exchange(
+            SingleInstanceWire.exchangeWithRetry(
                 target,
                 formatMcpInvokeRequest(target.token, toolName, argsJson),
                 timeoutMs = timeoutMs,
