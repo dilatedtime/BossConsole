@@ -710,8 +710,7 @@ internal class McpToolRegistryCore(
     /** Host-owned marker that prevents prepared registration metadata being copied again on replay. */
     private interface ProviderSnapshot :
         McpToolProvider,
-        McpToolAliasProvider,
-        McpToolPreparer
+        McpToolAliasProvider
 
     /**
      * Snapshot [provider] without re-entering its metadata getters during a later replay. Tool
@@ -734,17 +733,27 @@ internal class McpToolRegistryCore(
         // Read alongside tools() outside the lock - same plugin-code discipline.
         val aliases = (provider as? McpToolAliasProvider)?.toolAliases.orEmpty().toMap()
         val preparer = provider as? McpToolPreparer
-        return object : ProviderSnapshot {
-            override val providerId = providerId
+        return if (preparer != null) {
+            object : ProviderSnapshot, McpToolPreparer {
+                override val providerId = providerId
 
-            override fun tools(): List<McpToolDefinition> = definitions
+                override fun tools(): List<McpToolDefinition> = definitions
 
-            override val toolAliases: Map<String, String> = aliases
+                override val toolAliases: Map<String, String> = aliases
 
-            override suspend fun prepareInvocation(
-                toolName: String,
-                args: McpToolArgs,
-            ): McpPreparationResult? = preparer?.prepareInvocation(toolName, args)
+                override suspend fun prepareInvocation(
+                    toolName: String,
+                    args: McpToolArgs,
+                ): McpPreparationResult? = preparer.prepareInvocation(toolName, args)
+            }
+        } else {
+            object : ProviderSnapshot {
+                override val providerId = providerId
+
+                override fun tools(): List<McpToolDefinition> = definitions
+
+                override val toolAliases: Map<String, String> = aliases
+            }
         }
     }
 
@@ -758,6 +767,8 @@ internal class McpToolRegistryCore(
         val preparer = (prepared as? McpToolPreparer) ?: (provider as? McpToolPreparer)
         if (preparer != null) {
             _preparers[providerId] = preparer
+        } else {
+            _preparers.remove(providerId)
         }
         synchronized(mutationLock) {
             if (_providers.value.containsKey(providerId)) {
@@ -1016,7 +1027,7 @@ internal class McpToolRegistryCore(
             }
 
     // One boundary must cover denial, approval, execution, and the ledger write.
-    @Suppress("LongMethod", "CyclomaticComplexMethod", "ReturnCount", "NestedBlockDepth")
+    @Suppress("LongMethod", "CyclomaticComplexMethod", "ReturnCount", "NestedBlockDepth", "TooGenericExceptionCaught")
     suspend fun invoke(
         toolName: String,
         arguments: String,
@@ -1075,7 +1086,31 @@ internal class McpToolRegistryCore(
             }
 
             val preparer = _preparers[tool.providerId]
-            val prepared = preparer?.prepareInvocation(toolName, args)
+            val prepared =
+                try {
+                    withTimeout(invokeTimeoutMs) {
+                        preparer?.prepareInvocation(toolName, args)
+                    }
+                } catch (_: TimeoutCancellationException) {
+                    disposition = McpApprovalDisposition.TIMEOUT
+                    result =
+                        McpToolResult(
+                            "Tool '${tool.definition.name}' preparation timed out after ${invokeTimeoutMs / 1000}s",
+                            isError = true,
+                        )
+                    return result
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    val reason = LogSanitizer.sanitizeExceptionMessage(failure.message ?: failure::class.simpleName)
+                    disposition = McpApprovalDisposition.POLICY_DENIED
+                    result =
+                        McpToolResult(
+                            "Tool '${tool.definition.name}' preparation failed: $reason",
+                            isError = true,
+                        )
+                    return result
+                }
             val displayModel: Any?
             val allowStandingTrust: Boolean
             val forceAsk: Boolean
@@ -1154,6 +1189,11 @@ internal class McpToolRegistryCore(
                     McpApprovalDisposition.CANCELLED_AWAITING_APPROVAL
                 }
             throw cancelled
+        } catch (failure: Throwable) {
+            disposition = McpApprovalDisposition.POLICY_DENIED
+            val reason = LogSanitizer.sanitizeExceptionMessage(failure.message ?: failure::class.simpleName)
+            result = McpToolResult("Tool '${tool.definition.name}' failed: $reason", isError = true)
+            return result
         } finally {
             consumeExecutionObject(args)
             consumeExecutionObject(effectiveArgs)
