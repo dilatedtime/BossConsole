@@ -8,6 +8,7 @@ import ai.rever.boss.plugin.logging.LogCategory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.util.jar.JarFile
@@ -203,6 +204,16 @@ class LocalPluginRepository(
                     publishedAt = jarFile.lastModified(),
                 )
             }
+        } catch (e: SerializationException) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Failed to read plugin from JAR",
+                mapOf(
+                    "path" to jarFile.absolutePath,
+                    "error" to (e::class.simpleName ?: "SerializationException"),
+                ),
+            )
+            null
         } catch (e: Exception) {
             logger.warn(
                 LogCategory.SYSTEM,
@@ -233,6 +244,13 @@ class LocalPluginRepository(
                 val manifest = json.decodeFromString<PluginManifest>(content)
                 manifest.pluginId
             }
+        } catch (e: SerializationException) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Could not read pluginId from JAR",
+                mapOf("jar" to jarFile.name, "error" to (e::class.simpleName ?: "SerializationException")),
+            )
+            null
         } catch (e: Exception) {
             // Not a readable BOSS plugin JAR - callers treat null as "skip this file"
             logger.debug(

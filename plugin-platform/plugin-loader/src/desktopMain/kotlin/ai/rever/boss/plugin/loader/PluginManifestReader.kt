@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.PluginManifest
 import ai.rever.boss.plugin.api.PluginManifestConstants
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.InputStream
@@ -154,6 +155,17 @@ object PluginManifestReader {
             manifest
         } catch (e: PluginManifestException) {
             throw e
+        } catch (e: SerializationException) {
+            val errorType = e::class.simpleName ?: "SerializationException"
+            val lineOrOffset =
+                e.message?.let { msg ->
+                    Regex("""(at offset \d+|at line \d+)""").find(msg)?.value
+                }
+            val detail = if (lineOrOffset != null) "$errorType ($lineOrOffset)" else errorType
+            throw PluginManifestException(
+                "Failed to parse plugin manifest from $source: decode failure ($detail)",
+                cause = e,
+            )
         } catch (e: Exception) {
             throw PluginManifestException(
                 "Failed to parse plugin manifest from $source: ${e.message}",
