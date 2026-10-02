@@ -502,7 +502,7 @@ actual object GitService {
         setOf(GitFileStatusType.UNTRACKED, GitFileStatusType.IGNORED)
 
     /**
-     * Parse the whole output of `git status --porcelain=v1` into file statuses.
+     * Parse the whole output of `git status --porcelain=v1 -z` into file statuses.
      *
      * The single choke point for both status call sites, and the one place that decides
      * which porcelain entries are *changes* at all. Ignored entries (`!! path`, emitted
@@ -513,17 +513,26 @@ actual object GitService {
      * from the staged list to the unstaged one.
      *
      * The parser itself stays faithful to porcelain and still supports IGNORED, so
-     * a future caller that deliberately passes `--ignored` can parse those lines — it
+     * a future caller that deliberately passes `--ignored` can parse those lines; it
      * just has to pass `keepIgnored = true` here rather than inherit them silently.
      */
     internal fun parseStatusOutput(
         output: String,
         keepIgnored: Boolean = false,
     ): List<GitFileStatus> {
+        if (output.isEmpty()) return emptyList()
+
         val statuses = mutableListOf<GitFileStatus>()
-        val tokens = output.split('\u0000')
+        val rawTokens = output.split('\u0000')
+        val tokens =
+            if (rawTokens.isNotEmpty() && rawTokens.last().isEmpty()) {
+                rawTokens.dropLast(1)
+            } else {
+                rawTokens
+            }
+
         var i = 0
-        while (i < tokens.size - 1) {
+        while (i < tokens.size) {
             val token = tokens[i]
             if (token.length < 3) {
                 i++
@@ -534,7 +543,7 @@ actual object GitService {
             val isRenameOrCopy = indexChar in "RC" || workTreeChar in "RC"
             val path = token.substring(3)
             val originalPath =
-                if (isRenameOrCopy && i + 1 < tokens.size - 1) {
+                if (isRenameOrCopy && i + 1 < tokens.size) {
                     val orig = tokens[i + 1]
                     i++
                     orig

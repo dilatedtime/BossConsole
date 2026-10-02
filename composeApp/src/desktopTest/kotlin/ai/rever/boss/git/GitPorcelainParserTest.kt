@@ -199,6 +199,34 @@ class GitPorcelainParserTest {
         assertTrue(GitService.parseStatusOutput("\u0000\u0000").isEmpty())
     }
 
+    @Test
+    fun `parseStatusOutput preserves last entry when output lacks trailing null byte`() {
+        val statuses = GitService.parseStatusOutput("M  src/App.kt")
+        assertEquals(1, statuses.size)
+        assertEquals("src/App.kt", statuses.first().path)
+        assertTrue(statuses.first().isStaged)
+    }
+
+    @Test
+    fun `parseStatusOutput handles renames when output lacks trailing null byte without phantom files`() {
+        val statuses = GitService.parseStatusOutput("R  new.kt\u0000old.kt")
+        assertEquals(1, statuses.size)
+        assertEquals("new.kt", statuses.first().path)
+        assertEquals("old.kt", statuses.first().originalPath)
+        assertEquals(GitFileStatusType.RENAMED, statuses.first().indexStatus)
+    }
+
+    @Test
+    fun `parseStatusOutput handles mixed entries ending without trailing null byte`() {
+        val statuses =
+            GitService.parseStatusOutput(
+                "M  staged.kt\u0000R  dest.kt\u0000src.kt\u0000?? untracked.kt",
+            )
+        assertEquals(listOf("staged.kt", "dest.kt", "untracked.kt"), statuses.map { it.path })
+        assertEquals("src.kt", statuses.single { it.path == "dest.kt" }.originalPath)
+        assertEquals(GitFileStatusType.UNTRACKED, statuses.single { it.path == "untracked.kt" }.indexStatus)
+    }
+
     // ==================== parseSingleStatus: renames and copies ====================
 
     @Test
