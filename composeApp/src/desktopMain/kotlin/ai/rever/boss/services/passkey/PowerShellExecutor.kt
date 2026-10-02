@@ -113,17 +113,28 @@ object PowerShellExecutor {
         operationDescription: String,
         timeoutSeconds: Long = SCRIPT_TIMEOUT_SECONDS,
     ): String {
-        val outputFile = File.createTempFile("boss-ps-output", ".txt").apply {
-            deleteOnExit()
-        }
+        val outputFile =
+            File.createTempFile("boss-ps-output", ".txt").apply {
+                deleteOnExit()
+            }
 
-        val process = try {
-            processRunner(command, outputFile)
-        } catch (e: Exception) {
-            outputFile.delete()
-            throw e
-        }
+        val process =
+            try {
+                processRunner(command, outputFile)
+            } catch (e: Exception) {
+                outputFile.delete()
+                throw e
+            }
 
+        return waitForProcessAndReadOutput(process, outputFile, operationDescription, timeoutSeconds)
+    }
+
+    private fun waitForProcessAndReadOutput(
+        process: Process,
+        outputFile: File,
+        operationDescription: String,
+        timeoutSeconds: Long,
+    ): String =
         try {
             val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!finished) {
@@ -139,12 +150,10 @@ object PowerShellExecutor {
             val output = readTextSafely(outputFile)
 
             if (exitCode != 0) {
-                throw IllegalStateException(
-                    "PowerShell script failed with exit code: $exitCode, output: $output",
-                )
+                error("PowerShell script failed with exit code: $exitCode, output: $output")
             }
 
-            return output
+            output
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             process.destroyForcibly()
@@ -152,12 +161,16 @@ object PowerShellExecutor {
         } finally {
             outputFile.delete()
         }
-    }
 
     private fun consoleCharset(): Charset =
         try {
             System.getProperty("native.encoding")?.let { Charset.forName(it) } ?: Charset.defaultCharset()
         } catch (e: IllegalArgumentException) {
+            logger.debug(
+                LogCategory.PASSKEY,
+                "Unknown native encoding, using default charset",
+                mapOf("error" to e.toString()),
+            )
             Charset.defaultCharset()
         }
 
@@ -165,8 +178,18 @@ object PowerShellExecutor {
         try {
             file.readText(consoleCharset()).trim()
         } catch (e: IOException) {
+            logger.debug(
+                LogCategory.PASSKEY,
+                "Failed to read process output file",
+                mapOf("error" to e.toString()),
+            )
             ""
         } catch (e: SecurityException) {
+            logger.debug(
+                LogCategory.PASSKEY,
+                "Security exception reading process output file",
+                mapOf("error" to e.toString()),
+            )
             ""
         }
 
@@ -198,7 +221,7 @@ object PowerShellExecutor {
             logger.debug(LogCategory.PASSKEY, "Created PowerShell directory", mapOf("path" to defaultPath))
             return defaultPath
         } else {
-            throw IllegalStateException("Could not find or create PowerShell scripts directory: $defaultPath")
+            error("Could not find or create PowerShell scripts directory: $defaultPath")
         }
     }
 }

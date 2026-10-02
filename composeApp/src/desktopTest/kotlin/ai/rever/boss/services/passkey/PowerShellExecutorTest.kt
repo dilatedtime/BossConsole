@@ -152,7 +152,7 @@ class PowerShellExecutorTest {
     @Test
     fun `runScript executes script successfully when file exists`() {
         val tempDir = Files.createTempDirectory("ps-test-ok").toFile()
-        val script = File(tempDir, "sample.ps1").apply { writeText("Write-Output 'OK'") }
+        File(tempDir, "sample.ps1").writeText("Write-Output 'OK'")
         val fakeProcess = FakeProcess(exitCode = 0)
         PowerShellExecutor.processRunner = { _, outputFile ->
             outputFile.writeText("OK")
@@ -180,7 +180,10 @@ class PowerShellExecutorTest {
         var destroyedForcibly = false
         var exitValueCalled = false
 
-        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+        override fun waitFor(
+            timeout: Long,
+            unit: TimeUnit,
+        ): Boolean {
             if (shouldInterrupt) {
                 throw InterruptedException("Simulated interruption")
             }
@@ -212,7 +215,9 @@ class PowerShellExecutorTest {
         }
 
         override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+
         override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+
         override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
     }
 }

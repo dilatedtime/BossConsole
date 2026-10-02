@@ -106,20 +106,20 @@ actual object URLHandlerService {
                     "App not ready, queueing URL",
                     mapOf("url" to LogSanitizer.maskUriParams(url)),
                 )
-                return
             }
+
             EnqueueResult.DROPPED -> {
                 logger.warn(
                     LogCategory.BROWSER,
                     "Cold-start URL queue full, dropping request",
                     mapOf("url" to LogSanitizer.maskUriParams(url)),
                 )
-                return
             }
-            EnqueueResult.CLAIMED -> Unit
-        }
 
-        handleURLInternal(url, requiresConfirmation)
+            EnqueueResult.CLAIMED -> {
+                handleURLInternal(url, requiresConfirmation)
+            }
+        }
     }
 
     /**

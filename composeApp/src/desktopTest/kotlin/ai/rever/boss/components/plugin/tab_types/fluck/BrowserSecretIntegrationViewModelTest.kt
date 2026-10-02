@@ -1,12 +1,9 @@
+@file:Suppress("PackageNaming")
+
 package ai.rever.boss.components.plugin.tab_types.fluck
 
 import ai.rever.boss.services.supabase.models.PaginatedSecrets
 import ai.rever.boss.services.supabase.models.SecretEntry
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -15,6 +12,11 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class BrowserSecretIntegrationViewModelTest {
@@ -79,12 +81,10 @@ class BrowserSecretIntegrationViewModelTest {
                 advanceUntilIdle()
                 assertEquals(1, fetchCount.get())
 
-                // Second initialize cancels old collector and triggers one new load
                 viewModel.initialize()
                 advanceUntilIdle()
                 assertEquals(2, fetchCount.get())
 
-                // Emit a secret change event: exactly one collector should react
                 SecretChangeNotifier.notifyRefresh()
                 advanceUntilIdle()
                 assertEquals(3, fetchCount.get())
@@ -175,11 +175,13 @@ class BrowserSecretIntegrationViewModelTest {
                 viewModel.onUrlChanged("https://github.com/settings")
                 assertEquals("github.com", viewModel.state.currentDomain)
                 assertEquals(1, viewModel.state.matchingSecrets.size)
-                assertEquals("1", viewModel.state.matchingSecrets.first().id)
+                val matched = viewModel.state.matchingSecrets.first()
+                assertEquals("1", matched.id)
 
                 viewModel.searchSecrets("bob")
                 assertEquals(1, viewModel.state.filteredSecrets.size)
-                assertEquals("2", viewModel.state.filteredSecrets.first().id)
+                val filtered = viewModel.state.filteredSecrets.first()
+                assertEquals("2", filtered.id)
             } finally {
                 viewModel.dispose()
                 Dispatchers.resetMain()

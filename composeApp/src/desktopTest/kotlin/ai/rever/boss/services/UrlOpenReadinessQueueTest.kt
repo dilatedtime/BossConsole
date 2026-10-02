@@ -28,13 +28,25 @@ class UrlOpenReadinessQueueTest {
     @Test
     fun `enqueueOrClaim drops excess URLs when capacity limit is reached`() {
         val queue = UrlOpenReadinessQueue(maxQueued = 3)
-        assertEquals(EnqueueResult.ENQUEUED, queue.enqueueOrClaim("https://site1.example", requiresConfirmation = true))
-        assertEquals(EnqueueResult.ENQUEUED, queue.enqueueOrClaim("https://site2.example", requiresConfirmation = false))
-        assertEquals(EnqueueResult.ENQUEUED, queue.enqueueOrClaim("https://site3.example", requiresConfirmation = true))
+        assertEquals(
+            EnqueueResult.ENQUEUED,
+            queue.enqueueOrClaim("https://site1.example", requiresConfirmation = true),
+        )
+        assertEquals(
+            EnqueueResult.ENQUEUED,
+            queue.enqueueOrClaim("https://site2.example", requiresConfirmation = false),
+        )
+        assertEquals(
+            EnqueueResult.ENQUEUED,
+            queue.enqueueOrClaim("https://site3.example", requiresConfirmation = true),
+        )
         assertEquals(3, queue.size)
 
         // 4th request exceeds maxQueued and must be dropped
-        assertEquals(EnqueueResult.DROPPED, queue.enqueueOrClaim("https://site4.example", requiresConfirmation = true))
+        assertEquals(
+            EnqueueResult.DROPPED,
+            queue.enqueueOrClaim("https://site4.example", requiresConfirmation = true),
+        )
         assertEquals(3, queue.size)
         assertFalse(queue.enqueueOrClaimForCaller("https://site5.example", requiresConfirmation = false))
         assertEquals(3, queue.size)
@@ -49,12 +61,18 @@ class UrlOpenReadinessQueueTest {
     @Test
     fun `enqueueOrClaim claims immediately once service is ready`() {
         val queue = UrlOpenReadinessQueue(maxQueued = 2)
-        assertEquals(EnqueueResult.ENQUEUED, queue.enqueueOrClaim("https://first.example", requiresConfirmation = true))
+        assertEquals(
+            EnqueueResult.ENQUEUED,
+            queue.enqueueOrClaim("https://first.example", requiresConfirmation = true),
+        )
         val initialDrain = queue.markReadyAndClaimQueued()
         assertEquals(1, initialDrain.size)
 
         // Now ready: any subsequent call claims immediately
-        assertEquals(EnqueueResult.CLAIMED, queue.enqueueOrClaim("https://second.example", requiresConfirmation = true))
+        assertEquals(
+            EnqueueResult.CLAIMED,
+            queue.enqueueOrClaim("https://second.example", requiresConfirmation = true),
+        )
         assertTrue(queue.enqueueOrClaimForCaller("https://third.example", requiresConfirmation = false))
         assertEquals(0, queue.size)
         assertFalse(queue.hasQueuedURLs())
