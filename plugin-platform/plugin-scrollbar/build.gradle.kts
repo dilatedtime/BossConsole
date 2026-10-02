@@ -45,7 +45,19 @@ kotlin {
                 implementation(libs.kotlinx.coroutines.swing)
             }
         }
+        named("desktopTest") {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation(kotlin("test-junit5"))
+                implementation(libs.junit.jupiter)
+                implementation(libs.kotlinx.coroutines.test)
+            }
+        }
     }
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
 }
 
 mavenPublishing {
