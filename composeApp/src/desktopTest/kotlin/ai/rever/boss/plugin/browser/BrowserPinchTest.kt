@@ -4,6 +4,9 @@ import ai.rever.boss.utils.PinchZoomAccumulator
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.ln
@@ -113,6 +116,16 @@ class BrowserPinchTest {
         // Built from the child window's own constructor, so it belongs to the document it is
         // dispatched in.
         assertTrue("new win.WheelEvent('wheel'" in script)
+    }
+
+    @Test
+    fun `iframe descent accounts for CSS padding on the iframe element`() {
+        val script = BrowserPinchScript.dispatch(0.05, 0.5, 0.5)
+        assertTrue("getComputedStyle(target)" in script)
+        assertTrue("parseFloat(style.paddingLeft) || 0" in script)
+        assertTrue("parseFloat(style.paddingTop) || 0" in script)
+        assertTrue("target.clientLeft + padLeft" in script)
+        assertTrue("target.clientTop + padTop" in script)
     }
 
     // --- pointerFractionInBounds: the coordinate-space trap, again ---
@@ -225,8 +238,47 @@ class BrowserPinchTest {
         var stale: (() -> Boolean)? = null
         val answered = CountDownLatch(1)
         offers.offer(send = { _, isStale -> stale = isStale }, onAnswer = { answered.countDown() })
-        assertFalse(stale!!())
+        val isStaleFn = requireNotNull(stale)
+        assertFalse(isStaleFn())
         assertTrue(answered.await(2, TimeUnit.SECONDS))
-        assertTrue(stale!!())
+        assertTrue(isStaleFn())
+    }
+
+    @Test
+    fun `offers tag each offer with a strictly monotonic sequence number`() {
+        val offers = PinchOffers(maxPending = 4, deadlineMs = 1_000)
+        val sequences = mutableListOf<Long>()
+        repeat(3) {
+            offers.offer(
+                send = { answer, _ -> answer(true) },
+                onAnswer = { seq, _ -> sequences += seq },
+            )
+        }
+        assertEquals(listOf(1L, 2L, 3L), sequences)
+    }
+
+    @Test
+    fun `early completion cancels the scheduled timeout task`() {
+        var scheduledFuture: ScheduledFuture<*>? = null
+        val delegate = Executors.newSingleThreadScheduledExecutor()
+        val testScheduler =
+            object : ScheduledExecutorService by delegate {
+                override fun schedule(
+                    command: Runnable,
+                    delay: Long,
+                    unit: TimeUnit,
+                ): ScheduledFuture<*> {
+                    val future = delegate.schedule(command, delay, unit)
+                    scheduledFuture = future
+                    return future
+                }
+            }
+        try {
+            val offers = PinchOffers(maxPending = 4, deadlineMs = 5_000, scheduler = testScheduler)
+            offers.offer(send = { answer, _ -> answer(true) }, onAnswer = {})
+            assertTrue(scheduledFuture?.isCancelled == true)
+        } finally {
+            delegate.shutdownNow()
+        }
     }
 }

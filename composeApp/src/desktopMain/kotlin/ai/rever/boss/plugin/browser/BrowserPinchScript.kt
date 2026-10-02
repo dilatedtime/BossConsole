@@ -1,8 +1,11 @@
 package ai.rever.boss.plugin.browser
 
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ln
 
 /**
@@ -97,8 +100,11 @@ internal object BrowserPinchScript {
                   var box = target.getBoundingClientRect();
                   // Child coordinates are committed only with the child target, so a miss inside
                   // the iframe dispatches at the iframe element in the parent's coordinates.
-                  var cx = x - (box.left + target.clientLeft);
-                  var cy = y - (box.top + target.clientTop);
+                  var style = win.getComputedStyle ? win.getComputedStyle(target) : null;
+                  var padLeft = style ? (parseFloat(style.paddingLeft) || 0) : 0;
+                  var padTop = style ? (parseFloat(style.paddingTop) || 0) : 0;
+                  var cx = x - (box.left + target.clientLeft + padLeft);
+                  var cy = y - (box.top + target.clientTop + padTop);
                   inner = childDoc.elementFromPoint(cx, cy);
                   if (!inner) break;
                   x = cx;
@@ -187,47 +193,71 @@ internal enum class PinchAnswer {
 internal class PinchOffers(
     private val maxPending: Int,
     private val deadlineMs: Long,
+    private val scheduler: ScheduledExecutorService? = null,
 ) {
     private val pending = AtomicInteger(0)
+    private val sequenceGenerator = AtomicLong(0)
 
     /**
-     * Offers one delta. [send] receives a callback to report the page's answer with, and a check
-     * that turns true once the offer has been answered by any path. A [send] that queues its work
-     * should skip it when the check is true, so a backed-up queue does not run old offers late.
-     * [onAnswer] is called exactly once: with that answer, with [PinchAnswer.TIMED_OUT] at the
-     * deadline, or with [PinchAnswer.SKIPPED] when the cap is reached. An answer that arrives after the deadline
-     * is dropped. A [send] that fails should answer false; one that throws still frees its slot at
-     * the deadline, but the exception reaches the caller.
+     * Offers one delta. [onAnswer] is called with the answer without the sequence tag.
      */
     fun offer(
         send: (answer: (claimed: Boolean) -> Unit, isStale: () -> Boolean) -> Unit,
         onAnswer: (answer: PinchAnswer) -> Unit,
     ) {
+        offer(send) { _, answer -> onAnswer(answer) }
+    }
+
+    /**
+     * Offers one delta. [send] receives a callback to report the page's answer with, and a check
+     * that turns true once the offer has been answered by any path. A [send] that queues its work
+     * should skip it when the check is true, so a backed-up queue does not run old offers late.
+     * [onAnswer] is called exactly once with the monotonic [sequence] number and [answer].
+     */
+    fun offer(
+        send: (answer: (claimed: Boolean) -> Unit, isStale: () -> Boolean) -> Unit,
+        onAnswer: (sequence: Long, answer: PinchAnswer) -> Unit,
+    ) {
+        val sequence = sequenceGenerator.incrementAndGet()
         // Claim a slot first and give it back if over the cap, so two racing offers cannot both
         // pass a check and then both take a slot.
         if (pending.incrementAndGet() > maxPending) {
             pending.decrementAndGet()
-            onAnswer(PinchAnswer.SKIPPED)
+            onAnswer(sequence, PinchAnswer.SKIPPED)
             return
         }
         val answer = CompletableFuture<Boolean?>()
-        answer
-            .completeOnTimeout(null, deadlineMs, TimeUnit.MILLISECONDS)
-            .whenComplete { claimed, _ ->
-                pending.decrementAndGet()
-                // The future whenComplete returns is discarded, so an exception from onAnswer
-                // would vanish without a trace. Surface it on the thread's handler instead.
-                val result =
-                    when (claimed) {
-                        true -> PinchAnswer.CLAIMED
-                        false -> PinchAnswer.DECLINED
-                        null -> PinchAnswer.TIMED_OUT
-                    }
-                runCatching { onAnswer(result) }.onFailure { e ->
-                    Thread.currentThread().let { it.uncaughtExceptionHandler?.uncaughtException(it, e) }
+        val executor = scheduler ?: defaultScheduler
+        val timeoutTask =
+            executor.schedule(
+                { answer.complete(null) },
+                deadlineMs,
+                TimeUnit.MILLISECONDS,
+            )
+        answer.whenComplete { claimed, _ ->
+            timeoutTask.cancel(false)
+            pending.decrementAndGet()
+            // The future whenComplete returns is discarded, so an exception from onAnswer
+            // would vanish without a trace. Surface it on the thread's handler instead.
+            val result =
+                when (claimed) {
+                    true -> PinchAnswer.CLAIMED
+                    false -> PinchAnswer.DECLINED
+                    null -> PinchAnswer.TIMED_OUT
                 }
+            runCatching { onAnswer(sequence, result) }.onFailure { e ->
+                Thread.currentThread().let { it.uncaughtExceptionHandler?.uncaughtException(it, e) }
             }
+        }
         send({ claimed -> answer.complete(claimed) }, { answer.isDone })
+    }
+
+    companion object {
+        private val defaultScheduler: ScheduledExecutorService by lazy {
+            Executors.newSingleThreadScheduledExecutor { runnable ->
+                Thread(runnable, "boss-pinch-offer-timeout").apply { isDaemon = true }
+            }
+        }
     }
 }
 
