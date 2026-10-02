@@ -6,11 +6,17 @@ import ai.rever.boss.services.supabase.CrossDeviceAuthenticationRequired
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogSanitizer
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import java.util.Base64
 import java.util.UUID
-import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.ExperimentalTime
 
+/**
+ * Unpack CancellationException from a Result failure and rethrow it so coroutine cancellation
+ * propagates through auth and registration flows instead of turning into Result.failure.
+ */
 private fun <T> Result<T>.propagateCancellation(): Result<T> {
     val failure = exceptionOrNull()
     if (failure is CancellationException) throw failure
@@ -46,6 +52,13 @@ internal object PasskeyAuthService {
     }
 
     /**
+     * Clear the platform-specific passkey service for test isolation.
+     */
+    internal fun resetForTest() {
+        passkeyService = null
+    }
+
+    /**
      * Get passkey state flow from the passkey service
      */
     fun getPasskeyState() = passkeyService?.passkeyState
@@ -61,10 +74,17 @@ internal object PasskeyAuthService {
      */
     suspend fun registerPasskey(): Result<String> {
         return try {
-            val currentUser = AuthStateManager.currentUser.value ?: return Result.failure(Exception("No user logged in"))
-            val passkeyService = passkeyService ?: return Result.failure(Exception("Passkey service not available"))
+            currentCoroutineContext().ensureActive()
+            val currentUser =
+                AuthStateManager.currentUser.value ?: return Result.failure(Exception("No user logged in"))
+            val passkeyService =
+                passkeyService ?: return Result.failure(Exception("Passkey service not available"))
 
-            logger.info(LogCategory.PASSKEY, "Starting passkey registration", mapOf("userId" to LogSanitizer.maskUserId(currentUser.id)))
+            logger.info(
+                LogCategory.PASSKEY,
+                "Starting passkey registration",
+                mapOf("userId" to LogSanitizer.maskUserId(currentUser.id)),
+            )
 
             val displayName =
                 currentUser.email.ifBlank {
@@ -74,11 +94,12 @@ internal object PasskeyAuthService {
             // Step 1: Request registration challenge from Supabase without forcing authenticator type
             // Let the browser/platform choose the best available method
             val challengeResult =
-                SupabasePasskeyService.requestRegistrationChallenge(
-                    userId = currentUser.id,
-                    displayName = displayName,
-                    authenticatorSelection = null, // Let browser decide
-                )
+                SupabasePasskeyService
+                    .requestRegistrationChallenge(
+                        userId = currentUser.id,
+                        displayName = displayName,
+                        authenticatorSelection = null, // Let browser decide
+                    ).propagateCancellation()
 
             if (challengeResult.isFailure) {
                 return Result.failure(challengeResult.exceptionOrNull() ?: Exception("Failed to get challenge"))
@@ -88,12 +109,13 @@ internal object PasskeyAuthService {
 
             // Step 2: Create passkey using platform service
             val registrationResult =
-                passkeyService.registerPasskey(
-                    userId = currentUser.id,
-                    displayName = displayName,
-                    challenge = Base64.getUrlDecoder().decode(challenge.challenge),
-                    rpId = challenge.rpId,
-                )
+                passkeyService
+                    .registerPasskey(
+                        userId = currentUser.id,
+                        displayName = displayName,
+                        challenge = Base64.getUrlDecoder().decode(challenge.challenge),
+                        rpId = challenge.rpId,
+                    ).propagateCancellation()
 
             if (registrationResult.isFailure) {
                 return Result.failure(registrationResult.exceptionOrNull() ?: Exception("Passkey registration failed"))
@@ -113,27 +135,28 @@ internal object PasskeyAuthService {
             }
 
             // Step 3: Complete registration with Supabase backend
+            logger.debug(LogCategory.PASSKEY, "Calling SupabasePasskeyService.completeRegistration")
             val completionResult =
-                try {
-                    logger.debug(LogCategory.PASSKEY, "Calling SupabasePasskeyService.completeRegistration")
-                    SupabasePasskeyService.completeRegistration(
+                SupabasePasskeyService
+                    .completeRegistration(
                         userId = currentUser.id,
                         registration = registration,
                         challenge = challenge.challenge,
-                    )
-                } catch (e: Exception) {
-                    logger.error(LogCategory.PASSKEY, "Exception in completeRegistration", error = e)
-                    throw e
-                }
+                    ).propagateCancellation()
 
             if (completionResult.isFailure) {
-                return Result.failure(completionResult.exceptionOrNull() ?: Exception("Failed to complete registration"))
+                return Result.failure(
+                    completionResult.exceptionOrNull() ?: Exception("Failed to complete registration"),
+                )
             }
 
             val credential = completionResult.getOrThrow()
             logger.info(LogCategory.PASSKEY, "Passkey registered successfully")
 
             Result.success(credential.credential_id)
+        } catch (e: CancellationException) {
+            // A cancelled registration attempt must propagate rather than converting into an error Result.
+            throw e
         } catch (e: Exception) {
             logger.error(LogCategory.PASSKEY, "Passkey registration failed", error = e)
             Result.failure(e)

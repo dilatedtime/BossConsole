@@ -28,9 +28,16 @@ import kotlinx.coroutines.launch
  */
 class PasskeyAuthViewModel internal constructor(
     parentScope: CoroutineScope = CoroutineScope(Dispatchers.Main),
-    private val passkeyAuthentication: suspend (email: String, credentialId: String?) -> Result<Unit> =
+    internal val passkeyAuthentication: suspend (email: String, credentialId: String?) -> Result<Unit> =
         AuthService::authenticateWithPasskey,
 ) {
+    internal constructor(
+        passkeyAuthentication: suspend (email: String, credentialId: String?) -> Result<Unit>,
+    ) : this(
+        parentScope = CoroutineScope(Dispatchers.Main),
+        passkeyAuthentication = passkeyAuthentication,
+    )
+
     constructor() : this(CoroutineScope(Dispatchers.Main))
 
     private val logger = BossLogger.forComponent("PasskeyAuthViewModel")

@@ -195,4 +195,57 @@ class PasskeyAuthViewModelSessionLifecycleTest {
                 Dispatchers.resetMain()
             }
         }
+
+    @Test
+    fun `a current attempt completes successfully and clears loading state`() =
+        runTest {
+            Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+            val viewModel = newViewModel()
+            try {
+                var successCount = 0
+                viewModel.authenticateWithEmailAndPasskey("user@example.com") { successCount++ }
+                advanceUntilIdle()
+
+                val attempt = pendingAttempts.removeFirst()
+                assertEquals("user@example.com", attempt.email)
+                assertNull(attempt.credentialId)
+                assertTrue(viewModel.isLoading.value)
+                assertNull(viewModel.errorMessage.value)
+
+                attempt.gate.complete(Result.success(Unit))
+                advanceUntilIdle()
+
+                assertEquals(1, successCount)
+                assertFalse(viewModel.isLoading.value)
+                assertNull(viewModel.errorMessage.value)
+            } finally {
+                viewModel.dispose()
+                Dispatchers.resetMain()
+            }
+        }
+
+    @Test
+    fun `a current attempt failure clears loading state and sets error message`() =
+        runTest {
+            Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+            val viewModel = newViewModel()
+            try {
+                var successCount = 0
+                viewModel.authenticateWithEmailAndPasskey("user@example.com") { successCount++ }
+                advanceUntilIdle()
+
+                val attempt = pendingAttempts.removeFirst()
+                assertTrue(viewModel.isLoading.value)
+
+                attempt.gate.complete(Result.failure(Exception("Biometric authentication failed")))
+                advanceUntilIdle()
+
+                assertEquals(0, successCount)
+                assertFalse(viewModel.isLoading.value)
+                assertEquals("Biometric authentication failed", viewModel.errorMessage.value)
+            } finally {
+                viewModel.dispose()
+                Dispatchers.resetMain()
+            }
+        }
 }

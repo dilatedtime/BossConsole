@@ -7,7 +7,9 @@ import ai.rever.boss.services.supabase.CrossDeviceAuthenticationRequired
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 
 /**
  * Handles cross-device authentication coordination and QR code flows
@@ -130,9 +132,14 @@ internal object CrossDeviceAuthService {
 
             if (pollingResult.isSuccess) {
                 val authData = pollingResult.getOrThrow()
+                // Guard against establishing a session if the attempt was cancelled while
+                // polling completed (#1686 item 4).
+                currentCoroutineContext().ensureActive()
                 return onAuthenticationComplete(authData)
             } else {
-                return Result.failure(pollingResult.exceptionOrNull() ?: Exception("Cross-device authentication failed"))
+                return Result.failure(
+                    pollingResult.exceptionOrNull() ?: Exception("Cross-device authentication failed"),
+                )
             }
         } catch (e: CancellationException) {
             throw e
