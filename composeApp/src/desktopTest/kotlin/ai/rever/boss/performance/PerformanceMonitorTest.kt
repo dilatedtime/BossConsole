@@ -3,6 +3,8 @@ package ai.rever.boss.performance
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.time.LocalDateTime
+import java.util.Locale
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -27,6 +29,27 @@ class PerformanceMonitorTest {
         // Clean up after each test
         PerformanceMonitor.stop()
         PerformanceMonitor.clearResourceProviders()
+    }
+
+    // ==================== EXPORT FILE NAME TESTS ====================
+
+    @Test
+    fun `export file name does not depend on the default locale`() {
+        val time = LocalDateTime.of(2026, 9, 19, 13, 53, 20)
+        val expected = "performance-export-20260919-135320.json"
+        val original = Locale.getDefault()
+        val originalFormat = Locale.getDefault(Locale.Category.FORMAT)
+        try {
+            for (tag in listOf("en-US", "th-TH-u-ca-buddhist", "ar-EG", "fa-IR")) {
+                val locale = Locale.forLanguageTag(tag)
+                Locale.setDefault(locale)
+                Locale.setDefault(Locale.Category.FORMAT, locale)
+                assertEquals(expected, PerformanceMonitor.exportFileName(time), "Locale $tag changed the file name")
+            }
+        } finally {
+            Locale.setDefault(original)
+            Locale.setDefault(Locale.Category.FORMAT, originalFormat)
+        }
     }
 
     // ==================== SETTINGS VALIDATION TESTS ====================
