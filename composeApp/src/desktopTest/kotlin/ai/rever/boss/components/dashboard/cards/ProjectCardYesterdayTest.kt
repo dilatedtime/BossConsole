@@ -116,4 +116,26 @@ class ProjectCardYesterdayTest {
 
         assertEquals("Nov 2", label)
     }
+
+    @Test
+    fun `future or clock-skewed timestamps format calendar date rather than just now`() {
+        val today = LocalDate.of(2026, 9, 19)
+        val now = at(today, 12, 0)
+        val fiveMinutesFuture = at(today, 12, 5)
+
+        val label = formatRelativeTime(fiveMinutesFuture, now, zone)
+
+        assertEquals("Sep 19", label)
+    }
+
+    @Test
+    fun `future timestamp on subsequent day formats future calendar date rather than just now`() {
+        val today = LocalDate.of(2026, 9, 19)
+        val now = at(today, 12, 0)
+        val tomorrow = at(today.plusDays(1), 12, 0)
+
+        val label = formatRelativeTime(tomorrow, now, zone)
+
+        assertEquals("Sep 20", label)
+    }
 }
