@@ -17,6 +17,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -1177,4 +1178,163 @@ class McpToolRegistryCoreTest {
             assertFalse(result.isError)
             assertEquals("MY_SPECIAL_PLAN", executionObjectInHandler)
         }
+
+    @Test
+    fun `prepareInvocation throwing unhandled exception returns isError and logs POLICY_DENIED in ledger`() {
+        runBlocking {
+            val toolDef = echoTool("faulty_prep_tool")
+            val faultyProvider =
+                object : McpToolProvider, McpToolPreparer {
+                    override val providerId = "faulty_prep_provider"
+
+                    override fun tools() = listOf(toolDef)
+
+                    override suspend fun prepareInvocation(
+                        toolName: String,
+                        args: McpToolArgs,
+                    ): McpPreparationResult? = error("store connection failed")
+                }
+
+            val ledger = McpOperationLedger(ledgerFile = null)
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = McpPolicyEngine(policyFile = null),
+                    ledger = ledger,
+                )
+            core.updateAccess(isAdmin = true, permissions = emptySet())
+            core.registerProvider(faultyProvider)
+
+            val result = core.invoke("faulty_prep_tool", "{}")
+
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("faulty_prep_tool"))
+            assertTrue(result.text.contains("preparation failed: store connection failed"))
+
+            val lastRecord = ledger.recentOperations.value.first()
+            assertEquals("faulty_prep_tool", lastRecord.toolName)
+            assertEquals(McpApprovalDisposition.POLICY_DENIED, lastRecord.approvalDisposition)
+            assertTrue(lastRecord.isError)
+            assertNotNull(lastRecord.errorSnippet)
+            assertTrue(lastRecord.errorSnippet?.contains("store connection failed") == true)
+            assertFalse(lastRecord.errorSnippet?.contains("Execution cancelled by caller") == true)
+        }
+    }
+
+    @Test
+    fun `prepareInvocation timing out returns isError and records TIMEOUT in ledger`() {
+        runBlocking {
+            val toolDef = echoTool("slow_prep_tool")
+            val slowProvider =
+                object : McpToolProvider, McpToolPreparer {
+                    override val providerId = "slow_prep_provider"
+
+                    override fun tools() = listOf(toolDef)
+
+                    override suspend fun prepareInvocation(
+                        toolName: String,
+                        args: McpToolArgs,
+                    ): McpPreparationResult? {
+                        delay(200)
+                        return null
+                    }
+                }
+
+            val ledger = McpOperationLedger(ledgerFile = null)
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = McpPolicyEngine(policyFile = null),
+                    ledger = ledger,
+                    invokeTimeoutMs = 50L,
+                )
+            core.updateAccess(isAdmin = true, permissions = emptySet())
+            core.registerProvider(slowProvider)
+
+            val result = core.invoke("slow_prep_tool", "{}")
+
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("timed out after 0s"))
+
+            val lastRecord = ledger.recentOperations.value.first()
+            assertEquals("slow_prep_tool", lastRecord.toolName)
+            assertEquals(McpApprovalDisposition.TIMEOUT, lastRecord.approvalDisposition)
+            assertTrue(lastRecord.isError)
+        }
+    }
+
+    @Test
+    fun `re-registering provider without preparer clears stale preparer from registry`() {
+        runBlocking {
+            var preparerInvoked = false
+            val toolDef = echoTool("transitional_prep_tool")
+            val preparerProvider =
+                object : McpToolProvider, McpToolPreparer {
+                    override val providerId = "transitional_provider"
+
+                    override fun tools() = listOf(toolDef)
+
+                    override suspend fun prepareInvocation(
+                        toolName: String,
+                        args: McpToolArgs,
+                    ): McpPreparationResult? {
+                        preparerInvoked = true
+                        return null
+                    }
+                }
+            val plainProvider =
+                object : McpToolProvider {
+                    override val providerId = "transitional_provider"
+
+                    override fun tools() = listOf(toolDef)
+                }
+
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = McpPolicyEngine(policyFile = null),
+                )
+            core.updateAccess(isAdmin = true, permissions = emptySet())
+            core.registerProvider(preparerProvider)
+
+            core.invoke("transitional_prep_tool", "{}")
+            assertTrue(preparerInvoked)
+
+            // Re-register with plain provider lacking McpToolPreparer
+            preparerInvoked = false
+            core.registerProvider(plainProvider)
+
+            val result = core.invoke("transitional_prep_tool", "{}")
+            assertFalse(result.isError)
+            assertFalse(preparerInvoked, "Stale preparer must have been removed from _preparers")
+        }
+    }
+
+    @Test
+    fun `snapshotProvider only implements McpToolPreparer when underlying provider is a preparer`() {
+        val core = McpToolRegistryCore(disabledFile = null)
+        val plainProvider =
+            object : McpToolProvider {
+                override val providerId = "plain_provider"
+
+                override fun tools() = listOf(echoTool("plain_tool"))
+            }
+        val preparerProvider =
+            object : McpToolProvider, McpToolPreparer {
+                override val providerId = "prep_provider"
+
+                override fun tools() = listOf(echoTool("prep_tool"))
+
+                override suspend fun prepareInvocation(
+                    toolName: String,
+                    args: McpToolArgs,
+                ): McpPreparationResult? = null
+            }
+
+        val plainSnapshot = core.snapshotProvider(plainProvider)
+        assertFalse(plainSnapshot is McpToolPreparer, "Plain provider snapshot must not implement McpToolPreparer")
+
+        val prepSnapshot = core.snapshotProvider(preparerProvider)
+        assertTrue(prepSnapshot is McpToolPreparer, "Preparer provider snapshot must implement McpToolPreparer")
+    }
 }

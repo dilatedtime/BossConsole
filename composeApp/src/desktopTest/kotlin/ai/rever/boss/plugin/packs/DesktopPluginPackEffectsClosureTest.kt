@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.packs
 
 import ai.rever.boss.components.plugin.DependencyInstallPlan
 import ai.rever.boss.components.plugin.MissingDependencyInstaller
+import ai.rever.boss.mcp.ApprovedArtifact
 import ai.rever.boss.plugin.repository.PluginInfo
 import ai.rever.boss.plugin.repository.PluginRepository
 import ai.rever.boss.plugin.repository.PluginSearchFilter
@@ -10,6 +11,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class DesktopPluginPackEffectsClosureTest {
@@ -157,4 +160,77 @@ class DesktopPluginPackEffectsClosureTest {
             assertEquals("1.0.0", rootArtifact.version)
             assertEquals("sha-root", rootArtifact.sha256)
         }
+
+    @Test
+    fun `verifyApprovedArtifactHash returns null when store sha256 matches expected hash`() {
+        runBlocking {
+            val repo =
+                FakeRepo(
+                    versions =
+                        mapOf(
+                            "p1" to listOf(plugin("p1", version = "1.0.0", sha256 = "sha-p1")),
+                        ),
+                )
+            val approved = listOf(ApprovedArtifact("p1", "1.0.0", "sha-p1"))
+            val result = verifyApprovedArtifactHash(repo, "p1", "1.0.0", approved)
+            assertNull(result)
+        }
+    }
+
+    @Test
+    fun `verifyApprovedArtifactHash returns failure on hash mismatch`() {
+        runBlocking {
+            val repo =
+                FakeRepo(
+                    versions =
+                        mapOf(
+                            "p1" to listOf(plugin("p1", version = "1.0.0", sha256 = "sha-wrong")),
+                        ),
+                )
+            val approved = listOf(ApprovedArtifact("p1", "1.0.0", "sha-p1"))
+            val result = verifyApprovedArtifactHash(repo, "p1", "1.0.0", approved)
+            assertNotNull(result)
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message
+            assertTrue(message?.contains("does not match approved hash") == true)
+        }
+    }
+
+    @Test
+    fun `verifyApprovedArtifactHash uses fallbackInfo only when version matches`() {
+        runBlocking {
+            val repo =
+                FakeRepo(
+                    plugins = mapOf("p1" to plugin("p1", version = "1.0.0", sha256 = "sha-p1")),
+                )
+            val approved = listOf(ApprovedArtifact("p1", "1.0.0", "sha-p1"))
+            val result = verifyApprovedArtifactHash(repo, "p1", "1.0.0", approved)
+            assertNull(result)
+        }
+    }
+
+    @Test
+    fun `verifyApprovedArtifactHash rejects fallbackInfo when fallback version does not match requested version`() {
+        runBlocking {
+            val repo =
+                FakeRepo(
+                    plugins = mapOf("p1" to plugin("p1", version = "2.0.0", sha256 = "sha-v2")),
+                )
+            val approved = listOf(ApprovedArtifact("p1", "1.0.0", "sha-v1"))
+            val result = verifyApprovedArtifactHash(repo, "p1", "1.0.0", approved)
+            assertNotNull(result)
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message
+            assertTrue(message?.contains("Store provides no SHA-256 hash for p1 version 1.0.0") == true)
+        }
+    }
+
+    @Test
+    fun `verifyApprovedArtifactHash skips check when approvedArtifacts has no hash for plugin`() {
+        runBlocking {
+            val approved = listOf(ApprovedArtifact("other", "1.0.0", "sha-other"))
+            val result = verifyApprovedArtifactHash(FakeRepo(), "p1", "1.0.0", approved)
+            assertNull(result)
+        }
+    }
 }

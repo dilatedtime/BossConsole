@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.packs
 
+import ai.rever.boss.mcp.ApprovedArtifact
 import ai.rever.boss.mcp.McpPolicyAction
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -158,5 +159,20 @@ class PluginPackPlannerTest {
 
         assertEquals(RuleStepKind.POLICY_UNREADABLE, plan.rules.single().kind)
         assertFalse(plan.satisfied, "a rule that cannot be written is not in effect")
+    }
+
+    @Test
+    fun `blank version artifact sha256 falls back to non-blank latestSha256`() {
+        val listing =
+            StoreListing.Published(
+                latest = "2.0.0",
+                versions = setOf("2.0.0"),
+                latestSha256 = "sha-latest",
+                versionArtifacts = mapOf("2.0.0" to ApprovedArtifact(id, "2.0.0", "")),
+            )
+        val step = pluginStep(PackPlugin(id, null, false), snapshot(store = mapOf(id to listing)))
+
+        assertEquals(PluginStepKind.INSTALL, step.kind)
+        assertEquals("sha-latest", step.targetSha256)
     }
 }
