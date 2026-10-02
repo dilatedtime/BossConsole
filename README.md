@@ -16,7 +16,7 @@ Bring your own agent - Claude Code, Codex, Gemini, or OpenCode - and give it a r
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue.svg)](https://github.com/risa-labs-inc/BossConsole-Releases/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[**⬇ Download**](#downloads) · [📊 Compare](#how-boss-compares) · [⚡ Browser benchmark](#browser-performance) · [🤖 Run an agent](#run-any-ai-coding-agent) · [🔐 Governance](#you-decide-what-your-agents-can-touch) · [🧰 Toolbox](#toolbox--an-app-store-inside-the-app) · [🖥️ BossTerm](#bossterm--a-terminal-you-can-share-to-any-device)
+[**⬇ Download**](#downloads) · [**🛠 Contributing**](CONTRIBUTING.md) · [📊 Compare](#how-boss-compares) · [⚡ Browser benchmark](#browser-performance) · [🤖 Run an agent](#run-any-ai-coding-agent) · [🔐 Governance](#you-decide-what-your-agents-can-touch) · [🧰 Toolbox](#toolbox--an-app-store-inside-the-app) · [🖥️ BossTerm](#bossterm--a-terminal-you-can-share-to-any-device)
 
 </div>
 
@@ -87,7 +87,7 @@ Absolute scores were depressed by heavy co-tenancy - **800–1300% ambient CPU**
 - [Case study: the DNA Origami Inventor](#case-study-the-dna-origami-inventor)
 - [Design System](#design-system)
 - [Development](#development)
-- [CLI](#cli) · [CI/CD](#cicd) · [Documentation](#documentation) · [Open source & ecosystem](#open-source--ecosystem)
+- [CLI & Agent Harness](#cli--agent-harness) · [CI/CD](#cicd) · [Documentation](#documentation) · [Open source & ecosystem](#open-source--ecosystem)
 
 ---
 
@@ -156,7 +156,7 @@ An agent with tools is only as safe as the controls around it. BOSS is a **gover
 
 - **Server-enforced RBAC.** Roles and permissions live in Postgres and are enforced server-side via row-level security (Supabase). Plugins declare the permissions they need; a plugin - and its tools - only appear for users whose role grants them. See the [RBAC Guide](docs/RBAC_GUIDE.md).
 - **A kill-switch for every tool.** Every `mcp__boss__*` tool an agent can call is listed in **Toolbox → MCP**, and you can toggle any of them off. The exposed set is `all tools − your disabled set − permission-denied`, persisted to `~/.boss/mcp-disabled-tools.json` and enforced on the live server. Disable a plugin and its tools vanish from every agent instantly.
-- **User-scoped secrets.** The [Secret Manager](#security--secrets) stores encrypted credentials that are row-level-scoped to you. Its **browser auto-fill** injects a username/password straight into a web page's form fields - the value goes to the page, never to the model. (A secret is handed to an agent only if you explicitly call the permission-gated `secret_get` tool, which you can also toggle off - and see the admin-bypass note below, since "permission-gated" means nothing for an admin user.)
+- **User-scoped secrets.** The [Secret Manager](#security--secrets) stores encrypted credentials that are row-level-scoped to you. Its **browser auto-fill** injects a username/password straight into a web page's form fields - the value goes to the page, never to the model. The same principle covers every governed tool through **secret references**: an agent writes `{{secret:<id>}}` where a credential belongs, you approve the call in a dialog that names the secret and the tool, and the host substitutes the real value on the way to the plugin - the transcript, the approval dialog and the operation ledger only ever hold the reference. Secret-bearing calls always ask, whatever the tool's own policy says. (A secret is handed to an agent *as text* only if you explicitly call the permission-gated `secret_get` tool, which you can toggle off without losing that capability - and see the admin-bypass note below, since "permission-gated" means nothing for an admin user.) Scope and non-goals are in [docs/MCP_SECRET_REFERENCES.md](docs/MCP_SECRET_REFERENCES.md).
 - **Signed plugins.** Plugins installed from the BOSS Plugin Store carry a store signature binding `pluginId | version | sha256`; a **tampered or invalid signature fails closed** at download and load time - a re-signed or swapped JAR won't load.
 - **Fault isolation.** Each plugin runs in a supervised scope with a watchdog and auto-restart, so a crashing or hung plugin can't take down the host.
 
@@ -265,6 +265,13 @@ Scoped deliberately: this covers the **Docker and Kubernetes plugins only**, bec
 | **[Admin Role Management](https://github.com/risa-labs-inc/boss-plugin-admin-role-management) / [Role Creation](https://github.com/risa-labs-inc/boss-plugin-role-creation)** | Manage roles and permissions; build custom roles (admin) |
 
 *…and more in [boss-plugins](https://github.com/risa-labs-inc/boss-plugins), including analytics, fluck-agent (chat about the current page), and hardware integrations.*
+
+### Community plugins (third-party, not audited)
+Not published by Risa Labs and not in the Toolbox store. Install from the plugin's own repo and read its stated limitations first.
+
+| Plugin | What it does |
+|--------|--------------|
+| **[Agent Guardrail](https://github.com/krish57-bit/boss-guardrail-plugin)** | Adds a `guardrail_run` MCP tool that pattern-matches agent shell commands for destructive shapes (`rm -rf`, `git push --force`, `curl \| bash`) and asks for approval in a BOSS dialog before running them. Only covers commands sent through that tool. Best-effort and bypassable, not a substitute for the per-tool MCP kill-switch |
 
 ---
 
@@ -410,9 +417,13 @@ boss status --json                 # Query running application status
 boss mcp list --filter browser     # Discover registered MCP tools
 boss mcp describe <tool>           # Fetch tool schema on demand
 boss mcp invoke <tool> --args ...  # Execute tool headlessly via authenticated IPC
+boss plugin init <name>            # Scaffold a new plugin Gradle project
+boss plugin validate <path>        # Validate plugin manifest and bytecode
+boss plugin link <path>            # Stage plugin into BOSS_HOME with hot-reload
 ```
 
 See [docs/CLI.md](docs/CLI.md) for full options, exit codes, stream guarantees, and agent integration recipes.
+See [docs/PLUGIN_LAUNCHPAD.md](docs/PLUGIN_LAUNCHPAD.md) for plugin authoring, templates, and hot-reload workflows.
 
 **Installation:** Toolbox / Tools → Install BOSS CLI (or via Homebrew / installers).
 
@@ -421,12 +432,14 @@ See [docs/CLI.md](docs/CLI.md) for full options, exit codes, stream guarantees, 
 ## Documentation
 
 - [Command Line Interface (CLI)](docs/CLI.md) - CLI Agent Harness, `boss status`, `boss mcp`, and agent scripting
+- [Plugin Launchpad](docs/PLUGIN_LAUNCHPAD.md) - Developer CLI (`boss plugin init`, `validate`, `link`) & hot-reload
 - [Core Subsystems](docs/SUBSYSTEMS.md) - Auth, UI, keyboard shortcuts, threading
 - [Design System](docs/DESIGN_SYSTEM.md) - "Operator's Console" tokens, themes, and the live styleguide
 - [BossEditor Module](docs/BOSSEDITOR.md) - LSP, PSI, editor features
 - [Application Features](docs/FEATURES.md) - Performance monitoring, dashboard, downloads
 - [Keyboard Shortcuts](docs/KEYBOARD_SHORTCUTS.md) - Detailed shortcuts reference
 - [RBAC Guide](docs/RBAC_GUIDE.md) - Role-based access control
+- [Secret references in MCP tool calls](docs/MCP_SECRET_REFERENCES.md) - `{{secret:<id>}}` at the governance boundary: guarantee, non-goals, invariants
 - [Plugin System](plugin-platform/README.md) - Host-side plugin platform / SDK
 - [Plugin Development & MCP](https://github.com/risa-labs-inc/boss-plugins/blob/main/PLUGIN_DEVELOPMENT.md) - Writing plugins, the manifest, RBAC, and exposing `mcp__boss__*` tools
 
@@ -453,6 +466,7 @@ BOSS is developed in the open, end to end - the host app, the plugin platform, t
 - **Security** - [secret-manager](https://github.com/risa-labs-inc/boss-plugin-secret-manager)
 - **Productivity** - [bookmarks](https://github.com/risa-labs-inc/boss-plugin-bookmarks) · [downloads](https://github.com/risa-labs-inc/boss-plugin-downloads) · [topofmind](https://github.com/risa-labs-inc/boss-plugin-topofmind)
 - **Admin** - [admin-role-management](https://github.com/risa-labs-inc/boss-plugin-admin-role-management) · [role-creation](https://github.com/risa-labs-inc/boss-plugin-role-creation)
+- **Community (third-party, not audited)** - [boss-guardrail-plugin](https://github.com/krish57-bit/boss-guardrail-plugin)
 
 **Releases** - [**BossConsole-Releases**](https://github.com/risa-labs-inc/BossConsole-Releases) hosts the pre-built installers for every platform.
 

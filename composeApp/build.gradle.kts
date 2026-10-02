@@ -73,6 +73,26 @@ abstract class JxBrowserVersionValueSource : ValueSource<String, JxBrowserVersio
     }
 }
 
+// Configuration-cache-compatible ValueSource for reading Plugin API version from TOML (single source of truth)
+abstract class PluginApiVersionValueSource : ValueSource<String, PluginApiVersionValueSource.Parameters> {
+    interface Parameters : ValueSourceParameters {
+        val tomlFile: RegularFileProperty
+    }
+
+    override fun obtain(): String {
+        val file = parameters.tomlFile.get().asFile
+        if (!file.exists()) {
+            throw GradleException("libs.versions.toml not found at ${file.absolutePath}")
+        }
+        val content = file.readText()
+        return Regex("""boss-plugin-api\s*=\s*"([^"]+)"""")
+            .find(content)
+            ?.groupValues
+            ?.get(1)
+            ?: throw GradleException("Could not find boss-plugin-api version in libs.versions.toml")
+    }
+}
+
 // Load version from properties file using configuration-cache-compatible providers
 val versionPropsFile = layout.projectDirectory.file("../version.properties")
 val versionPropsProvider =
@@ -159,6 +179,13 @@ val jxBrowserVersion =
     project.findProperty("jxBrowserVersion")?.toString()
         ?: jxBrowserVersionProvider.get()
 
+// Configuration-cache-compatible provider for Plugin API contract version from libs.versions.toml
+val pluginApiVersionProvider =
+    providers.of(PluginApiVersionValueSource::class.java) {
+        parameters.tomlFile.set(libsVersionsFile)
+    }
+val pluginApiVersion = pluginApiVersionProvider.get()
+
 // local.properties (git-ignored) as a lazy, configuration-cache-tracked input.
 // Absent file → absent provider; callers must getOrElse/orNull.
 val localPropertiesProvider: Provider<Properties> =
@@ -239,9 +266,10 @@ val generateVersionConstants =
         val minorProvider = propsProvider.map { it.getProperty("app.version.minor", "8") }
         val patchProvider = propsProvider.map { it.getProperty("app.version.patch", "0") }
         val prereleaseProvider = propsProvider.map { it.getProperty("app.prerelease.suffix", "") }
+        val pluginApiProvider = pluginApiVersionProvider
         val jxVersionProvider = jxBrowserVersionProvider
 
-        // Track libs.versions.toml as an input for JxBrowser version
+        // Track libs.versions.toml as an input for JxBrowser and Plugin API versions
         inputs.file(libsVersionsFile)
 
         inputs.file(versionPropsFile)
@@ -256,6 +284,7 @@ val generateVersionConstants =
             val minor = minorProvider.get()
             val patch = patchProvider.get()
             val prerelease = prereleaseProvider.get().takeIf { it.isNotBlank() }
+            val pluginApiVer = pluginApiProvider.get()
             val jxVersion = jxVersionProvider.get()
 
             // Generate PRERELEASE constant as nullable String
@@ -281,6 +310,9 @@ val generateVersionConstants =
                 |
                 |    /** JxBrowser version from gradle/libs.versions.toml */
                 |    const val JXBROWSER_VERSION = "$jxVersion"
+                |
+                |    /** Plugin API contract version from gradle/libs.versions.toml */
+                |    const val PLUGIN_API_VERSION = "$pluginApiVer"
                 |}
                 |
                     """.trimMargin(),
@@ -1032,6 +1064,7 @@ kotlin {
         }
 
         desktopTest.dependencies {
+            implementation(libs.grpc.netty) // Real pinned-TLS bridge integration fixtures.
             implementation(kotlin("test-junit5"))
             implementation(libs.junit.jupiter)
             // Test-only: supabase-kt's auth exceptions carry the HttpResponse that produced
@@ -1068,10 +1101,12 @@ kotlin {
                 implementation(project(":plugin-platform:plugin-api-ipc"))
             }
         }
-        // Without the IPC module (Windows ARM64) the drift test can't compile;
-        // drop it from the source set — every other platform still enforces it.
+        // Without the IPC module (Windows ARM64) the drift test and the Downloads
+        // consistency test can't compile; drop them from the source set - every other
+        // platform still enforces them.
         if (findProject(":plugin-platform:plugin-api-ipc") == null) {
             desktopTest.kotlin.exclude("**/SkipListDriftTest.kt")
+            desktopTest.kotlin.exclude("**/DownloadsDirectoryConsistencyTest.kt")
         }
         // Mirror of the desktopMain exclusions above: **/kernel/** and
         // **/plugin/remote/** aren't compiled on Windows ARM64 (no boss-ipc, no
@@ -1086,11 +1121,20 @@ kotlin {
                 // Not under either directory, but they assert on boss-ipc's IpcVersion, and
                 // that module is dropped from the dependency list above on this platform.
                 // Found by WindowsArm64SourceIsolationTest rather than by a build breaking.
+                "**/plugin/OopPluginDisableLifecycleTest.kt",
+                "**/plugin/OutOfProcessPluginSpawnerLifecycleTest.kt",
+                // Exercises the OOP spawner implementation, excluded from this platform.
+                "**/plugin/OutOfProcessSpawnerEpochFencingTest.kt",
                 "**/plugin/IpcCompatibilityTest.kt",
                 "**/plugin/PluginStoreSetupIpcGateTest.kt",
                 "**/plugin/PluginStateDeltaTest.kt",
                 // Its process registry and production ID helper belong to the excluded OOP runtime.
                 "**/plugin/PluginProcessIdTest.kt",
+                // The source-isolation guard rejects this test's IPC package import.
+                "**/run/DesktopRunnerTerminalServiceTest.kt",
+                // Same IpcEventBridge dependency - the capture seam it uses lives in
+                // the boss-ipc module dropped on this platform.
+                "**/git/GitRunInTerminalQuotingTest.kt",
             )
         }
     }
@@ -2274,6 +2318,35 @@ tasks.register<FixLinuxDesktopFileTask>("fixLinuxDesktopFile") {
     debDir.set(layout.buildDirectory.dir("compose/binaries/main/deb"))
 }
 
+// jpackage copies an older-SDK launcher even on a modern build runner. AppKit uses
+// that SDK opt-in for native toolbar glass, so normalize the packaged launcher after
+// all app-image mutations. Keep the deployment target and launcher code unchanged.
+tasks.register("prepareMacOSAppearance") {
+    group = "distribution"
+    description = "Enables native macOS toolbar styling in the packaged launcher"
+    val onMacHost = isMacOSHost
+    val signingDisabled = macOSSigningDisabledProvider
+    val developerId = macOSDeveloperId
+    val app = layout.buildDirectory.dir("compose/binaries/main/app/BOSS.app")
+    val script = rootProject.file("scripts/prepare-macos-appearance.py")
+    val entitlements = project.file("src/desktopMain/resources/BOSS.entitlements")
+    val injected = project.objects.newInstance<InjectedExecOps>()
+    onlyIf { onMacHost }
+    doLast {
+        injected.execOps.exec {
+            commandLine(
+                "python3",
+                script.absolutePath,
+                app.get().asFile.absolutePath,
+                "--identity",
+                if (signingDisabled.get()) "-" else developerId,
+                "--entitlements",
+                entitlements.absolutePath,
+            )
+        }
+    }
+}
+
 // Configure task dependencies for DMG packaging
 afterEvaluate {
     // Make run tasks depend on the extraction tasks
@@ -2305,7 +2378,7 @@ afterEvaluate {
         // signing is disabled, signPty4jBinaries skips itself via its own onlyIf
         // and the CLI extraction still runs.
         if (isMacOS) {
-            finalizedBy("signPty4jBinaries", "extractCLIToAppResources")
+            finalizedBy("signPty4jBinaries", "extractCLIToAppResources", "prepareMacOSAppearance")
             println(
                 "📝 createDistributable will be finalized by signPty4jBinaries (skips itself when signing is disabled) and extractCLIToAppResources",
             )
@@ -2336,10 +2409,14 @@ afterEvaluate {
         println("📝 extractCLIToAppResources will depend on generateVersionedCLIScripts")
     }
 
+    tasks.named("prepareMacOSAppearance") {
+        mustRunAfter("createDistributable", "stripForeignPlatformNatives", "signPty4jBinaries", "extractCLIToAppResources")
+    }
+
     // Ensure packageDmg runs after all signing/CLI tasks (ordering only, see above)
     tasks.findByName("packageDmg")?.apply {
         if (isMacOS) {
-            mustRunAfter("signPty4jBinaries", "extractCLIToAppResources")
+            mustRunAfter("signPty4jBinaries", "extractCLIToAppResources", "prepareMacOSAppearance")
             println("📝 packageDmg will run after PTY4J signing and CLI extraction")
         }
     }

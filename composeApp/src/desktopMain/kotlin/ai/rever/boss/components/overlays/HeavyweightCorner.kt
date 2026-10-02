@@ -4,7 +4,6 @@ import ai.rever.boss.plugin.browser.LocalAwtWindow
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.window.ApplyBossWindowIcon
-import ai.rever.boss.window.BossWindowIcon
 import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -19,12 +18,12 @@ import androidx.compose.ui.awt.ComposeDialog
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogWindow
-import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.WindowState
 import androidx.compose.ui.window.rememberWindowState
@@ -105,6 +104,7 @@ fun HeavyweightCorner(
 ) {
     val parent = LocalAwtWindow.current
     val density = LocalDensity.current.density
+    val layoutDirection = LocalLayoutDirection.current
     var measured by remember { mutableStateOf<DpSize?>(null) }
     val size = measured ?: initialSize
     val bounds = trackedContentPaneBounds(parent) ?: return
@@ -113,7 +113,10 @@ fun HeavyweightCorner(
     // `bounds` only changes identity on a real change (see [trackedContentPaneBounds]), and a fresh
     // array every recomposition would re-run the placement effect, and with it a native
     // setLocation, for nothing.
-    val region = remember(bounds, inset, regionInWindow) { resolveRegion(bounds, inset, regionInWindow) }
+    val region =
+        remember(bounds, inset, regionInWindow, layoutDirection) {
+            resolveRegion(bounds, inset, regionInWindow, layoutDirection)
+        }
     // The measurement ceiling is the REGION itself - the whole parent content pane - not the
     // first-frame [initialSize]. The ceiling is a hard clip, and toast text is arbitrary plugin
     // content: three wordy toasts can exceed a fixed height like 600dp, and because the window is
@@ -127,14 +130,16 @@ fun HeavyweightCorner(
     val state =
         rememberWindowState(
             size = size,
-            position = cornerPosition(region, size, alignment).let { WindowPosition(it.first.dp, it.second.dp) },
+            position =
+                cornerPosition(region, size, alignment, layoutDirection)
+                    .let { WindowPosition(it.first.dp, it.second.dp) },
         )
 
     // Assign window state from an effect, never during composition - writing it inline during
     // composition is what made the cursor overlay jitter.
-    LaunchedEffect(size, region, alignment) {
+    LaunchedEffect(size, region, alignment, layoutDirection) {
         state.size = size
-        val at = cornerPosition(region, size, alignment)
+        val at = cornerPosition(region, size, alignment, layoutDirection)
         state.position = WindowPosition(at.first.dp, at.second.dp)
     }
 
@@ -175,16 +180,11 @@ fun HeavyweightCorner(
         return
     }
 
-    Window(
+    OverlayWindow(
         onCloseRequest = {},
         state = state,
-        undecorated = true,
-        transparent = true,
-        alwaysOnTop = true,
         focusable = focusable,
-        resizable = false,
-        icon = BossWindowIcon.painter,
-    ) {
+    ) { window ->
         EnsureOverlayWindowTransparent(window, kind = "corner")
         ApplyBossWindowIcon(window)
         measuringContent()
@@ -268,9 +268,9 @@ private fun OwnedCornerDialog(
             }
             dialog.setSize(
                 state.size.width.value
-                    .toInt(),
+                    .roundToInt(),
                 state.size.height.value
-                    .toInt(),
+                    .roundToInt(),
             )
         },
     ) {

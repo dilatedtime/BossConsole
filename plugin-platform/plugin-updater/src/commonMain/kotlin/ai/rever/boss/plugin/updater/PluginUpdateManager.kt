@@ -75,6 +75,9 @@ interface UpdateListener {
  * - Rollback on failure
  * - Periodic background checks
  */
+// Distinct host-awareness gates (IPC/boss/api compatibility floors, downloaded-jar identity
+// vet), each with its own lifecycle and wiring point; no natural grouping.
+@Suppress("LongParameterList")
 class PluginUpdateManager(
     private val repositoryManager: PluginRepositoryManager,
     private val config: UpdateCheckerConfig = UpdateCheckerConfig(),
@@ -114,6 +117,30 @@ class PluginUpdateManager(
      * keeps the fail-open answer it has always had.
      */
     private val hostApiVersion: () -> String? = { "" },
+    /**
+     * Host-supplied identity vet for a downloaded update jar (BossConsole#927).
+     *
+     * Called between the download and the swap, with the id of the plugin being updated
+     * and the path of the jar the store served for it. Nothing binds a store row to the
+     * plugin id its jar declares - the store signature anchor covers the row's bytes, not
+     * the manifest inside them - and the swap force-unloads the running plugin BEFORE the
+     * new jar's manifest is ever read. A jar declaring a different id would then register
+     * whatever its own manifest says: a normal id leaves the updated plugin uninstalled
+     * for the session (ALREADY_LOADED makes the rollback a no-op), and an api-id jar
+     * reaches DynamicPluginManager.hotSwapApiLayer - a process-wide unload/swap/reload.
+     *
+     * A failed result rejects the jar while the original plugin is still installed: fail
+     * closed, no partial uninstall.
+     *
+     * REQUIRED, with no default - deliberately unlike [isIpcCompatible], [hostBossVersion]
+     * and [hostApiVersion], whose defaults keep a manager constructed without host
+     * awareness failing open the way it always has. A silently absent identity vet is a
+     * different class of hazard: an absent floor gate still leaves the loader's own
+     * version checks as a backstop, while an absent identity gate leaves the swap
+     * unvetted entirely. A construction site that forgets the vet must break the build,
+     * not ship without the gate.
+     */
+    private val verifyDownloadedJar: (pluginId: String, downloadedJarPath: String) -> Result<Unit>,
 ) {
     private val logger = BossLogger.forComponent("PluginUpdateManager")
 
@@ -484,6 +511,19 @@ class PluginUpdateManager(
 
         val downloadedPath = downloadResult.getOrThrow()
 
+        // Download-verify boundary (BossConsole#927): vet the jar's declared identity
+        // BEFORE the swap unloads anything, so a mismatched jar is refused while the
+        // running plugin is still installed. This is also the last point at which
+        // nothing destructive has begun - the Installing state below is where callers
+        // withdraw their Cancel.
+        val vetted = verifyDownloadedJar(pluginId, downloadedPath)
+        if (vetted.isFailure) {
+            val error = vetted.exceptionOrNull()?.message ?: "Downloaded update rejected"
+            _state.value = UpdateState.Failed(pluginId, error, vetted.exceptionOrNull())
+            listeners.forEach { it.onUpdateFailed(pluginId, error) }
+            return Result.failure(vetted.exceptionOrNull() ?: Exception(error))
+        }
+
         // Install
         _state.value = UpdateState.Installing(pluginId)
         listeners.forEach { it.onUpdateInstalling(pluginId) }
@@ -614,6 +654,17 @@ class PluginUpdateManager(
 
     /**
      * Check if version1 is newer than version2.
+     *
+     * Fails CLOSED when either side is unparseable: an unreadable version
+     * offers no update. This is the one comparator on the live update path
+     * (Toolbox -> PluginUpdateBridge -> this class).
+     *
+     * The repository-side counterpart, `PluginRepositoryManager.isNewerVersion`
+     * in plugin-repository, fails OPEN on an unparseable *installed* version:
+     * a plugin whose recorded version is already broken should not be stranded
+     * without updates. The two divergences are deliberate on each page; settling
+     * which behaviour is the right one is a change of its own, and until then
+     * this is the answer the user actually gets.
      */
     private fun isNewerVersion(
         version1: String,
