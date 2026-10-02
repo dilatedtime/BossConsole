@@ -272,8 +272,8 @@ object PluginPackPlanner {
         val wanted = step.plugin.version
         val target = wanted ?: listing.latest
         val targetSha =
-            listing.versionArtifacts[target]?.sha256
-                ?: if (target == listing.latest) listing.latestSha256 else null
+            listing.versionArtifacts[target]?.sha256?.takeIf { it.isNotBlank() }
+                ?: if (target == listing.latest) listing.latestSha256?.takeIf { it.isNotBlank() } else null
         val installed = step.installed
         return when {
             wanted != null && wanted !in listing.versions -> {

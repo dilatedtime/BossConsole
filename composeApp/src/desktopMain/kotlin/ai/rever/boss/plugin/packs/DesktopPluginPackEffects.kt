@@ -431,7 +431,7 @@ private suspend fun resolveArtifactForId(
 }
 
 @Suppress("ReturnCount")
-private suspend fun verifyApprovedArtifactHash(
+internal suspend fun verifyApprovedArtifactHash(
     repository: PluginRepository,
     pluginId: String,
     version: String,
@@ -442,10 +442,14 @@ private suspend fun verifyApprovedArtifactHash(
     val versions = runCatching { repository.getPluginVersions(pluginId).getOrNull() }.getOrNull().orEmpty()
     val versionInfo = versions.firstOrNull { it.version == version }
     val fallbackInfo = runCatching { repository.getPlugin(pluginId).getOrNull() }.getOrNull()
-    val storeSha = versionInfo?.sha256?.takeIf { it.isNotBlank() } ?: fallbackInfo?.sha256.orEmpty()
+    val storeSha =
+        versionInfo?.sha256?.takeIf { it.isNotBlank() }
+            ?: fallbackInfo?.takeIf { it.version == version }?.sha256.orEmpty()
     if (storeSha.isBlank()) {
         return Result.failure(
-            IllegalStateException("Store provides no SHA-256 hash for $pluginId; expected $expectedSha."),
+            IllegalStateException(
+                "Store provides no SHA-256 hash for $pluginId version $version; expected $expectedSha.",
+            ),
         )
     }
     if (!storeSha.equals(expectedSha, ignoreCase = true)) {
