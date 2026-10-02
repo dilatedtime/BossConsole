@@ -360,7 +360,7 @@ class McpOperationLedger(
             for (item in batch) {
                 when (item) {
                     is LedgerWork.FlushMarker -> {
-                        Unit
+                        continue
                     }
 
                     is LedgerWork.PendingRecord -> {
@@ -754,15 +754,24 @@ internal class McpLedgerStore(
     fun readEntries(): List<McpLedgerEntry> {
         val entries = mutableListOf<McpLedgerEntry>()
         for (file in existingFilesOldestFirst()) {
-            val lines =
-                try {
-                    file.readLines()
-                } catch (t: Exception) {
-                    throw McpLedgerReadException("Cannot read ledger file ${file.absolutePath}: ${t.message}", t)
+            try {
+                file.useLines { lines ->
+                    var index = 0
+                    for (line in lines) {
+                        index++
+                        if (line.isNotBlank()) {
+                            entries += McpLedgerEntry(file, index, decode(file, index, line))
+                        }
+                    }
                 }
-            lines.forEachIndexed { index, line ->
-                if (line.isBlank()) return@forEachIndexed
-                entries += McpLedgerEntry(file, index + 1, decode(file, index + 1, line))
+            } catch (t: McpLedgerReadException) {
+                throw t
+            } catch (t: Exception) {
+                val safeMsg =
+                    LogSanitizer.sanitizeExceptionMessage(
+                        t.message ?: t::class.simpleName ?: "unknown error",
+                    )
+                throw McpLedgerReadException("Cannot read ledger file ${file.absolutePath}: $safeMsg", t)
             }
         }
         return entries
@@ -773,8 +782,12 @@ internal class McpLedgerStore(
         try {
             json.decodeFromString<McpOperationRecord>(line)
         } catch (t: Exception) {
+            val safeMsg =
+                LogSanitizer.sanitizeExceptionMessage(
+                    t.message ?: t::class.simpleName ?: "unknown error",
+                )
             throw McpLedgerReadException(
-                "Malformed record in ${file.absolutePath} at line $lineNumber: ${t.message}",
+                "Malformed record in ${file.absolutePath} at line $lineNumber: $safeMsg",
                 t,
             )
         }
