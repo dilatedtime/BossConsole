@@ -50,6 +50,12 @@ data class McpOperationRecord(
      */
     val escalated: Boolean = false,
     /**
+     * The evaluation reason why the call was escalated when [escalated] is true (e.g. destructive
+     * command pattern or uninspectable argument depth/size). Null when unescalated.
+     * Absent from records written before this field existed, which decode with null.
+     */
+    val whyEscalated: String? = null,
+    /**
      * SHA-256 over [parentHash] and this record's [canonicalFormForHashing], so a record edited
      * after the fact no longer agrees with the chain that follows it.
      *
@@ -104,5 +110,8 @@ internal fun McpOperationRecord.canonicalFormForHashing(): String =
         // Written only when set, like secretRefs, so every record without it hashes as it did.
         if (escalated) {
             put("escalated", true)
+        }
+        if (whyEscalated != null) {
+            put("whyEscalated", whyEscalated)
         }
     }.toString()

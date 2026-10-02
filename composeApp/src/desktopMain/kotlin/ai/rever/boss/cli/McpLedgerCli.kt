@@ -507,6 +507,7 @@ internal object McpLedgerFormat {
                     }
                     if (record.escalated) {
                         append("\n    escalated: rated CRITICAL, so a saved allow did not cover it")
+                        record.whyEscalated?.let { append(" ($it)") }
                     }
                 }
             }
@@ -644,6 +645,7 @@ internal object McpLedgerFormat {
             put("errorSnippet", record.errorSnippet)
             put("secretRefs", buildJsonArray { record.secretRefs.forEach { add(it) } })
             put("escalated", record.escalated)
+            put("whyEscalated", record.whyEscalated)
             put("hash", record.hash)
             put("parentHash", record.parentHash)
             put("file", entry.file.name)

@@ -1040,7 +1040,8 @@ internal class McpToolRegistryCore(
         val savedPolicy = policyEngine.policyFor(canonicalName, tool.providerId, tool.definition.readOnly)
         // Stated rather than inferred from a policy change, so the prompt and the ledger row
         // read the same answer and a second rule that also moves the policy cannot pass as one.
-        val escalated = escalatesToAsk(canonicalName, args, savedPolicy)
+        val whyEscalated = checkEscalation(canonicalName, args, savedPolicy)
+        val escalated = whyEscalated != null
         val policy = if (escalated) McpPolicyAction.ASK else savedPolicy
         val startTime = System.nanoTime()
         // The secret pre-pass runs before the audit boundary below on purpose: nothing in it
@@ -1181,6 +1182,7 @@ internal class McpToolRegistryCore(
                         },
                     secretRefs = secrets.references.map { it.ledgerName },
                     escalated = escalated,
+                    whyEscalated = whyEscalated,
                 )
             }
         }
@@ -1395,14 +1397,17 @@ internal class McpToolRegistryCore(
      * its name and already weighed when the policy was saved. The ALLOW may be a tool rule or a
      * provider-wide "Trust This Plugin" rule; both are covered.
      */
-    private fun escalatesToAsk(
+    private fun checkEscalation(
         toolName: String,
         args: McpToolArgs,
         policy: McpPolicyAction,
-    ): Boolean =
-        policy == McpPolicyAction.ALLOW &&
-            DefaultMcpRiskEvaluator.isShellTool(toolName) &&
-            DefaultMcpRiskEvaluator().evaluateRisk(toolName, args).level >= McpRiskLevel.CRITICAL
+    ): String? {
+        if (policy != McpPolicyAction.ALLOW || !DefaultMcpRiskEvaluator.isShellTool(toolName)) {
+            return null
+        }
+        val assessment = DefaultMcpRiskEvaluator().evaluateRisk(toolName, args)
+        return if (assessment.level >= McpRiskLevel.CRITICAL) assessment.reason else null
+    }
 
     /**
      * An approval of an escalated call counts as once, whatever scope came back (#1624). The dialog

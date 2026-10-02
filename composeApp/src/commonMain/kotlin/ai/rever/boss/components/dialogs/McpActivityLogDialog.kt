@@ -196,6 +196,15 @@ private fun McpOperationRow(
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
         McpOperationHeaderRow(op, timeFormat, colors)
         McpOperationMetaRow(op, colors, persistenceState)
+        op.whyEscalated?.let { reason ->
+            Text(
+                text = "Escalated: $reason",
+                fontSize = 11.sp,
+                color = colors.alert,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         op.errorSnippet?.let { snippet ->
             Text(
                 text = snippet,
@@ -291,6 +300,14 @@ private fun McpOperationMetaRow(
             fontSize = 10.sp,
             color = colors.textSecondary,
         )
+        if (op.escalated) {
+            Text(
+                text = "escalated",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
+                color = colors.alert,
+            )
+        }
     }
 }
 

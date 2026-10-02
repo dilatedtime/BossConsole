@@ -65,10 +65,15 @@ class McpLedgerChainTest {
         val entry = storedRecords(file).single()
         val descriptor = McpOperationRecord.serializer().descriptor
         val fields = (0 until descriptor.elementsCount).map { descriptor.getElementName(it) }.toSet()
-        // secretRefs and escalated are emitted only when set, so a record without them keeps the
-        // pre-feature hash (see the two `preserve the pre-feature canonical hash` tests); coverage
-        // of those fields is asserted on a record that carries both.
-        val withRefs = entry.copy(secretRefs = listOf("id.password"), escalated = true)
+        // secretRefs, escalated and whyEscalated are emitted only when set, so a record without them
+        // keeps the pre-feature hash (see the two `preserve the pre-feature canonical hash` tests);
+        // coverage of those fields is asserted on a record that carries all of them.
+        val withRefs =
+            entry.copy(
+                secretRefs = listOf("id.password"),
+                escalated = true,
+                whyEscalated = "destructive command pattern",
+            )
         val canonical = Json.parseToJsonElement(withRefs.canonicalFormForHashing()) as JsonObject
         assertEquals(fields - setOf("hash", "parentHash"), canonical.keys)
     }
@@ -172,6 +177,10 @@ class McpLedgerChainTest {
             record.canonicalFormForHashing(),
         )
         assertTrue("\"escalated\":true" in record.copy(escalated = true).canonicalFormForHashing())
+        assertTrue(
+            "\"whyEscalated\":\"destructive command pattern\"" in
+                record.copy(escalated = true, whyEscalated = "destructive command pattern").canonicalFormForHashing(),
+        )
     }
 
     @Test

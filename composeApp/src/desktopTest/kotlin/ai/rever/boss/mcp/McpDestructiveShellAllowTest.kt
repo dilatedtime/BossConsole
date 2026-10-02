@@ -175,6 +175,10 @@ class McpDestructiveShellAllowTest {
             assertEquals(McpApprovalDisposition.APPROVED_ONCE, row.approvalDisposition)
             assertTrue(row.escalated, "the ledger row must say what the prompt said (#1655)")
             assertTrue(
+                row.whyEscalated?.contains("destructive") == true,
+                "the ledger row must carry whyEscalated explaining the CRITICAL rating",
+            )
+            assertTrue(
                 policyEngine.policyFor("some_other_tool", "p1", false) != McpPolicyAction.ALLOW,
                 "an escalated prompt must not be able to trust the whole plugin",
             )
@@ -190,11 +194,9 @@ class McpDestructiveShellAllowTest {
             assertFalse(request.escalated, "only a saved ALLOW that was overridden is an escalation")
             approvalBus.deny(request.id)
             assertTrue(pending.await().isError)
-            assertFalse(
-                ledger.recentOperations.value
-                    .first()
-                    .escalated,
-            )
+            val row = ledger.recentOperations.value.first()
+            assertFalse(row.escalated)
+            assertEquals(null, row.whyEscalated)
         }
 
     // #1655: YOLO mode answers the escalated prompt too, so without the flag this row read exactly
@@ -211,7 +213,12 @@ class McpDestructiveShellAllowTest {
             val (routine, destructive) = ledger.recentOperations.value.filter { it.toolName == "run_command" }
             assertEquals(McpApprovalDisposition.YOLO_ALLOWED, destructive.approvalDisposition)
             assertTrue(destructive.escalated, "the unattended destructive call must be distinguishable")
+            assertTrue(
+                destructive.whyEscalated?.contains("destructive") == true,
+                "the destructive call must record whyEscalated in the ledger",
+            )
             assertFalse(routine.escalated, "a routine call under the same rule is not")
+            assertEquals(null, routine.whyEscalated)
             assertEquals(2, handlerRuns)
         }
 
@@ -231,6 +238,7 @@ class McpDestructiveShellAllowTest {
             assertEquals(McpPolicyAction.ASK, row.policyApplied)
             assertEquals(McpApprovalDisposition.YOLO_ALLOWED, row.approvalDisposition)
             assertFalse(row.escalated, "no saved ALLOW was overridden, so this is not an escalation")
+            assertEquals(null, row.whyEscalated)
         }
 
     // Review on #1650: the deny half of "Always" is the durable answer that does hold on an
