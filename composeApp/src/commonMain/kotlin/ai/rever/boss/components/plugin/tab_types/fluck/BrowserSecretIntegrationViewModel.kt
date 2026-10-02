@@ -1,6 +1,7 @@
 package ai.rever.boss.components.plugin.tab_types.fluck
 
 import ai.rever.boss.services.supabase.SecretService
+import ai.rever.boss.services.supabase.models.PaginatedSecrets
 import ai.rever.boss.services.supabase.models.SecretEntry
 import ai.rever.boss.utils.WebsiteMatchingUtil
 import ai.rever.boss.utils.logging.BossLogger
@@ -33,7 +34,14 @@ import kotlinx.coroutines.launch
  *
  * Used by Issue #56 - Secret Access Integration with Fluck Browser
  */
-class BrowserSecretIntegrationViewModel {
+class BrowserSecretIntegrationViewModel(
+    parentScope: CoroutineScope = CoroutineScope(Dispatchers.Main),
+    private val fetchSecrets: suspend () -> Result<PaginatedSecrets> = {
+        SecretService.getUserSecretsWithShared(limit = 1000, offset = 0)
+    },
+) {
+    constructor() : this(CoroutineScope(Dispatchers.Main))
+
     private val logger = BossLogger.forComponent("BrowserSecretIntegrationViewModel")
 
     /**
@@ -42,10 +50,13 @@ class BrowserSecretIntegrationViewModel {
     var state by mutableStateOf(BrowserSecretState())
         private set
 
-    private val coroutineScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val job = SupervisorJob(parentScope.coroutineContext[Job])
+    private val coroutineScope = CoroutineScope(parentScope.coroutineContext + job)
 
     // Job tracking to prevent race conditions and request cancellations (Issue #352)
     private var loadJob: Job? = null
+    private var secretEventsJob: Job? = null
+    private var isDisposed: Boolean = false
 
     /**
      * Initialize and load all secrets for the user.
@@ -54,15 +65,19 @@ class BrowserSecretIntegrationViewModel {
      * Also starts observing secret change events for automatic synchronization.
      */
     fun initialize() {
+        if (isDisposed) return
+
         loadAllSecrets()
 
-        // Observe secret change events for automatic synchronization
-        coroutineScope.launch {
-            SecretChangeNotifier.secretChangeEvents.collect { event ->
-                // Reload secrets whenever they change in other components
-                loadAllSecrets()
+        // Cancel any previous collector before launching a new one to prevent duplicate collectors
+        secretEventsJob?.cancel()
+        secretEventsJob =
+            coroutineScope.launch {
+                SecretChangeNotifier.secretChangeEvents.collect { _ ->
+                    // Reload secrets whenever they change in other components
+                    loadAllSecrets()
+                }
             }
-        }
     }
 
     /**
@@ -70,7 +85,14 @@ class BrowserSecretIntegrationViewModel {
      * Should be called when the browser tab is closed.
      */
     fun dispose() {
+        isDisposed = true
+        secretEventsJob?.cancel()
+        secretEventsJob = null
+        loadJob?.cancel()
+        loadJob = null
+        job.cancel()
         coroutineScope.cancel()
+        state = state.copy(isLoadingSecrets = false)
     }
 
     /**
@@ -79,6 +101,8 @@ class BrowserSecretIntegrationViewModel {
      * Race condition fix (Issue #352): Cancels in-flight requests before starting new one
      */
     private fun loadAllSecrets() {
+        if (isDisposed) return
+
         // Cancel any in-flight load request
         loadJob?.cancel()
 
@@ -86,7 +110,7 @@ class BrowserSecretIntegrationViewModel {
 
         loadJob =
             coroutineScope.launch {
-                val result = SecretService.getUserSecretsWithShared(limit = 1000, offset = 0)
+                val result = fetchSecrets()
 
                 result.fold(
                     onSuccess = { paginatedSecrets ->
@@ -227,6 +251,7 @@ class BrowserSecretIntegrationViewModel {
      * Reload secrets after a new secret is created or modified.
      */
     suspend fun reloadSecrets() {
+        if (isDisposed) return
         loadAllSecrets()
     }
 
