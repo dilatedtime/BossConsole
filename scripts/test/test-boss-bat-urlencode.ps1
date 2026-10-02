@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
 Regression tests for the boss.bat :urlencode and :detect_and_route subroutines (#1057, #1059).
@@ -531,6 +531,33 @@ try {
         $fwdOut = Invoke-BossLine $quoteBat $fwdPayload
         Assert-True (-not (Test-Path $quoteMarker)) "a payload in a forwarded argument is data, not a command: boss $fwdPayload"
         Assert-True ($fwdOut -match 'FORWARDED:') "it reaches the stub rather than being refused (got: $($fwdOut.Trim()))"
+
+        # Forwarded commands refuse caret-escaped metacharacters (#1673).
+        # Unquoted &, |, >, <, ^ reaching boss.bat through bare %* would be
+        # re-parsed by cmd.exe if forwarded untouched.
+        foreach ($fwdMeta in @(
+            'status ^& echo side-effect^>quote-marker.txt',
+            'doctor ^> quote-marker.txt',
+            'mcp list ^| calc',
+            'completion bash ^< quote-marker.txt'
+        )) {
+            Remove-Item $quoteMarker -ErrorAction SilentlyContinue
+            $fwdMetaOut = Invoke-BossLine $quoteBat $fwdMeta
+            Assert-True (-not (Test-Path $quoteMarker)) "metacharacter runs nothing: boss $fwdMeta"
+            Assert-True ($fwdMetaOut -match 'Error: forwarded arguments cannot contain unquoted metacharacters') `
+                "boss $fwdMeta is refused with a reason (got: $($fwdMetaOut.Trim()))"
+        }
+
+        # Quoted metacharacters inside JSON or strings are preserved for forwarded commands (#1673)
+        foreach ($quotedMeta in @(
+            'mcp invoke search_workspace --args {"url":"https://example.com/api?a=1&b=2"}',
+            'mcp invoke search_workspace --query "cats & dogs"'
+        )) {
+            $quotedOut = Invoke-BossLine $quoteBat $quotedMeta
+            Assert-True ($quotedOut -match [regex]::Escape('FORWARDED:' + $quotedMeta)) `
+                "forwarded command preserves quoted metacharacters: boss $quotedMeta (got: $($quotedOut.Trim()))"
+        }
+
         # The first argument is read through %~1 whatever the command, and
         # plugin reads %~2 and %~3 before it forwards, so both stay strict.
         foreach ($payload in @(

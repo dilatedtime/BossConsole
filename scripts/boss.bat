@@ -246,9 +246,11 @@ REM quoted reads above. So a " may only open at the start or after a space, and
 REM only close at the end or before a space. Delayed expansion is on here only:
 REM the value is already in a variable, and !var! reads are never re-parsed.
 REM The first argument is always checked. status, doctor, mcp and completion
-REM hand the rest to BOSS.exe as a bare %*, which cmd re-reads exactly as the
-REM caller's line was read, and nothing reads it through %~N first - so their
-REM arguments may hold quotes, as `boss mcp invoke tool --args {"q":"x"}` does.
+REM hand the rest to BOSS.exe as a bare %*. While their arguments may hold
+REM quotes inside JSON (e.g. `boss mcp invoke tool --args {"q":"x"}`), cmd
+REM expands bare %* directly onto the command line, which re-parses caret-escaped
+REM metacharacters (^&, ^|, ^>, ^<, ^^) (#1673). Unquoted metacharacters are
+REM refused; inside quotes they are inert to cmd and permitted.
 REM plugin is not one of them: it reads %~2 and %~3 before it forwards.
 :check_arg_quotes
 setlocal EnableDelayedExpansion
@@ -272,37 +274,63 @@ for %%P in (4096 2048 1024 512 256 128 64 32 16 8 4 2 1) do if not "!s:~%%P,1!"=
     set "s=!s:~%%P!"
 )
 set /a "last=len-1"
+set caret=^^
 set q=^"
 set "open="
 set "prev= "
 set "bad="
+set "bad_meta="
 set "first="
-set "done="
-for /l %%i in (0,1,!last!) do if not defined bad if not defined done (
+set "is_fwd="
+for /l %%i in (0,1,!last!) do if not defined bad if not defined bad_meta (
     set "c=!rest:~%%i,1!"
-    if "!c!"=="!q!" (
-        if defined open (
-            set /a "n=%%i+1"
-            for %%n in (!n!) do set "next=!rest:~%%n,1!"
-            if defined next if not "!next!"==" " set "bad=1"
-            set "open="
+    if defined is_fwd (
+        if "!c!"=="!q!" (
+            if defined open (
+                set "open="
+            ) else (
+                set "open=1"
+            )
         ) else (
-            if not "!prev!"==" " set "bad=1"
-            set "open=1"
+            if not defined open (
+                if "!c!"=="&" set "bad_meta=1"
+                if "!c!"=="|" set "bad_meta=1"
+                if "!c!"==">" set "bad_meta=1"
+                if "!c!"=="<" set "bad_meta=1"
+                if "!c!"=="!caret!" set "bad_meta=1"
+            )
+        )
+    ) else (
+        if "!c!"=="!q!" (
+            if defined open (
+                set /a "n=%%i+1"
+                for %%n in (!n!) do set "next=!rest:~%%n,1!"
+                if defined next if not "!next!"==" " set "bad=1"
+                set "open="
+            ) else (
+                if not "!prev!"==" " set "bad=1"
+                set "open=1"
+            )
         )
     )
     if not defined first if not defined open if "!c!"==" " if not "!prev!"==" " (
         set "first=!rest:~0,%%i!"
         if "!first:~0,1!"=="!q!" set "first=!first:~1!"
         if "!first:~-1!"=="!q!" set "first=!first:~0,-1!"
-        for %%v in (status doctor mcp completion) do if /i "!first!"=="%%v" set "done=1"
+        for %%v in (status doctor mcp completion) do if /i "!first!"=="%%v" set "is_fwd=1"
     )
     set "prev=!c!"
 )
+if defined open set "bad=1"
 if defined bad (
     echo Error: an argument has a double quote inside it.
     echo Quote a whole argument, e.g. boss file "C:\My Files\a.txt". In a URL, write a quote as %%22.
     echo For a terminal command that needs a quote, run boss.ps1 instead.
+    endlocal & exit /b 1
+)
+if defined bad_meta (
+    echo Error: forwarded arguments cannot contain unquoted metacharacters.
+    echo Quote the argument or run boss.ps1 instead.
     endlocal & exit /b 1
 )
 endlocal & exit /b 0
