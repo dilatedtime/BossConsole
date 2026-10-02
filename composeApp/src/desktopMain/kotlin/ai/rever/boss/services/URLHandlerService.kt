@@ -99,13 +99,24 @@ actual object URLHandlerService {
             return
         }
 
-        if (!urlQueue.enqueueOrClaimForCaller(url, requiresConfirmation)) {
-            logger.debug(
-                LogCategory.BROWSER,
-                "App not ready, queueing URL",
-                mapOf("url" to LogSanitizer.maskUriParams(url)),
-            )
-            return
+        when (urlQueue.enqueueOrClaim(url, requiresConfirmation)) {
+            EnqueueResult.ENQUEUED -> {
+                logger.debug(
+                    LogCategory.BROWSER,
+                    "App not ready, queueing URL",
+                    mapOf("url" to LogSanitizer.maskUriParams(url)),
+                )
+                return
+            }
+            EnqueueResult.DROPPED -> {
+                logger.warn(
+                    LogCategory.BROWSER,
+                    "Cold-start URL queue full, dropping request",
+                    mapOf("url" to LogSanitizer.maskUriParams(url)),
+                )
+                return
+            }
+            EnqueueResult.CLAIMED -> Unit
         }
 
         handleURLInternal(url, requiresConfirmation)
@@ -315,26 +326,45 @@ internal data class QueuedUrlOpen(
     val requiresConfirmation: Boolean,
 )
 
+/** Outcome of attempting to enqueue or claim an incoming URL during cold start. */
+internal enum class EnqueueResult {
+    CLAIMED,
+    ENQUEUED,
+    DROPPED,
+}
+
 /** Atomically hands queued URLs to the ready caller without losing concurrent arrivals. */
-internal class UrlOpenReadinessQueue {
+internal class UrlOpenReadinessQueue(
+    private val maxQueued: Int = MAX_QUEUED,
+) {
     private val lock = Any()
     private val deferred = ArrayDeque<QueuedUrlOpen>()
     private var ready = false
 
+    val size: Int
+        get() = synchronized(lock) { deferred.size }
+
     fun hasQueuedURLs(): Boolean = synchronized(lock) { deferred.isNotEmpty() }
+
+    fun enqueueOrClaim(
+        url: String,
+        requiresConfirmation: Boolean,
+    ): EnqueueResult =
+        synchronized(lock) {
+            if (ready) {
+                EnqueueResult.CLAIMED
+            } else if (deferred.size >= maxQueued) {
+                EnqueueResult.DROPPED
+            } else {
+                deferred.addLast(QueuedUrlOpen(url, requiresConfirmation))
+                EnqueueResult.ENQUEUED
+            }
+        }
 
     fun enqueueOrClaimForCaller(
         url: String,
         requiresConfirmation: Boolean,
-    ): Boolean =
-        synchronized(lock) {
-            if (ready) {
-                true
-            } else {
-                deferred.addLast(QueuedUrlOpen(url, requiresConfirmation))
-                false
-            }
-        }
+    ): Boolean = enqueueOrClaim(url, requiresConfirmation) == EnqueueResult.CLAIMED
 
     fun markReadyAndClaimQueued(): List<QueuedUrlOpen> =
         synchronized(lock) {
@@ -343,4 +373,8 @@ internal class UrlOpenReadinessQueue {
                 while (deferred.isNotEmpty()) add(deferred.removeFirst())
             }
         }
+
+    companion object {
+        const val MAX_QUEUED = 32
+    }
 }
