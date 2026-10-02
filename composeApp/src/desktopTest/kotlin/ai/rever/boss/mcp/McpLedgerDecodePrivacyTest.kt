@@ -37,14 +37,18 @@ class McpLedgerDecodePrivacyTest {
         file.writeText(tornLine + "\n")
 
         val ledger = McpOperationLedger(ledgerFile = file)
-        val failure = assertFailsWith<McpLedgerReadException> {
-            ledger.readEntries()
-        }
+        val failure =
+            assertFailsWith<McpLedgerReadException> {
+                ledger.readEntries()
+            }
 
         val message = failure.message.orEmpty()
         assertTrue(message.contains("line 1"), "Exception message must report the line number: $message")
         assertTrue(message.contains(file.absolutePath), "Exception message must name the file: $message")
-        assertTrue(message.contains("decodeFailure="), "Exception message must include structured decodeFailure: $message")
+        assertTrue(
+            message.contains("decodeFailure="),
+            "Exception message must include structured decodeFailure: $message",
+        )
         assertFalse(message.contains(secretToken), "Exception message must never leak secret token: $message")
     }
 
