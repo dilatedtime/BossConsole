@@ -1,6 +1,7 @@
 package ai.rever.boss.focusmode
 
 import ai.rever.boss.plugin.pathutils.BossDirectories
+import ai.rever.boss.utils.SettingsBackupHelper
 import ai.rever.boss.utils.atomicWriteText
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
@@ -27,6 +28,7 @@ import java.io.File
 actual object FocusModeSettingsManager {
     private val logger = BossLogger.forComponent("FocusModeSettingsManager")
     private val settingsFile = BossDirectories.resolve("focus-mode-settings.json")
+    private val backupFile = SettingsBackupHelper.backupFileFor(settingsFile)
 
     // The encoder lives with decodeWithDefaults, because the two have to agree about
     // encodeDefaults: see FocusModeSettings.storageJson for what breaks when they do not.
@@ -61,40 +63,36 @@ actual object FocusModeSettingsManager {
      * If file doesn't exist, uses default settings.
      */
     private fun loadSettingsSync() {
-        try {
-            if (settingsFile.exists()) {
-                val content = settingsFile.readText()
-                // Merge against the platform defaults rather than plain-decoding: a file written
-                // before the per-edge switches existed has no opinion about them, and the class
-                // defaults would hide both sidebars on Windows with no way to reveal them.
-                val settings = FocusModeSettings.decodeWithDefaults(content, platformDefaults)
-                _currentSettings.value = settings
-                logger.debug(LogCategory.SYSTEM, "Loaded settings", mapOf("path" to settingsFile.absolutePath))
-            } else {
-                // First run - create default settings file
-                logger.debug(LogCategory.SYSTEM, "No settings file found, using defaults")
-                val defaultSettings = platformDefaults
-                _currentSettings.value = defaultSettings
-
-                // Save default settings to file
-                try {
-                    val content = json.encodeToString(FocusModeSettings.serializer(), defaultSettings)
-                    settingsFile.atomicWriteText(content)
-                    logger.debug(LogCategory.SYSTEM, "Created default settings file", mapOf("path" to settingsFile.absolutePath))
-                } catch (e: Exception) {
-                    logger.warn(LogCategory.SYSTEM, "Could not write default settings file", error = e)
-                }
-            }
-        } catch (e: SerializationException) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "Failed to decode settings, falling back to defaults",
-                decodeFailure(e),
+        val loaded =
+            SettingsBackupHelper.loadWithBackupRecovery(
+                primaryFile = settingsFile,
+                backupFile = backupFile,
+                logger = logger,
+                category = LogCategory.SYSTEM,
+                decode = { FocusModeSettings.decodeWithDefaults(it, platformDefaults) },
             )
-            _currentSettings.value = platformDefaults
-        } catch (e: Exception) {
-            logger.warn(LogCategory.SYSTEM, "Failed to load settings, falling back to defaults", error = e)
-            _currentSettings.value = platformDefaults
+        if (loaded != null) {
+            _currentSettings.value = loaded
+            logger.debug(LogCategory.SYSTEM, "Loaded settings", mapOf("path" to settingsFile.absolutePath))
+        } else {
+            // First run or recovery unavailable - create default settings file
+            logger.debug(LogCategory.SYSTEM, "No valid settings file found, using defaults")
+            val defaultSettings = platformDefaults
+            _currentSettings.value = defaultSettings
+
+            // Save default settings to file
+            try {
+                val content = json.encodeToString(FocusModeSettings.serializer(), defaultSettings)
+                settingsFile.atomicWriteText(content)
+                SettingsBackupHelper.updateBackup(backupFile, content, logger, LogCategory.SYSTEM)
+                logger.debug(
+                    LogCategory.SYSTEM,
+                    "Created default settings file",
+                    mapOf("path" to settingsFile.absolutePath),
+                )
+            } catch (e: Exception) {
+                logger.warn(LogCategory.SYSTEM, "Could not write default settings file", error = e)
+            }
         }
     }
 
@@ -116,6 +114,7 @@ actual object FocusModeSettingsManager {
                     // Encode inside the lock so the last writer persists the freshest state.
                     val content = json.encodeToString(FocusModeSettings.serializer(), _currentSettings.value)
                     settingsFile.atomicWriteText(content)
+                    SettingsBackupHelper.updateBackup(backupFile, content, logger, LogCategory.SYSTEM)
                     logger.debug(LogCategory.SYSTEM, "Settings saved", mapOf("path" to settingsFile.absolutePath))
                 } catch (e: Exception) {
                     logger.warn(LogCategory.SYSTEM, "Failed to save settings", error = e)

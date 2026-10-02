@@ -1,6 +1,7 @@
 package ai.rever.boss.performance
 
 import ai.rever.boss.plugin.pathutils.BossDirectories
+import ai.rever.boss.utils.SettingsBackupHelper
 import ai.rever.boss.utils.atomicWriteText
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
@@ -27,6 +28,7 @@ import java.io.File
 actual object PerformanceSettingsManager {
     private val logger = BossLogger.forComponent("PerformanceSettingsManager")
     private val settingsFile = BossDirectories.resolve("performance-settings.json")
+    private val backupFile = SettingsBackupHelper.backupFileFor(settingsFile)
     private val json =
         Json {
             prettyPrint = true
@@ -47,26 +49,15 @@ actual object PerformanceSettingsManager {
     }
 
     private fun loadSettingsSync() {
-        try {
-            if (settingsFile.exists()) {
-                val content = settingsFile.readText()
-                val settings = json.decodeFromString<PerformanceSettings>(content)
-                // Validate loaded settings to handle potentially corrupted files
-                _currentSettings.value = settings.validated()
-            } else {
-                _currentSettings.value = PerformanceSettings()
-            }
-        } catch (e: SerializationException) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "Failed to load performance settings - using defaults",
-                decodeFailure(e),
+        val loaded =
+            SettingsBackupHelper.loadWithBackupRecovery(
+                primaryFile = settingsFile,
+                backupFile = backupFile,
+                logger = logger,
+                category = LogCategory.SYSTEM,
+                decode = { json.decodeFromString<PerformanceSettings>(it).validated() },
             )
-            _currentSettings.value = PerformanceSettings()
-        } catch (e: Exception) {
-            logger.warn(LogCategory.SYSTEM, "Failed to load performance settings - using defaults", error = e)
-            _currentSettings.value = PerformanceSettings()
-        }
+        _currentSettings.value = loaded ?: PerformanceSettings()
     }
 
     internal fun reloadForTest() {
@@ -80,6 +71,7 @@ actual object PerformanceSettingsManager {
                     // Encode inside the lock so the last writer persists the freshest state.
                     val content = json.encodeToString(PerformanceSettings.serializer(), _currentSettings.value)
                     settingsFile.atomicWriteText(content)
+                    SettingsBackupHelper.updateBackup(backupFile, content, logger, LogCategory.SYSTEM)
                 } catch (e: Exception) {
                     // Settings save failed - not critical, will use in-memory settings
                     logger.warn(

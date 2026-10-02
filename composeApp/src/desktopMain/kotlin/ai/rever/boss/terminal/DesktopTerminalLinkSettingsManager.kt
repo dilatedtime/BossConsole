@@ -1,6 +1,7 @@
 package ai.rever.boss.terminal
 
 import ai.rever.boss.plugin.pathutils.BossDirectories
+import ai.rever.boss.utils.SettingsBackupHelper
 import ai.rever.boss.utils.atomicWriteText
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
@@ -31,6 +32,7 @@ import java.io.File
 actual object TerminalLinkSettingsManager {
     private val logger = BossLogger.forComponent("TerminalLinkSettingsManager")
     private val settingsFile = BossDirectories.resolve("terminal-link-settings.json")
+    private val backupFile = SettingsBackupHelper.backupFileFor(settingsFile)
     private val json =
         Json {
             prettyPrint = true
@@ -63,29 +65,25 @@ actual object TerminalLinkSettingsManager {
      */
     private suspend fun loadSettingsAsync() =
         withContext(Dispatchers.IO) {
-            try {
-                settingsFile.parentFile?.mkdirs()
-
-                if (settingsFile.exists()) {
-                    val content = settingsFile.readText()
-                    val settings = json.decodeFromString<TerminalLinkSettings>(content)
-                    _currentSettings.value = settings
-                    logger.debug(LogCategory.TERMINAL, "Loaded settings")
-                } else {
-                    // Create the default settings file under the same lock saveSettings uses, so a
-                    // load-time default write cannot race a concurrent toggle's save and lose it.
-                    saveMutex.withLock {
-                        val content = json.encodeToString(TerminalLinkSettings.serializer(), _currentSettings.value)
-                        settingsFile.atomicWriteText(content)
-                    }
-                    logger.debug(LogCategory.TERMINAL, "Created default settings file")
+            settingsFile.parentFile?.mkdirs()
+            val loaded =
+                SettingsBackupHelper.loadWithBackupRecovery(
+                    primaryFile = settingsFile,
+                    backupFile = backupFile,
+                    logger = logger,
+                    category = LogCategory.TERMINAL,
+                    decode = { json.decodeFromString<TerminalLinkSettings>(it) },
+                )
+            if (loaded != null) {
+                _currentSettings.value = loaded
+                logger.debug(LogCategory.TERMINAL, "Loaded settings")
+            } else {
+                saveMutex.withLock {
+                    val content = json.encodeToString(TerminalLinkSettings.serializer(), _currentSettings.value)
+                    settingsFile.atomicWriteText(content)
+                    SettingsBackupHelper.updateBackup(backupFile, content, logger, LogCategory.TERMINAL)
                 }
-            } catch (e: SerializationException) {
-                logger.warn(LogCategory.TERMINAL, "Error loading settings", decodeFailure(e))
-                // Keep default settings on error
-            } catch (e: Exception) {
-                logger.warn(LogCategory.TERMINAL, "Error loading settings", error = e)
-                // Keep default settings on error
+                logger.debug(LogCategory.TERMINAL, "Created default settings file")
             }
         }
 
@@ -101,6 +99,7 @@ actual object TerminalLinkSettingsManager {
                     // Encode inside the lock so the last writer persists the freshest state.
                     val content = json.encodeToString(TerminalLinkSettings.serializer(), _currentSettings.value)
                     settingsFile.atomicWriteText(content)
+                    SettingsBackupHelper.updateBackup(backupFile, content, logger, LogCategory.TERMINAL)
                     logger.debug(LogCategory.TERMINAL, "Settings saved")
                 } catch (e: Exception) {
                     logger.warn(LogCategory.TERMINAL, "Error saving settings", error = e)
