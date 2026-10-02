@@ -404,14 +404,22 @@ class McpPolicyEngine(
                 return@synchronized false
             }
             if (preserveDeny && policyFor(toolName, providerId) == McpPolicyAction.DENY) return@synchronized false
-            applyConfig(
-                key = toolName,
-                logKey = "tool",
-                updated = _config.value.copy(rules = _config.value.rules + (toolName to action)),
-                successMessage = "Updated tool policy: ${action.name}",
-                failureMessage = "Failed to persist MCP policy update",
-                faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },
-            )
+            val saved =
+                applyConfig(
+                    key = toolName,
+                    logKey = "tool",
+                    updated = _config.value.copy(rules = _config.value.rules + (toolName to action)),
+                    successMessage = "Updated tool policy: ${action.name}",
+                    failureMessage = "Failed to persist MCP policy update",
+                    faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },
+                )
+            if (saved) {
+                revocations[toolName] = revocationVersion(toolName) + 1
+                if (action != McpPolicyAction.ALLOW) {
+                    revokeSessionTrust(toolName, providerId)
+                }
+            }
+            saved
         }
 
     /**
@@ -446,14 +454,22 @@ class McpPolicyEngine(
             if (policyFor(toolName, providerId) == McpPolicyAction.DENY) {
                 return@synchronized McpProactivePolicyOutcome.Denied
             }
-            writeConfig(
-                key = toolName,
-                logKey = "tool",
-                updated = _config.value.copy(rules = _config.value.rules + (toolName to action)),
-                successMessage = "Updated tool policy: ${action.name}",
-                failureMessage = "Failed to persist MCP policy update",
-                faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },
-            )
+            val outcome =
+                writeConfig(
+                    key = toolName,
+                    logKey = "tool",
+                    updated = _config.value.copy(rules = _config.value.rules + (toolName to action)),
+                    successMessage = "Updated tool policy: ${action.name}",
+                    failureMessage = "Failed to persist MCP policy update",
+                    faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },
+                )
+            if (outcome == McpProactivePolicyOutcome.Saved) {
+                revocations[toolName] = revocationVersion(toolName) + 1
+                if (action != McpPolicyAction.ALLOW) {
+                    revokeSessionTrust(toolName, providerId)
+                }
+            }
+            outcome
         }
 
     /** Save a reviewed section in one durable write; concurrent edits invalidate the whole snapshot. */
@@ -536,14 +552,24 @@ class McpPolicyEngine(
             if (preserveDeny && isProviderOrToolDenied(providerId, toolName)) {
                 return@synchronized false
             }
-            applyConfig(
-                key = providerId,
-                logKey = "provider",
-                updated = _config.value.copy(providerRules = _config.value.providerRules + (providerId to action)),
-                successMessage = "Updated provider policy: ${action.name}",
-                failureMessage = "Failed to persist MCP provider policy update",
-                faultFor = { k, e -> McpPolicyFault.ProviderPolicyPersistFailed(k, e) },
-            )
+            val saved =
+                applyConfig(
+                    key = providerId,
+                    logKey = "provider",
+                    updated = _config.value.copy(providerRules = _config.value.providerRules + (providerId to action)),
+                    successMessage = "Updated provider policy: ${action.name}",
+                    failureMessage = "Failed to persist MCP provider policy update",
+                    faultFor = { k, e -> McpPolicyFault.ProviderPolicyPersistFailed(k, e) },
+                )
+            if (saved) {
+                providerRevocations[providerId] = (providerRevocations[providerId] ?: 0L) + 1
+                if (action != McpPolicyAction.ALLOW) {
+                    _sessionTrustedTools.update { trusted ->
+                        trusted.filterNot { it.providerId == providerId }.toSet()
+                    }
+                }
+            }
+            saved
         }
 
     /**
@@ -578,14 +604,24 @@ class McpPolicyEngine(
             if (action == McpPolicyAction.ALLOW && isProviderDenied(providerId)) {
                 return@synchronized McpProactivePolicyOutcome.Denied
             }
-            writeConfig(
-                key = providerId,
-                logKey = "provider",
-                updated = _config.value.copy(providerRules = _config.value.providerRules + (providerId to action)),
-                successMessage = "Updated provider policy: ${action.name}",
-                failureMessage = "Failed to persist MCP provider policy update",
-                faultFor = { k, e -> McpPolicyFault.ProviderPolicyPersistFailed(k, e) },
-            )
+            val outcome =
+                writeConfig(
+                    key = providerId,
+                    logKey = "provider",
+                    updated = _config.value.copy(providerRules = _config.value.providerRules + (providerId to action)),
+                    successMessage = "Updated provider policy: ${action.name}",
+                    failureMessage = "Failed to persist MCP provider policy update",
+                    faultFor = { k, e -> McpPolicyFault.ProviderPolicyPersistFailed(k, e) },
+                )
+            if (outcome == McpProactivePolicyOutcome.Saved) {
+                providerRevocations[providerId] = (providerRevocations[providerId] ?: 0L) + 1
+                if (action != McpPolicyAction.ALLOW) {
+                    _sessionTrustedTools.update { trusted ->
+                        trusted.filterNot { it.providerId == providerId }.toSet()
+                    }
+                }
+            }
+            outcome
         }
 
     /**
