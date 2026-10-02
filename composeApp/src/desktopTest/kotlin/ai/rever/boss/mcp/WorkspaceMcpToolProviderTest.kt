@@ -394,10 +394,19 @@ class WorkspaceMcpToolProviderTest {
                 WorkspaceSerializer.serialize(savedSpaceFixture("outside-space", "/work/outside")),
             )
             val escapeLink = File(workspaceDir, "escape-link.json")
-            Files.createSymbolicLink(escapeLink.toPath(), outsideSpaceFile.toPath())
+            val symlinkCreated =
+                try {
+                    Files.createSymbolicLink(escapeLink.toPath(), outsideSpaceFile.toPath())
+                    true
+                } catch (_: UnsupportedOperationException) {
+                    false
+                } catch (e: java.io.IOException) {
+                    if (!System.getProperty("os.name").startsWith("Windows")) throw e
+                    false
+                }
 
             val payloads =
-                listOf(
+                listOfNotNull(
                     // Any readable file on disk, by absolute path.
                     "/etc/passwd",
                     // A valid Space file that lives elsewhere.
@@ -405,7 +414,7 @@ class WorkspaceMcpToolProviderTest {
                     // `..` escaping the store from inside it.
                     File(workspaceDir, "../../etc/passwd").absolutePath.replace('\\', '/'),
                     // A symlink inside the store pointing out.
-                    escapeLink.absolutePath.replace('\\', '/'),
+                    if (symlinkCreated) escapeLink.absolutePath.replace('\\', '/') else null,
                     // A missing file outside the store: refused before the existence probe
                     // ("Workspace file not found"), because containment runs first.
                     "/no/such/store/missing-space.json",
@@ -489,8 +498,19 @@ class WorkspaceMcpToolProviderTest {
             val outside = Files.createTempDirectory("ws-containment-outside").toFile()
             tempDirs.add(outside)
             val link = File(workspaceDir, "link.json")
-            Files.createSymbolicLink(link.toPath(), outside.toPath())
-            assertNull(checkWorkspacePathContainment(link.absolutePath, store).canonicalPath)
+            val symlinkCreated =
+                try {
+                    Files.createSymbolicLink(link.toPath(), outside.toPath())
+                    true
+                } catch (_: UnsupportedOperationException) {
+                    false
+                } catch (e: java.io.IOException) {
+                    if (!System.getProperty("os.name").startsWith("Windows")) throw e
+                    false
+                }
+            if (symlinkCreated) {
+                assertNull(checkWorkspacePathContainment(link.absolutePath, store).canonicalPath)
+            }
         }
 
     @Test
