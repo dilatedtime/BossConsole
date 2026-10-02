@@ -166,6 +166,8 @@ fun ProjectCard(
  * calendar in the local zone instead of a 24-48h elapsed window (#1078): a file modified
  * at 23:00 two days back is the day before yesterday, not yesterday, and a file modified
  * at 23:59 last night is yesterday, not "Just now", at one minute past midnight.
+ * Future or clock-skewed timestamps (diff < 0) bypass elapsed buckets (#1041) and format
+ * with their calendar date rather than "Just now".
  */
 internal fun formatRelativeTime(
     timestamp: Long,
@@ -175,9 +177,9 @@ internal fun formatRelativeTime(
     val diff = now - timestamp
     val elapsedLabel =
         when {
-            diff < 60_000 -> "Just now"
-            diff < 3600_000 -> "${diff / 60_000}m ago"
-            diff < 86400_000 -> "${diff / 3600_000}h ago"
+            diff in 0 until 60_000 -> "Just now"
+            diff in 60_000 until 3600_000 -> "${diff / 60_000}m ago"
+            diff in 3600_000 until 86400_000 -> "${diff / 3600_000}h ago"
             else -> null
         }
 
