@@ -210,19 +210,25 @@ class DefaultMcpRiskEvaluator : McpRiskEvaluator {
     }
 
     /**
-     * `format` as the command itself: the first word of a command, or with a volume anywhere after
-     * it (`cmd /c format d:`, `cmd /c format /q /fs:ntfs e:` - switches may come first). It used to
-     * be matched as the text `format ` anywhere, which rated `docker ps --format json`,
-     * `clang-format -i x.c` and plain English typed into a terminal CRITICAL, so a saved "Always
-     * Allow" asked again for all of them (#1655). None of those carries a drive letter. A sentence
-     * that starts with the word still rates CRITICAL; that errs toward asking.
+     * `format` targeting a volume or block device: `format d:`, `format /q e:`, `format /dev/sda1`.
+     *
+     * It used to match the first word `format` unconditionally (`i == 0`), which rated plain
+     * English sentences typed into a terminal CRITICAL (e.g. `format the drive label as bold`,
+     * `format code with prettier`, `format date as ISO`), causing false CRITICAL ratings and
+     * ASK churn under a standing ALLOW (#1655). None of those carries a drive letter or device.
+     *
+     * A real filesystem format command always targets a volume (`d:`) or POSIX block device
+     * (`/dev/sda1`), possibly preceded or followed by format switches (`/fs:ntfs`, `/q`). Without
+     * a volume or device operand, `format` in DOS/Windows refuses to run (`Required parameter
+     * missing - Drive:`), and bare `format` does not exist as a Linux utility.
      *
      * [tokens] arrive lowercased ([evaluateShellCommand] lowercases the payload), which is what
-     * lets [VOLUME] and [FORMAT_COMMANDS] be written in lower case only.
+     * lets [VOLUME], [POSIX_DEVICE], and [FORMAT_COMMANDS] be written in lower case only.
      */
     private fun isFormatCommand(tokens: List<String>): Boolean =
         tokens.indices.any { i ->
-            tokens[i] in FORMAT_COMMANDS && (i == 0 || tokens.drop(i + 1).any { it.matches(VOLUME) })
+            tokens[i] in FORMAT_COMMANDS &&
+                tokens.drop(i + 1).any { it.matches(VOLUME) || it.matches(POSIX_DEVICE) }
         }
 
     /**
@@ -262,12 +268,24 @@ class DefaultMcpRiskEvaluator : McpRiskEvaluator {
         fun isShellTool(toolName: String): Boolean = toolName.removePrefix("mcp__boss__") in SHELL_TOOLS
 
         private val DESTRUCTIVE_WORDING =
-            listOf("rm -rf", "del /s", "mkfs", "git push --force", "git push -f", "dd if=", "chmod -r 777")
+            listOf(
+                "rm -rf",
+                "del /s",
+                "mkfs",
+                "git push --force",
+                "git push -f",
+                "dd if=",
+                "chmod -r 777",
+                "format-volume",
+            )
 
         private val FORMAT_COMMANDS = setOf("format", "format.com", "format.exe")
 
         /** A Windows volume operand: a drive letter and colon, optionally followed by a path. */
         private val VOLUME = Regex("""[a-z]:.*""")
+
+        /** A POSIX block device path under /dev/ (e.g. /dev/sda1, /dev/nvme0n1). */
+        private val POSIX_DEVICE = Regex("""/dev/.*""")
 
         private val WHITESPACE = Regex("""\s+""")
 
