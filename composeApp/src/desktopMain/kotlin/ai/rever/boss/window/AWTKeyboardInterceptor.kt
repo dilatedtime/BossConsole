@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap
  * checks if they match registered shortcuts, and dispatches actions through
  * MenuActionsHandler if matched.
  */
+@Suppress("LargeClass")
 object AWTKeyboardInterceptor {
     private var isInstalled = false
     private var dispatcher: KeyEventDispatcher? = null
@@ -42,6 +43,19 @@ object AWTKeyboardInterceptor {
      * Updated by Compose layer when the active tab type changes.
      */
     private val windowContextMap = ConcurrentHashMap<String, ShortcutContext>()
+
+    private val contextListener =
+        WindowShortcutContextRegistry.Listener { windowId, context ->
+            if (context != null) {
+                updateWindowContext(windowId, context)
+            } else {
+                clearWindowContext(windowId)
+            }
+        }
+
+    init {
+        WindowShortcutContextRegistry.addListener(contextListener)
+    }
 
     private val doubleShiftGesture = DoubleShiftGesture()
 
@@ -149,14 +163,10 @@ object AWTKeyboardInterceptor {
      * Update the active shortcut context for a window.
      * Called from the Compose layer when the active tab type changes.
      *
-     * NOT CALLED TODAY - no production caller sets a window context, so [windowContextMap] is
-     * always empty and [detectCurrentContext] answers purely from the AWT focus walk. That walk
-     * can only see a heavyweight component, i.e. JxBrowser's page surface, so BROWSER-context
-     * bindings resolve while the PAGE has focus and not while focus is in a browser's Compose
-     * chrome (address bar, tab strip, find bar). Wiring this up would fix that class, but it is
-     * window-scoped: with a browser in the main panel and focus in a SIDEBAR editor it would
-     * report BROWSER and hand Cmd+F and Cmd+R to the browser, which is why it stays unwired
-     * here. See the Cmd+L note in `KeymapPresets.standardBrowserBindings`.
+     * Driven by [WindowShortcutContextRegistry] based on the active tab of the active main window
+     * panel in [BossMainWindowPanel]. When a browser tab is active, [detectCurrentContext] resolves
+     * to [ShortcutContext.BROWSER], allowing BROWSER-context bindings like Cmd+L
+     * ([KeymapPresets.FLUCK_FOCUS_ADDRESS_BAR_ACTION]) to match even when focus is in Compose chrome.
      *
      * @param windowId The BOSS window ID
      * @param context The shortcut context of the currently active component
@@ -184,6 +194,7 @@ object AWTKeyboardInterceptor {
     fun install() {
         if (isInstalled) return
 
+        WindowShortcutContextRegistry.addListener(contextListener)
         dispatcher = KeyEventDispatcher { event -> processKeyEvent(event) }
 
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
@@ -292,7 +303,7 @@ object AWTKeyboardInterceptor {
         }
 
         // Try to match the key event against shortcuts
-        val match = findMatchingBinding(event)
+        val match = findMatchingBinding(event, windowId)
         val binding = match?.binding
 
         if (binding != null) {
@@ -584,15 +595,16 @@ object AWTKeyboardInterceptor {
      * consult it, so the caller built a matcher per keypress for nothing. The Compose-side
      * matcher is a different path (the Shortcuts tester and getMatchingBindings read it).
      */
-    private fun findMatchingBinding(event: KeyEvent): BindingMatch? {
+    internal fun findMatchingBinding(
+        event: KeyEvent,
+        windowId: String? = findWindowId(KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow),
+    ): BindingMatch? {
         // Canonicalised once: keyNameMatches folds both sides, so doing it per keystroke per
         // binding meant two lowercase() allocations for each of ~47 bindings per keypress.
         val eventKey = canonicalKeyName(getKeyName(event.keyCode))
         val settings = KeymapSettingsManager.currentSettings.value
 
         // Detect current context for filtering
-        val focusedWindow = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow
-        val windowId = findWindowId(focusedWindow)
         val currentContext = detectCurrentContext(windowId)
 
         // Collect all matching bindings with their context priority

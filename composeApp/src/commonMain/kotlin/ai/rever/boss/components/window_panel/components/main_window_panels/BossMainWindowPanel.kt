@@ -44,6 +44,7 @@ import ai.rever.boss.components.workspaces.createTabFromWorkspaceConfig
 import ai.rever.boss.components.workspaces.workspaceManager
 import ai.rever.boss.icons.FileIcons
 import ai.rever.boss.keymap.KeymapSettingsManager
+import ai.rever.boss.keymap.handler.KeymapHandler
 import ai.rever.boss.keymap.model.TabSwitchMode
 import ai.rever.boss.layout.BossChrome
 import ai.rever.boss.plugin.api.LocalIsPanelActive
@@ -88,6 +89,7 @@ import ai.rever.boss.window.TabBarVerticalWidthRange
 import ai.rever.boss.window.TabWidthMode
 import ai.rever.boss.window.WindowAppearanceSettingsManager
 import ai.rever.boss.window.WindowOperations
+import ai.rever.boss.window.WindowShortcutContextRegistry
 import ai.rever.boss.window.displayName
 import ai.rever.boss.window.selectProjectInWindow
 import androidx.compose.foundation.background
@@ -1407,6 +1409,31 @@ fun BossTabsComponent.BossMainPanelContent(modifier: Modifier) {
         ?: remember { mutableStateOf(Project("No Project", "", 0L)) }
 
     // Own the content tint once, outside plugin surfaces, just as BossTerm's root does.
+    val isPanelActive = LocalIsPanelActive.current
+    val inMainPanel = LocalInMainWindowPanel.current
+    val activeTab = tabsState.value.activeTab
+
+    DisposableEffect(this.windowId, activeTab?.typeId, isPanelActive, inMainPanel) {
+        var token: Any? = null
+        if (isPanelActive && inMainPanel && activeTab != null) {
+            val context = KeymapHandler.determineContext(activeTab.typeId.typeId)
+            token =
+                WindowShortcutContextRegistry.updateContext(
+                    this@BossMainPanelContent.windowId,
+                    this@BossMainPanelContent.componentId,
+                    context,
+                )
+        }
+        onDispose {
+            if (token != null) {
+                WindowShortcutContextRegistry.clearContext(
+                    this@BossMainPanelContent.windowId,
+                    token,
+                )
+            }
+        }
+    }
+
     val glass = ai.rever.boss.theme.LocalWindowGlass.current
     Box(modifier = modifier.background(if (glass.installed) BossTheme.colors.ink else Color.Transparent)) {
         val activeTab = tabsState.value.activeTab
@@ -1599,7 +1626,7 @@ class BossTabsComponent(
     val windowId: String,
 ) : ComponentContext by componentContext {
     // Unique ID for this component (used for TabUpdateRegistry)
-    private val componentId = "${windowId}_${System.identityHashCode(this)}"
+    internal val componentId = "${windowId}_${System.identityHashCode(this)}"
 
     /**
      * Mint a tab id no live tab already holds. [uniqueId]'s random suffix is what makes a
