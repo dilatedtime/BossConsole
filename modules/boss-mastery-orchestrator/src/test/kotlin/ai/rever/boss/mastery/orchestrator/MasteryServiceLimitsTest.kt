@@ -2,6 +2,7 @@ package ai.rever.boss.mastery.orchestrator
 
 import ai.rever.boss.ipc.proto.ExecuteMasteryRequest
 import ai.rever.boss.ipc.proto.MasteryDefinition
+import ai.rever.boss.ipc.proto.MasteryEdge
 import ai.rever.boss.ipc.proto.MasteryExecutionId
 import ai.rever.boss.ipc.proto.MasteryId
 import ai.rever.boss.ipc.proto.MasteryNode
@@ -194,6 +195,55 @@ class MasteryServiceLimitsTest {
                     .orEmpty()
                     .contains("5 retries"),
             )
+        }
+
+    @Test
+    fun `definitions exceeding shared executor budget limits are refused`() =
+        runTest {
+            val service = service()
+            // Exceeds shared MAX_NODES
+            val tooManyNodesDef = MasteryDefinition.newBuilder().setId("too-many-nodes")
+            repeat(MasteryExecutor.MAX_NODES + 1) {
+                tooManyNodesDef.addNodes(
+                    MasteryNode
+                        .newBuilder()
+                        .setId("node-$it")
+                        .setPluginId("plugin")
+                        .setAction("action"),
+                )
+            }
+            val nodeFailure =
+                assertFailsWith<StatusRuntimeException> {
+                    service.createMastery(tooManyNodesDef.build())
+                }
+            assertEquals(Status.Code.RESOURCE_EXHAUSTED, nodeFailure.status.code)
+
+            // Exceeds shared MAX_EDGES
+            val tooManyEdgesDef = MasteryDefinition.newBuilder().setId("too-many-edges")
+            tooManyEdgesDef.addNodes(
+                MasteryNode
+                    .newBuilder()
+                    .setId("first")
+                    .setPluginId("plugin")
+                    .setAction("action"),
+            )
+            tooManyEdgesDef.addNodes(
+                MasteryNode
+                    .newBuilder()
+                    .setId("second")
+                    .setPluginId("plugin")
+                    .setAction("action"),
+            )
+            repeat(MasteryExecutor.MAX_EDGES + 1) {
+                tooManyEdgesDef.addEdges(
+                    MasteryEdge.newBuilder().setFromNode("first").setToNode("second"),
+                )
+            }
+            val edgeFailure =
+                assertFailsWith<StatusRuntimeException> {
+                    service.createMastery(tooManyEdgesDef.build())
+                }
+            assertEquals(Status.Code.RESOURCE_EXHAUSTED, edgeFailure.status.code)
         }
 
     private fun service(

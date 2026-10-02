@@ -30,9 +30,11 @@ class MasteryExecutor(
      * Execute a mastery definition, streaming progress events.
      *
      * Persisted definitions are re-read at this seam as trusted data, so a structurally hostile
-     * document — an oversized graph, a blank, duplicate, or INPUT-reserved node id, a dangling
-     * edge endpoint, or a cycle — is refused with a [MasteryProgress.Failed] verdict before a
-     * single capability invocation.
+     * document - an oversized graph, a blank, duplicate, or INPUT-reserved node id, a dangling
+     * edge endpoint, or a cycle - is refused with a [MasteryProgress.Failed] verdict before a
+     * Note for consumers: streams for structurally invalid definitions emit a terminal
+     * [MasteryProgress.Failed] immediately without a preceding [MasteryProgress.Started],
+     * signaling that workflow execution was rejected before admission.
      *
      * @param mastery The mastery DAG to execute
      * @param input   Initial key-value input (available to nodes as "INPUT.key")
@@ -45,11 +47,12 @@ class MasteryExecutor(
         channelFlow {
             // Load-time re-validation: persisted definitions are re-read here as trusted data,
             // so a hostile document is refused before a single capability invocation.
-            val violation = structuralViolation(mastery)
-            if (violation != null) {
-                send(MasteryProgress.Failed(violation, mastery.id))
+            val preflight = preflight(mastery)
+            if (preflight is PreflightResult.Failure) {
+                send(MasteryProgress.Failed(preflight.reason, null))
                 return@channelFlow
             }
+            val levels = (preflight as PreflightResult.Success).levels
             val startTime = System.currentTimeMillis()
             send(MasteryProgress.Started(mastery.id, mastery.nodes.size))
 
@@ -60,10 +63,9 @@ class MasteryExecutor(
 
             try {
                 reserveOutput("INPUT", input, outputBudget)
-                val levels = topoLevels(mastery)
 
                 for (level in levels) {
-                    // All nodes in a level are independent — execute in parallel
+                    // All nodes in a level are independent - execute in parallel
                     val snapshot = nodeOutputs.toMap()
                     val levelResults: List<Pair<String, Map<String, String>>> =
                         coroutineScope {
@@ -106,17 +108,46 @@ class MasteryExecutor(
 
     /**
      * Structural re-validation at the load/execute seam. Persisted definitions are re-read as
-     * trusted data, so the executor refuses a hostile-but-schema-valid document — an oversized
+     * trusted data, so the executor refuses a hostile-but-schema-valid document - an oversized
      * graph, a blank, duplicate, or INPUT-reserved node id, a dangling edge endpoint, or a
-     * cycle — before emitting [MasteryProgress.Started]. Returns the refusal reason handed to
-     * [MasteryProgress.Failed], or null when the DAG is walkable.
+     * cycle - before emitting [MasteryProgress.Started].
+     *
+     * Size checks run before graph scans to reject oversized inputs immediately. Topological sort
+     * is performed once and reused during execution to avoid a redundant second sort pass.
+     *
+     * Returns [PreflightResult.Success] containing topologically sorted levels when valid,
+     * or [PreflightResult.Failure] with the diagnosis string.
      */
-    private fun structuralViolation(mastery: MasteryDefinition): String? {
-        val nodeIds = mutableSetOf<String>()
-        var duplicateId: String? = null
-        for (node in mastery.nodes) {
-            if (!nodeIds.add(node.id)) duplicateId = node.id
+    private fun preflight(mastery: MasteryDefinition): PreflightResult =
+        when {
+            mastery.nodes.size > MAX_NODES -> {
+                PreflightResult.Failure(
+                    "Definition exceeds the runtime budget of $MAX_NODES nodes (${mastery.nodes.size})",
+                )
+            }
+
+            mastery.edges.size > MAX_EDGES -> {
+                PreflightResult.Failure(
+                    "Definition exceeds the runtime budget of $MAX_EDGES edges (${mastery.edges.size})",
+                )
+            }
+
+            else -> {
+                validateAndSortDag(mastery)
+            }
         }
+
+    private fun validateAndSortDag(mastery: MasteryDefinition): PreflightResult {
+        val nodeIds = HashSet<String>(mastery.nodes.size)
+        var duplicateId: String? = null
+        val invalidNode =
+            mastery.nodes.firstOrNull { node ->
+                val invalid = node.id.isBlank() || node.id == INPUT_NODE_ID
+                if (!invalid && !nodeIds.add(node.id) && duplicateId == null) {
+                    duplicateId = node.id
+                }
+                invalid
+            }
         val danglingSource =
             mastery.edges
                 .firstOrNull { edge ->
@@ -124,49 +155,35 @@ class MasteryExecutor(
                 }?.fromNode
         val danglingTarget =
             mastery.edges.firstOrNull { edge -> edge.toNode !in nodeIds }?.toNode
+
         return when {
-            mastery.nodes.size > MAX_NODES -> {
-                "Definition exceeds the runtime budget of $MAX_NODES nodes (${mastery.nodes.size})"
-            }
-
-            mastery.edges.size > MAX_EDGES -> {
-                "Definition exceeds the runtime budget of $MAX_EDGES edges (${mastery.edges.size})"
-            }
-
-            mastery.nodes.any { it.id.isBlank() || it.id == INPUT_NODE_ID } -> {
-                "Node id is blank or claims the reserved '$INPUT_NODE_ID' id of the caller's input"
+            invalidNode != null -> {
+                PreflightResult.Failure(
+                    "Node id is blank or claims the reserved '$INPUT_NODE_ID' id of the caller's input",
+                )
             }
 
             duplicateId != null -> {
-                "Duplicate node id '$duplicateId'"
+                PreflightResult.Failure("Duplicate node id '$duplicateId'")
             }
 
             danglingSource != null -> {
-                "Edge source '$danglingSource' does not match any node"
+                PreflightResult.Failure("Edge source '$danglingSource' does not match any node")
             }
 
             danglingTarget != null -> {
-                "Edge target '$danglingTarget' does not match any node"
+                PreflightResult.Failure("Edge target '$danglingTarget' does not match any node")
             }
 
             else -> {
-                walkViolation(mastery)
+                try {
+                    PreflightResult.Success(topoLevels(mastery))
+                } catch (conflict: IllegalArgumentException) {
+                    PreflightResult.Failure(conflict.message ?: "Definition is not a walkable DAG")
+                }
             }
         }
     }
-
-    /**
-     * The final structural check: the definition must be a walkable DAG. [TopologicalSort]
-     * refuses cycles with an [IllegalArgumentException]; its message becomes the refusal
-     * reason handed to [MasteryProgress.Failed].
-     */
-    private fun walkViolation(mastery: MasteryDefinition): String? =
-        try {
-            topoLevels(mastery)
-            null
-        } catch (conflict: IllegalArgumentException) {
-            conflict.message ?: "Definition is not a walkable DAG"
-        }
 
     private suspend fun executeNode(
         node: MasteryNode,
@@ -301,13 +318,23 @@ class MasteryExecutor(
             }.associate { it.key to it.value }
     }
 
-    private companion object {
+    companion object {
         /** Runtime budget, mirroring the persistence-side definition caps. */
         const val MAX_NODES = 128
         const val MAX_EDGES = 512
 
         /** Reserved id of the virtual source node that carries the caller's input. */
         const val INPUT_NODE_ID = "INPUT"
+    }
+
+    private sealed interface PreflightResult {
+        data class Success(
+            val levels: List<List<MasteryNode>>,
+        ) : PreflightResult
+
+        data class Failure(
+            val reason: String,
+        ) : PreflightResult
     }
 
     private class NodeExecutionException(
@@ -353,6 +380,6 @@ sealed class MasteryProgress {
 
     data class Failed(
         val error: String,
-        val failedNodeId: String,
+        val failedNodeId: String? = null,
     ) : MasteryProgress()
 }

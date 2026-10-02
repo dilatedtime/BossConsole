@@ -6,12 +6,13 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
  * Adversarial load-seam coverage: persisted definitions are re-read as trusted data, so the
  * executor must refuse hostile-but-schema-valid documents with a [MasteryProgress.Failed]
- * verdict, a surviving stream, and zero capability invocations — instead of killing the stream
+ * verdict, a surviving stream, and zero capability invocations, instead of killing the stream
  * on an uncaught sort error or silently walking a forged DAG.
  */
 class MasteryExecutorPreflightTest {
@@ -44,7 +45,10 @@ class MasteryExecutorPreflightTest {
         val executor = MasteryExecutor(resolver)
         val events = executor.execute(mastery, mapOf("url" to "https://example.com")).toList()
         assertEquals(1, events.size, "expected a single Failed verdict, got: $events")
-        return assertIs<MasteryProgress.Failed>(events.single())
+        assertFalse(events.any { it is MasteryProgress.Started }, "must not emit Started before preflight rejection")
+        val failed = assertIs<MasteryProgress.Failed>(events.single())
+        assertNull(failed.failedNodeId, "preflight failures reject definition and have no node id")
+        return failed
     }
 
     @Test
@@ -65,7 +69,7 @@ class MasteryExecutorPreflightTest {
                 )
             val failed = refuse(resolver, mastery)
             assertTrue("Cycle" in failed.error, "expected a cycle diagnosis, was: ${failed.error}")
-            assertEquals("cycle-mastery", failed.failedNodeId)
+            assertNull(failed.failedNodeId, "cycle diagnosis should not report a failedNodeId")
             assertTrue(resolver.invocations.isEmpty())
         }
 
@@ -159,6 +163,18 @@ class MasteryExecutorPreflightTest {
                     oversizedEdges,
                 )
             assertTrue("512 edges" in refuse(resolver, chainedEdges).error)
+            assertTrue(resolver.invocations.isEmpty())
+        }
+
+    @Test
+    fun `oversized graph is refused by budget guard before duplicate or dangling scans`() =
+        runBlocking {
+            val resolver = RecordingResolver()
+            // 129 nodes with duplicate IDs: size check must fire before duplicate check
+            val oversizedDuplicateNodes = (1..129).map { MasteryNode("same-id", "plugin-a", "act") }
+            val failed = refuse(resolver, definition("oversized-dups", oversizedDuplicateNodes))
+            assertTrue("128 nodes" in failed.error, "size budget must take precedence, got: ${failed.error}")
+            assertFalse("Duplicate" in failed.error, "duplicate scan must not have run on oversized input")
             assertTrue(resolver.invocations.isEmpty())
         }
 }

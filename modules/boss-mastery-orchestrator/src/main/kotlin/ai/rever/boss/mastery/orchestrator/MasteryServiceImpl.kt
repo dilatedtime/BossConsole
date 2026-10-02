@@ -378,7 +378,7 @@ internal fun KProgress.toProto(executionId: String): PProgress {
                 MasteryFailed
                     .newBuilder()
                     .setErrorMessage(error)
-                    .setFailedNodeId(failedNodeId)
+                    .apply { failedNodeId?.let { setFailedNodeId(it) } }
                     .build(),
             )
         }
@@ -401,7 +401,10 @@ private fun validateDefinition(request: PMasteryDef) {
         "Mastery identifiers or summary fields exceed the size limit"
     }
     validateArgument(request.description.length <= 4096) { "Mastery description exceeds the size limit" }
-    if (request.serializedSize > 65_536 || request.nodesCount > 128 || request.edgesCount > 512) {
+    if (request.serializedSize > 65_536 ||
+        request.nodesCount > MasteryExecutor.MAX_NODES ||
+        request.edgesCount > MasteryExecutor.MAX_EDGES
+    ) {
         throw masteryLimit("Mastery definition exceeds service limits")
     }
     validateArgument(request.nodesList.all { it.maxRetries in 0..5 && it.timeoutMs in 0..300_000 }) {
