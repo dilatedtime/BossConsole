@@ -37,4 +37,13 @@ object LogSanitizer {
     fun sanitizeLogMessage(message: String?): String = delegate.sanitizeLogMessage(message)
 
     fun sanitizeStackTrace(stackTrace: String?): String = delegate.sanitizeStackTrace(stackTrace)
+
+    fun sanitizeFileName(fileName: String?): String? = delegate.sanitizeFileName(fileName)
+
+    @Suppress("MaxLineLength")
+    fun sanitizeStackTraceElement(element: StackTraceElement): StackTraceElement = delegate.sanitizeStackTraceElement(element)
+
+    fun sanitizeThrowable(throwable: Throwable?): Throwable? = delegate.sanitizeThrowable(throwable)
 }
+
+typealias SanitizedThrowable = ai.rever.boss.plugin.logging.SanitizedThrowable

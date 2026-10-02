@@ -680,4 +680,52 @@ class LogSanitizerTest {
         assertEquals("[no stack trace]", LogSanitizer.sanitizeStackTrace(null))
         assertEquals("[no stack trace]", LogSanitizer.sanitizeStackTrace(""))
     }
+
+    // =========================================================================
+    // sanitizeFileName, sanitizeStackTraceElement, and sanitizeThrowable Tests
+    // =========================================================================
+
+    @Test
+    fun `sanitizeFileName strips directories from filenames`() {
+        assertEquals("File.kt", LogSanitizer.sanitizeFileName("/path/to/File.kt"))
+        assertEquals("File.kt", LogSanitizer.sanitizeFileName("""C:\path\to\File.kt"""))
+        assertEquals("File.kt", LogSanitizer.sanitizeFileName("File.kt"))
+        assertEquals("", LogSanitizer.sanitizeFileName(""))
+        assertEquals(null, LogSanitizer.sanitizeFileName(null))
+    }
+
+    @Test
+    fun `sanitizeStackTraceElement strips directory paths from frame filename`() {
+        val frame =
+            StackTraceElement(
+                "ai.rever.boss.TestClass",
+                "testMethod",
+                "/Users/developer/sources/TestClass.kt",
+                25,
+            )
+        val sanitized = LogSanitizer.sanitizeStackTraceElement(frame)
+        assertEquals("TestClass.kt", sanitized.fileName)
+        assertEquals("ai.rever.boss.TestClass", sanitized.className)
+        assertEquals("testMethod", sanitized.methodName)
+        assertEquals(25, sanitized.lineNumber)
+    }
+
+    @Test
+    fun `sanitizeThrowable strips paths from all frame filenames`() {
+        val error = RuntimeException("Crash at /private/path/file.txt")
+        error.stackTrace =
+            arrayOf(
+                StackTraceElement(
+                    "ai.rever.boss.Worker",
+                    "run",
+                    "/private/path/Worker.kt",
+                    100,
+                ),
+            )
+
+        val sanitized = LogSanitizer.sanitizeThrowable(error)
+        assertTrue(sanitized is SanitizedThrowable)
+        assertEquals("Worker.kt", sanitized.stackTrace[0].fileName)
+        assertFalse(sanitized.message.orEmpty().contains("/private/path/file.txt"))
+    }
 }

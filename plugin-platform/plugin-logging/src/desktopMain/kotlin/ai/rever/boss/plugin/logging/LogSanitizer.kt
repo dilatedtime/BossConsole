@@ -788,4 +788,96 @@ object LogSanitizer {
             "[sanitization-error]"
         }
     }
+
+    /**
+     * Sanitize a source filename from a stack trace frame.
+     *
+     * Strips directory paths (both Unix and Windows) down to the simple basename,
+     * and redacts locations and credentials from the basename.
+     */
+    fun sanitizeFileName(fileName: String?): String? {
+        if (fileName.isNullOrBlank()) return fileName
+
+        return try {
+            val base = fileName.substringAfterLast('/').substringAfterLast('\\').trim()
+            if (base.isEmpty()) {
+                "[PATH]"
+            } else {
+                redactLocationsAndCredentials(base)
+            }
+        } catch (_: Exception) {
+            "[PATH]"
+        }
+    }
+
+    /**
+     * Sanitize a single StackTraceElement by redacting file paths in the filename
+     * and redacting locations/credentials in the declaring class and method name.
+     */
+    fun sanitizeStackTraceElement(element: StackTraceElement): StackTraceElement {
+        val sanitizedFile = sanitizeFileName(element.fileName)
+        val sanitizedClass = redactLocationsAndCredentials(element.className)
+        val sanitizedMethod = redactLocationsAndCredentials(element.methodName)
+        return StackTraceElement(
+            sanitizedClass,
+            sanitizedMethod,
+            sanitizedFile,
+            element.lineNumber,
+        )
+    }
+
+    /**
+     * Sanitize a throwable by redacting stack-frame filenames, exception messages,
+     * nested causes, and suppressed exceptions.
+     *
+     * Cycle detection guards against self-referencing causes or suppressed exceptions.
+     */
+    fun sanitizeThrowable(throwable: Throwable?): Throwable? {
+        if (throwable == null) return null
+        val seen = mutableSetOf<Int>()
+        return sanitizeThrowableInternal(throwable, seen)
+    }
+
+    private fun sanitizeThrowableInternal(
+        throwable: Throwable,
+        seen: MutableSet<Int>,
+    ): Throwable {
+        val identity = System.identityHashCode(throwable)
+        val className = throwable::class.qualifiedName ?: throwable.javaClass.name
+        if (!seen.add(identity)) {
+            val circular = SanitizedThrowable(className, "[circular reference]")
+            circular.stackTrace = emptyArray()
+            return circular
+        }
+
+        val sanitizedMessage = throwable.message?.let { sanitizeExceptionMessage(it) }
+        val sanitizedCause = throwable.cause?.let { sanitizeThrowableInternal(it, seen) }
+        val sanitized = SanitizedThrowable(className, sanitizedMessage, sanitizedCause)
+
+        val frames = throwable.stackTrace
+        if (frames != null) {
+            sanitized.stackTrace = frames.map { sanitizeStackTraceElement(it) }.toTypedArray()
+        }
+
+        for (suppressed in throwable.suppressed) {
+            sanitized.addSuppressed(sanitizeThrowableInternal(suppressed, seen))
+        }
+
+        return sanitized
+    }
+}
+
+/**
+ * A sanitized throwable representation preserving the original exception class name
+ * and sanitized message, with stack trace frame filenames sanitized.
+ */
+class SanitizedThrowable(
+    val originalClassName: String,
+    message: String?,
+    cause: Throwable? = null,
+) : Throwable(message, cause) {
+    override fun toString(): String {
+        val msg = localizedMessage
+        return if (msg != null) "$originalClassName: $msg" else originalClassName
+    }
 }
