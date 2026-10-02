@@ -4,6 +4,7 @@ package ai.rever.boss.utils
 
 import ai.rever.boss.health.WorkspaceHealthCollector
 import ai.rever.boss.health.toJson
+import ai.rever.boss.mcp.mcpJsonNestingExceeds
 import ai.rever.boss.plugin.api.McpToolResult
 import ai.rever.boss.plugin.pathutils.BossDirectories
 import ai.rever.boss.utils.logging.BossLogger
@@ -1431,6 +1432,13 @@ private fun buildMcpInvokeResponse(
 ): String {
     if (toolName.isBlank()) {
         return RESPONSE_ERROR_PREFIX + "Tool name must not be blank"
+    }
+
+    if (mcpJsonNestingExceeds(argsJson)) {
+        return encodeMcpResult(
+            toolName,
+            McpToolResult("Arguments exceed maximum supported nesting depth", isError = true),
+        )
     }
 
     try {
