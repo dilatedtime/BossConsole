@@ -262,6 +262,38 @@ class WorkspaceServiceImplTest {
             assertFalse(service.getCurrentWorkspace(Empty.getDefaultInstance()).found)
         }
 
+    @Test
+    fun corruptedWorkspaceFilesAreSkippedDuringStartupWithoutAffectingValidWorkspaces() {
+        runBlocking {
+            val root = temporary.newFolder("workspaces-corrupt")
+            val corrupt = root.resolve("corrupt-id.json")
+            val secretCanary = "secret-project-path-canary-12345"
+            corrupt.writeText("""{"id":"corrupt-id","projectPath":"$secretCanary","layout":""")
+
+            val valid = root.resolve("valid-id.json")
+            valid.writeText(
+                """
+                {
+                  "id": "valid-id",
+                  "name": "Valid Space",
+                  "projectPath": "/projects/valid",
+                  "description": "A valid workspace",
+                  "createdAt": 1000,
+                  "lastOpenedAt": 2000,
+                  "tabCount": 2,
+                  "metadata": {}
+                }
+                """.trimIndent(),
+            )
+
+            val service = WorkspaceServiceImpl(root)
+            val workspaces = service.getWorkspaces(Empty.getDefaultInstance())
+            assertEquals(1, workspaces.workspacesCount)
+            assertEquals("valid-id", workspaces.getWorkspaces(0).id)
+            assertEquals("Valid Space", workspaces.getWorkspaces(0).name)
+        }
+    }
+
     private inline fun assertStatus(
         code: Status.Code,
         action: () -> Unit,

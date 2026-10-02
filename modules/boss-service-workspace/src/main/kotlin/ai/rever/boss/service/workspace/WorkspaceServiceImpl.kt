@@ -12,6 +12,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -127,6 +128,9 @@ class WorkspaceServiceImpl(
                     require(file.name == "${pw.id}.json") { "Workspace filename does not match its ID" }
                     workspaces[pw.id] = pw.toProto()
                     logger.debug("Loaded workspace from disk: id={}", pw.id)
+                } catch (e: SerializationException) {
+                    val errorType = e::class.simpleName ?: "SerializationException"
+                    logger.warn("Failed to load workspace file {}: decode failure ({})", file.name, errorType)
                 } catch (e: Exception) {
                     logger.warn("Failed to load workspace file {}: {}", file.name, e.message)
                 }

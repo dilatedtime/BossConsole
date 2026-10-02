@@ -10,13 +10,16 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermission
 import java.util.concurrent.ConcurrentHashMap
 
@@ -85,6 +88,9 @@ class SettingsServiceImpl(
                         .build()
             }
             logger.info("Loaded {} setting(s) from disk", settings.size)
+        } catch (e: SerializationException) {
+            val errorType = e::class.simpleName ?: "SerializationException"
+            logger.warn("Failed to load settings from disk: decode failure ({})", errorType)
         } catch (e: Exception) {
             logger.warn("Failed to load settings from disk: {}", e.message)
         }
@@ -111,6 +117,7 @@ class SettingsServiceImpl(
             try {
                 applyPosixOwnerPermissions(tmp.toPath())
                 tmp.writeText(encoded)
+                FileChannel.open(tmp.toPath(), StandardOpenOption.WRITE).use { it.force(true) }
                 atomicMoveFile(tmp.toPath(), settingsFile.toPath())
             } finally {
                 tmp.delete()

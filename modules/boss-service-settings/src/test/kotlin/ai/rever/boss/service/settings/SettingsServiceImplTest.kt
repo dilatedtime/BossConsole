@@ -283,4 +283,60 @@ class SettingsServiceImplTest {
                 assertTrue(extraPerms.isEmpty(), "Expected owner-only permissions, found: $perms")
             }
         }
+
+    @Test
+    fun `initialization handles corrupt settings file gracefully and initializes empty`() {
+        runBlocking {
+            val root = temporary.newFolder("settings-dir-corrupt")
+            val settingsFile = File(root, "settings.json")
+            val secretCanary = "secret-token-canary-889900"
+            settingsFile.writeText("""[{"key":"api_key","value":"$secretCanary","namespace":""")
+
+            val service = SettingsServiceImpl(settingsFile)
+            val list = service.listSettings(ListSettingsRequest.getDefaultInstance())
+            assertEquals(0, list.totalCount)
+
+            val get =
+                service.getSetting(
+                    GetSettingRequest
+                        .newBuilder()
+                        .setKey("api_key")
+                        .setDefaultValue("fallback")
+                        .build(),
+                )
+            assertFalse(get.found)
+            assertEquals("fallback", get.value)
+        }
+    }
+
+    @Test
+    fun `saveSetting overwrites corrupt settings file with valid durable JSON`() {
+        runBlocking {
+            val root = temporary.newFolder("settings-dir-recover")
+            val settingsFile = File(root, "settings.json")
+            settingsFile.writeText("{ malformed json [")
+
+            val service = SettingsServiceImpl(settingsFile)
+            service.setSetting(
+                SetSettingRequest
+                    .newBuilder()
+                    .setKey("healthy")
+                    .setValue("true")
+                    .setNamespace("health")
+                    .build(),
+            )
+
+            val reloaded = SettingsServiceImpl(settingsFile)
+            val loaded =
+                reloaded.getSetting(
+                    GetSettingRequest
+                        .newBuilder()
+                        .setKey("healthy")
+                        .setNamespace("health")
+                        .build(),
+                )
+            assertTrue(loaded.found)
+            assertEquals("true", loaded.value)
+        }
+    }
 }
