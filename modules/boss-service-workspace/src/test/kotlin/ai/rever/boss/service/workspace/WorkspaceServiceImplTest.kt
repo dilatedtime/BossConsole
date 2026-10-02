@@ -262,6 +262,17 @@ class WorkspaceServiceImplTest {
             assertFalse(service.getCurrentWorkspace(Empty.getDefaultInstance()).found)
         }
 
+    @Test
+    fun `corrupt workspace file does not crash and is ignored`() =
+        runBlocking {
+            val root = temporary.newFolder("workspaces")
+            val record = root.resolve("corrupt.json")
+            record.writeText("""{"id":"corrupt","name":"Private","projectPath":"/secret/path""")
+
+            val service = WorkspaceServiceImpl(root)
+            assertEquals(0, service.getWorkspaces(Empty.getDefaultInstance()).workspacesCount)
+        }
+
     private inline fun assertStatus(
         code: Status.Code,
         action: () -> Unit,

@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import java.io.File
 
@@ -65,6 +66,11 @@ actual object ScrollbarSettingsManager {
                     logger.warn(LogCategory.SYSTEM, "Could not write default settings file", error = e)
                 }
             }
+        } catch (e: SerializationException) {
+            // Decoder messages contain the input document. Scrollbar settings must not copy
+            // corrupted file contents into the host log.
+            logger.warn(LogCategory.SYSTEM, "Failed to load settings: ${e.javaClass.simpleName}")
+            _currentSettings.value = getDefaultSettings()
         } catch (e: Exception) {
             logger.warn(LogCategory.SYSTEM, "Failed to load settings", error = e)
             _currentSettings.value = getDefaultSettings()

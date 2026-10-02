@@ -283,4 +283,16 @@ class SettingsServiceImplTest {
                 assertTrue(extraPerms.isEmpty(), "Expected owner-only permissions, found: $perms")
             }
         }
+
+    @Test
+    fun `corrupt settings file does not throw and starts with empty settings`() =
+        runBlocking {
+            val root = temporary.newFolder("settings-dir")
+            val settingsFile = File(root, "settings.json")
+            settingsFile.writeText("[{\"key\":\"secret_api_token\",\"value\":\"sk-12345\"")
+
+            val service = SettingsServiceImpl(settingsFile)
+            val list = service.listSettings(ListSettingsRequest.getDefaultInstance())
+            assertTrue(list.settingsList.isEmpty())
+        }
 }

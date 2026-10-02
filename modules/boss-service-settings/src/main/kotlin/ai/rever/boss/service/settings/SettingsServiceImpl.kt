@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -85,6 +86,10 @@ class SettingsServiceImpl(
                         .build()
             }
             logger.info("Loaded {} setting(s) from disk", settings.size)
+        } catch (e: SerializationException) {
+            // Decoder messages contain the input document. Settings may hold private
+            // tokens or keys, so log only the exception type rather than raw content.
+            logger.warn("Failed to load settings from disk: {}", e.javaClass.simpleName)
         } catch (e: Exception) {
             logger.warn("Failed to load settings from disk: {}", e.message)
         }
