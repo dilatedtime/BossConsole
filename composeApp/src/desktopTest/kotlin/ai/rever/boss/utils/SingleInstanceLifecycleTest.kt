@@ -495,9 +495,7 @@ class SingleInstanceLifecycleTest {
 
         val exception =
             assertThrows<IllegalStateException> {
-                SingleInstanceFiles.withCrossProcessLock(timeoutMs = 100) {
-                    "unreached"
-                }
+                SingleInstanceFiles.withCrossProcessLock(timeoutMs = 100) {}
             }
         assertTrue(
             exception.message?.contains("Single-instance cross-process file locking is unavailable") == true,
@@ -519,9 +517,7 @@ class SingleInstanceLifecycleTest {
                     onUnsupportedCalled = true
                     "unsupported-fallback"
                 },
-            ) {
-                "unreached"
-            }
+            ) {}
 
         assertTrue(onUnsupportedCalled, "onUnsupported callback must be invoked when locking is unsupported")
         assertEquals("unsupported-fallback", result)
@@ -574,6 +570,78 @@ class SingleInstanceLifecycleTest {
             SingleInstanceFiles.withdrawUnixSocket(mismatchedDescriptor, allowUnkeyed = true)
             assertTrue(Files.exists(socketPath), "Socket must be preserved when inode does not match descriptor key")
         }
+    }
+
+    @Test
+    fun `teardownFaultedListener with stale epoch leaves active listener and descriptor intact`() {
+        assertTrue(SingleInstanceManager.acquireLock(), "Launch must acquire lock")
+        val activeDescriptor = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor)
+        val activeEpoch = SingleInstanceManager.listenerEpochForTest
+
+        // Stale epoch teardown must be ignored
+        SingleInstanceManager.teardownFaultedListenerForTest(activeEpoch - 1)
+
+        assertTrue(SingleInstanceManager.isListening, "Active listener must remain listening")
+        assertEquals(
+            activeDescriptor.token,
+            SingleInstanceManager.publishedInstanceDescriptor?.token,
+            "Published descriptor must remain intact",
+        )
+        assertEquals(
+            activeDescriptor.token,
+            readPublishedDescriptor()?.token,
+            "On-disk descriptor must remain intact",
+        )
+
+        // Matching epoch teardown cleans up active state
+        SingleInstanceManager.teardownFaultedListenerForTest(activeEpoch)
+
+        assertFalse(SingleInstanceManager.isListening, "Listener must stop after matching teardown")
+        assertNull(SingleInstanceManager.publishedInstanceDescriptor, "Published descriptor must be cleared")
+        assertNull(readPublishedDescriptor(), "On-disk descriptor must be removed")
+
+        SingleInstanceManager.release()
+    }
+
+    @Test
+    fun `release preserves shared files on disk when lock acquisition times out`() {
+        assertTrue(SingleInstanceManager.acquireLock(), "Launch must acquire lock")
+        val activeDescriptor = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor)
+
+        withForkedLockHolder(durationMs = 4000L) {
+            SingleInstanceManager.release()
+
+            assertFalse(SingleInstanceManager.isListening, "Local listener must be stopped on release")
+            assertNull(SingleInstanceManager.publishedInstanceDescriptor, "Local descriptor must be cleared")
+
+            val onDisk = readPublishedDescriptor()
+            assertNotNull(onDisk, "Descriptor file must be preserved on disk when release lock times out")
+            assertEquals(activeDescriptor.token, onDisk.token, "Descriptor token must match preserved instance")
+        }
+
+        SingleInstanceManager.withdrawForTest(activeDescriptor)
+        assertNull(readPublishedDescriptor(), "Descriptor must be cleanly withdrawn after peer lock is released")
+    }
+
+    @Test
+    fun `teardownFaultedListener preserves shared files on disk when lock acquisition times out`() {
+        assertTrue(SingleInstanceManager.acquireLock(), "Launch must acquire lock")
+        val activeDescriptor = assertNotNull(SingleInstanceManager.publishedInstanceDescriptor)
+        val epoch = SingleInstanceManager.listenerEpochForTest
+
+        withForkedLockHolder(durationMs = 4000L) {
+            SingleInstanceManager.teardownFaultedListenerForTest(epoch)
+
+            assertFalse(SingleInstanceManager.isListening, "Local listener must be stopped on faulted teardown")
+            assertNull(SingleInstanceManager.publishedInstanceDescriptor, "Local descriptor must be cleared")
+
+            val onDisk = readPublishedDescriptor()
+            assertNotNull(onDisk, "Descriptor file must be preserved on disk when teardown lock times out")
+            assertEquals(activeDescriptor.token, onDisk.token, "Descriptor token must match preserved instance")
+        }
+
+        SingleInstanceManager.withdrawForTest(activeDescriptor)
+        assertNull(readPublishedDescriptor(), "Descriptor must be cleanly withdrawn after peer lock is released")
     }
 
     private fun descriptorPath(): Path = File(tempDir.toFile(), "run").toPath().resolve("single-instance")

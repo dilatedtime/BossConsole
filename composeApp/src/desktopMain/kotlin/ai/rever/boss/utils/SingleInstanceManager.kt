@@ -1294,6 +1294,13 @@ internal object SingleInstanceWire {
                 mapOf("reason" to (e.message ?: "not a port")),
             )
             ConnectResult.Unreachable
+        } catch (e: IllegalArgumentException) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Malformed endpoint in the single-instance descriptor",
+                mapOf("reason" to (e.message ?: "invalid port")),
+            )
+            ConnectResult.Unreachable
         }
 
     /**
