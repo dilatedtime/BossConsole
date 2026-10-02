@@ -48,24 +48,24 @@ fun PasskeyBrowserScreen(
     // minted (sessionId). Anything else — a magic link, another session's callback, a link
     // that does not parse — is left for BossAppWithAuth's collector to route; this screen
     // does not act on it.
-    val deepLink by DeepLinkHandler.deepLinkFlow.collectAsState()
-    LaunchedEffect(deepLink) {
-        val link = deepLink
-        if (link != null && AuthDeepLinks.completesPasskeyCeremony(link, sessionId)) {
-            passkeyBrowserLogger.info(
-                LogCategory.AUTH,
-                "Deep link received, passkey ceremony completed",
-                mapOf("sessionId" to LogSanitizer.maskSessionId(sessionId)),
-            )
+    LaunchedEffect(sessionId) {
+        DeepLinkHandler.deepLinkFlow.collect { link ->
+            if (link != null && AuthDeepLinks.completesPasskeyCeremony(link, sessionId)) {
+                passkeyBrowserLogger.info(
+                    LogCategory.AUTH,
+                    "Deep link received, passkey ceremony completed",
+                    mapOf("sessionId" to LogSanitizer.maskSessionId(sessionId)),
+                )
 
-            // Add small delay for visual feedback
-            delay(500)
+                // Add small delay for visual feedback
+                delay(500)
 
-            // Clear the deep link
-            DeepLinkHandler.clearDeepLink()
+                // Clear the deep link
+                DeepLinkHandler.clearDeepLink()
 
-            // Trigger success callback
-            onSuccess()
+                // Trigger success callback
+                onSuccess()
+            }
         }
     }
 

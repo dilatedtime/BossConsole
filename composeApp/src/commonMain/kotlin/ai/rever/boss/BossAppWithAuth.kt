@@ -7,7 +7,6 @@ import ai.rever.boss.components.misc.LoadingScreen
 import ai.rever.boss.components.misc.OfflineScreen
 import ai.rever.boss.services.auth.CoreAuthService
 import ai.rever.boss.services.auth.MagicLinkErrorService
-import ai.rever.boss.services.auth.PasskeySessionEventHandler
 import ai.rever.boss.services.supabase.AuthService
 import ai.rever.boss.utils.DeepLinkHandler
 import ai.rever.boss.utils.WindowFocusManager
@@ -57,45 +56,25 @@ fun ComponentContext.BossAppWithAuth(
 
             when (val link = AuthDeepLinks.parse(uri)) {
                 is AuthDeepLink.PasskeyRegistered -> {
-                    logger.info(
+                    // Passkey ceremony completion is managed by PasskeyBrowserScreen bound
+                    // to its ceremony sessionId. Leaving the link unconsumed here ensures
+                    // the active browser screen collects and verifies the ceremony completion.
+                    logger.debug(
                         LogCategory.AUTH,
-                        "Passkey registration completed",
+                        "Received passkey registration deep link",
                         mapOf("sessionId" to LogSanitizer.maskSessionId(link.sessionId)),
                     )
-                    PasskeySessionEventHandler.handleRegistrationCompleted(link.sessionId)
-                    DeepLinkHandler.clearDeepLink()
                 }
 
                 is AuthDeepLink.PasskeyAuthenticated -> {
-                    logger.info(
+                    // Passkey ceremony completion is managed by PasskeyBrowserScreen bound
+                    // to its ceremony sessionId. Leaving the link unconsumed here ensures
+                    // the active browser screen collects and verifies the ceremony completion.
+                    logger.debug(
                         LogCategory.AUTH,
-                        "Passkey authentication completed",
+                        "Received passkey authentication deep link",
                         mapOf("sessionId" to LogSanitizer.maskSessionId(link.sessionId)),
                     )
-
-                    // Trigger the polling check to complete authentication
-                    coroutineScope.launch {
-                        // The CrossDeviceAuthService is already polling, but we can trigger
-                        // an immediate check when we receive the deep link
-                        val metadata = PasskeySessionEventHandler.getSessionMetadata(link.sessionId)
-                        metadata?.let { session ->
-                            logger.debug(
-                                LogCategory.AUTH,
-                                "Checking authentication status",
-                                mapOf("sessionId" to LogSanitizer.maskSessionId(link.sessionId)),
-                            )
-
-                            // Notify that authentication completed
-                            PasskeySessionEventHandler.handleAuthenticationCompleted(link.sessionId)
-                        } ?: run {
-                            logger.warn(
-                                LogCategory.AUTH,
-                                "No metadata found for session",
-                                mapOf("sessionId" to LogSanitizer.maskSessionId(link.sessionId)),
-                            )
-                        }
-                    }
-                    DeepLinkHandler.clearDeepLink()
                 }
 
                 is AuthDeepLink.MagicLinkVerify -> {
