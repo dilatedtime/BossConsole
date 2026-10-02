@@ -629,6 +629,7 @@ internal object SingleInstanceFiles {
     fun <T> withCrossProcessLock(
         timeoutMs: Long = CROSS_PROCESS_LOCK_TIMEOUT_MS,
         onTimeout: (() -> T)? = null,
+        onUnsupported: (() -> T)? = onTimeout,
         block: () -> T,
     ): T {
         crossProcessJvmLock.lock()
@@ -636,7 +637,7 @@ internal object SingleInstanceFiles {
             if (holdsOsLock.get()) {
                 return block()
             }
-            return acquireOsLockAndExecute(timeoutMs, onTimeout, block)
+            return acquireOsLockAndExecute(timeoutMs, onTimeout, onUnsupported, block)
         } finally {
             crossProcessJvmLock.unlock()
         }
@@ -671,6 +672,7 @@ internal object SingleInstanceFiles {
         cause: Exception?,
         timeoutMs: Long,
         onTimeout: (() -> T)?,
+        onUnsupported: (() -> T)?,
     ): T {
         if (status == LockAcquireStatus.UNSUPPORTED) {
             logger.warn(
@@ -678,7 +680,7 @@ internal object SingleInstanceFiles {
                 "Single-instance cross-process file locking is unavailable on this filesystem",
                 error = cause,
             )
-            return onTimeout?.invoke()
+            return onUnsupported?.invoke()
                 ?: throw IllegalStateException(
                     "Single-instance cross-process file locking is unavailable on this filesystem",
                     cause,
@@ -718,6 +720,7 @@ internal object SingleInstanceFiles {
     private fun <T> acquireOsLockAndExecute(
         timeoutMs: Long,
         onTimeout: (() -> T)?,
+        onUnsupported: (() -> T)?,
         block: () -> T,
     ): T {
         val path = lifecycleLockFile.toPath()
@@ -727,7 +730,7 @@ internal object SingleInstanceFiles {
         }
         val channel = openLifecycleChannel(path)
         if (channel == null) {
-            return handleLockFailure(LockAcquireStatus.UNSUPPORTED, null, timeoutMs, onTimeout)
+            return handleLockFailure(LockAcquireStatus.UNSUPPORTED, null, timeoutMs, onTimeout, onUnsupported)
         }
         restrictToOwner(path, ownerOnlyFilePermissions)
 
@@ -740,7 +743,7 @@ internal object SingleInstanceFiles {
                 channel.close()
             } catch (_: IOException) {
             }
-            handleLockFailure(lockResult.status, lockResult.cause, timeoutMs, onTimeout)
+            handleLockFailure(lockResult.status, lockResult.cause, timeoutMs, onTimeout, onUnsupported)
         }
     }
 
@@ -936,8 +939,16 @@ internal object SingleInstanceFiles {
      * Note on inode reuse: unlinking and rebinding a socket at the same path may land
      * on the same device/inode if freed. The cross-process lock is the primary serialization;
      * this inode identity check provides defence-in-depth rather than an absolute guarantee.
+     *
+     * [allowUnkeyed] permits deleting an unkeyed socket when cleaning up a failed launch
+     * this process bound on a filesystem where [BasicFileAttributes.fileKey] is unsupported.
+     * Even with [allowUnkeyed] = true, if [descriptor.socketFileKey] is non-null, deletion
+     * is strictly inode-gated against the live on-disk socket file.
      */
-    private fun withdrawUnixSocket(descriptor: InstanceDescriptor) {
+    internal fun withdrawUnixSocket(
+        descriptor: InstanceDescriptor,
+        allowUnkeyed: Boolean = false,
+    ) {
         val socketPath = File(descriptor.endpoint).toPath()
         if (!Files.exists(socketPath)) return
         val currentKey =
@@ -952,17 +963,25 @@ internal object SingleInstanceFiles {
                 Files.deleteIfExists(socketPath)
             }
 
-            boundKey == null || currentKey == null -> {
+            boundKey != null && currentKey != null -> {
                 logger.info(
                     LogCategory.SYSTEM,
-                    "Socket file ownership cannot be positively verified (missing file key); leaving in place",
+                    "Socket file was replaced by another owner (inode mismatch); leaving it in place",
                 )
+            }
+
+            allowUnkeyed -> {
+                logger.info(
+                    LogCategory.SYSTEM,
+                    "Socket file has no verifiable file key; deleting as bound by this failed launch",
+                )
+                Files.deleteIfExists(socketPath)
             }
 
             else -> {
                 logger.info(
                     LogCategory.SYSTEM,
-                    "Socket file was replaced by another owner (inode mismatch); leaving it in place",
+                    "Socket file ownership cannot be positively verified (missing file key); leaving in place",
                 )
             }
         }
@@ -1086,14 +1105,25 @@ internal object SingleInstanceWire {
     }
 
     /** Probes [descriptor]'s endpoint, distinguishing unreachable from live-but-unresponsive endpoints. */
-    @Suppress("TooGenericExceptionCaught")
     fun probeInstance(
         descriptor: InstanceDescriptor,
         request: String = formatPingRequest(descriptor.token),
         timeoutMs: Long = SingleInstanceManager.connectionBudgetMsOverride ?: CONNECTION_TIMEOUT_MS,
         maxResponseBytes: Int = MAX_RESPONSE_BYTES,
+    ): SingleInstanceProbe =
+        when (val conn = connect(descriptor)) {
+            is ConnectResult.Connected -> probeConnectedChannel(conn.channel, request, timeoutMs, maxResponseBytes)
+            is ConnectResult.Unreachable -> SingleInstanceProbe.UNREACHABLE
+            is ConnectResult.UnexpectedFailure -> SingleInstanceProbe.CONNECTED_NO_REPLY
+        }
+
+    @Suppress("TooGenericExceptionCaught")
+    private fun probeConnectedChannel(
+        channel: SocketChannel,
+        request: String,
+        timeoutMs: Long,
+        maxResponseBytes: Int,
     ): SingleInstanceProbe {
-        val channel = connect(descriptor) ?: return SingleInstanceProbe.UNREACHABLE
         var budget: ScheduledFuture<*>? = null
         return try {
             channel.use { ch ->
@@ -1144,7 +1174,11 @@ internal object SingleInstanceWire {
         timeoutMs: Long = SingleInstanceManager.connectionBudgetMsOverride ?: CONNECTION_TIMEOUT_MS,
         maxResponseBytes: Int = MAX_RESPONSE_BYTES,
     ): String? {
-        val channel = connect(descriptor) ?: return null
+        val channel =
+            when (val conn = connect(descriptor)) {
+                is ConnectResult.Connected -> conn.channel
+                is ConnectResult.Unreachable, is ConnectResult.UnexpectedFailure -> return null
+            }
         var budget: ScheduledFuture<*>? = null
         return try {
             channel.use { ch ->
@@ -1205,34 +1239,61 @@ internal object SingleInstanceWire {
         return resp
     }
 
-    private fun connect(descriptor: InstanceDescriptor): SocketChannel? =
-        try {
-            when (descriptor.transport) {
-                SingleInstanceTransport.UNIX -> {
-                    SocketChannel.open(UnixDomainSocketAddress.of(descriptor.endpoint))
-                }
+    private sealed interface ConnectResult {
+        data class Connected(
+            val channel: SocketChannel,
+        ) : ConnectResult
 
-                SingleInstanceTransport.TCP -> {
-                    SocketChannel.open(
-                        InetSocketAddress(InetAddress.getLoopbackAddress(), descriptor.endpoint.toInt()),
-                    )
+        object Unreachable : ConnectResult
+
+        data class UnexpectedFailure(
+            val cause: Exception,
+        ) : ConnectResult
+    }
+
+    private fun connect(descriptor: InstanceDescriptor): ConnectResult =
+        try {
+            val channel =
+                when (descriptor.transport) {
+                    SingleInstanceTransport.UNIX -> {
+                        SocketChannel.open(UnixDomainSocketAddress.of(descriptor.endpoint))
+                    }
+
+                    SingleInstanceTransport.TCP -> {
+                        SocketChannel.open(
+                            InetSocketAddress(InetAddress.getLoopbackAddress(), descriptor.endpoint.toInt()),
+                        )
+                    }
                 }
-            }
-        } catch (e: IOException) {
-            // Nothing listening is the ordinary case for a stale descriptor.
+            ConnectResult.Connected(channel)
+        } catch (e: java.net.ConnectException) {
             logger.debug(
                 LogCategory.SYSTEM,
-                "Nothing reachable on the single-instance endpoint",
+                "Nothing reachable on the single-instance endpoint (connection refused)",
+                mapOf("transport" to descriptor.transport.name, "reason" to (e.message ?: "refused")),
+            )
+            ConnectResult.Unreachable
+        } catch (e: java.nio.file.NoSuchFileException) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Nothing reachable on the single-instance endpoint (socket missing)",
+                mapOf("transport" to descriptor.transport.name, "reason" to (e.message ?: "no such file")),
+            )
+            ConnectResult.Unreachable
+        } catch (e: IOException) {
+            logger.debug(
+                LogCategory.SYSTEM,
+                "Probe-side IO failure connecting to single-instance endpoint",
                 mapOf("transport" to descriptor.transport.name, "reason" to (e.message ?: "io error")),
             )
-            null
+            ConnectResult.UnexpectedFailure(e)
         } catch (e: NumberFormatException) {
             logger.warn(
                 LogCategory.SYSTEM,
                 "Malformed endpoint in the single-instance descriptor",
                 mapOf("reason" to (e.message ?: "not a port")),
             )
-            null
+            ConnectResult.Unreachable
         }
 
     /**
@@ -1750,6 +1811,10 @@ object SingleInstanceManager {
             SingleInstanceFiles.runtimeDirOverride = value
         }
 
+    /** User-visible diagnostic reason for the most recent startup failure, or null on success/clean release. */
+    var lastStartupFailureReason: String? = null
+        internal set
+
     /** The published descriptor for test assertions. */
     internal val publishedInstanceDescriptor: InstanceDescriptor?
         get() = published
@@ -1793,6 +1858,7 @@ object SingleInstanceManager {
 
         val preLock = SingleInstanceFiles.read()
         if (preLock != null && !shouldReclaimExisting(preLock)) {
+            lastStartupFailureReason = "Another instance is already running"
             return false
         }
 
@@ -1801,7 +1867,19 @@ object SingleInstanceManager {
             synchronized(lifecycleLock) {
                 SingleInstanceFiles.withCrossProcessLock(
                     onTimeout = {
+                        lastStartupFailureReason =
+                            "Timed out waiting for single-instance cross-process lock (held by peer)"
                         logger.warn(LogCategory.SYSTEM, "Timed out waiting for lock in acquireLock")
+                        false
+                    },
+                    onUnsupported = {
+                        lastStartupFailureReason =
+                            "Single-instance cross-process file locking is unsupported on this filesystem"
+                        logger.warn(
+                            LogCategory.SYSTEM,
+                            "Single-instance cross-process file locking is unsupported on this filesystem; " +
+                                "declining launch",
+                        )
                         false
                     },
                 ) {
@@ -1809,6 +1887,8 @@ object SingleInstanceManager {
 
                     val underLock = SingleInstanceFiles.read()
                     if (underLock?.token != preLock?.token) {
+                        lastStartupFailureReason =
+                            "Single-instance descriptor changed during lock acquisition"
                         logger.info(
                             LogCategory.SYSTEM,
                             "Single-instance descriptor changed during lock acquisition; aborting startup",
@@ -1818,9 +1898,16 @@ object SingleInstanceManager {
 
                     val startResult = startServerLocked()
                     if (!startResult.success) {
+                        lastStartupFailureReason =
+                            if (published == null && serverChannel == null) {
+                                "Failed to bind single-instance endpoint"
+                            } else {
+                                "Failed to publish single-instance descriptor"
+                            }
                         listenerToJoinOnFailure = startResult.threadToJoin
                         return@withCrossProcessLock false
                     }
+                    lastStartupFailureReason = null
                     true
                 }
             }
@@ -1990,11 +2077,7 @@ object SingleInstanceManager {
         listenerThread = null
 
         if (boundDescriptor?.transport == SingleInstanceTransport.UNIX) {
-            try {
-                Files.deleteIfExists(File(boundDescriptor.endpoint).toPath())
-            } catch (e: IOException) {
-                logger.warn(LogCategory.SYSTEM, "Error removing socket file on startup failure", error = e)
-            }
+            SingleInstanceFiles.withdrawUnixSocket(boundDescriptor, allowUnkeyed = true)
         }
 
         SingleInstanceFiles.withdrawLocked(descriptorToWithdraw)
@@ -2012,6 +2095,7 @@ object SingleInstanceManager {
         beforeTeardownFaultedListenerForTest = null
         droppedConnectionsCount.set(0)
         lastDroppedWarningLogNanos.set(Long.MIN_VALUE)
+        lastStartupFailureReason = null
     }
 
     @Suppress("TooGenericExceptionCaught")

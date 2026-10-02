@@ -487,6 +487,95 @@ class SingleInstanceLifecycleTest {
             }
         }
 
+    @Test
+    fun `withCrossProcessLock throws IllegalStateException when locking is unsupported and onTimeout is null`() {
+        val lockFile = SingleInstanceFiles.lifecycleLockFile
+        lockFile.mkdirs()
+        assertTrue(lockFile.isDirectory, "Lock file must be created as directory to simulate unsupported locking")
+
+        val exception =
+            assertThrows<IllegalStateException> {
+                SingleInstanceFiles.withCrossProcessLock(timeoutMs = 100) {
+                    "unreached"
+                }
+            }
+        assertTrue(
+            exception.message?.contains("Single-instance cross-process file locking is unavailable") == true,
+            "Exception message must reflect unsupported file locking: ${exception.message}",
+        )
+    }
+
+    @Test
+    fun `withCrossProcessLock invokes onUnsupported when locking is unsupported`() {
+        val lockFile = SingleInstanceFiles.lifecycleLockFile
+        lockFile.mkdirs()
+
+        var onUnsupportedCalled = false
+        val result =
+            SingleInstanceFiles.withCrossProcessLock(
+                timeoutMs = 100,
+                onTimeout = { "timeout" },
+                onUnsupported = {
+                    onUnsupportedCalled = true
+                    "unsupported-fallback"
+                },
+            ) {
+                "unreached"
+            }
+
+        assertTrue(onUnsupportedCalled, "onUnsupported callback must be invoked when locking is unsupported")
+        assertEquals("unsupported-fallback", result)
+    }
+
+    @Test
+    fun `acquireLock records unsupported reason when locking is unsupported`() {
+        val lockFile = SingleInstanceFiles.lifecycleLockFile
+        lockFile.mkdirs()
+
+        assertFalse(SingleInstanceManager.acquireLock(), "acquireLock must return false when locking is unsupported")
+        assertEquals(
+            "Single-instance cross-process file locking is unsupported on this filesystem",
+            SingleInstanceManager.lastStartupFailureReason,
+        )
+    }
+
+    @Test
+    fun `probeInstance separates unexpected probe IO exceptions from UNREACHABLE`() {
+        val badDescriptor =
+            InstanceDescriptor(
+                transport = SingleInstanceTransport.TCP,
+                endpoint = "-1",
+                token = "test-token",
+            )
+        val probe = SingleInstanceWire.probeInstance(badDescriptor)
+        assertEquals(SingleInstanceProbe.UNREACHABLE, probe)
+    }
+
+    @Test
+    fun `withdrawUnixSocket preserves socket when inode mismatch occurs`() {
+        val socketPath = SingleInstanceFiles.socketFile.toPath()
+        socketPath.parent.toFile().mkdirs()
+        Files.writeString(socketPath, "dummy-socket-fixture")
+        val liveKey =
+            try {
+                Files.readAttributes(socketPath, BasicFileAttributes::class.java).fileKey()
+            } catch (_: Exception) {
+                null
+            }
+
+        if (liveKey != null) {
+            val mismatchedDescriptor =
+                InstanceDescriptor(
+                    transport = SingleInstanceTransport.UNIX,
+                    endpoint = socketPath.toString(),
+                    token = "desc-token",
+                    socketFileKey = "mismatched-inode-key-99999",
+                )
+            SingleInstanceFiles.withdrawUnixSocket(mismatchedDescriptor, allowUnkeyed = true)
+            assertTrue(Files.exists(socketPath), "Socket must be preserved when inode does not match descriptor key")
+        }
+    }
+
     private fun descriptorPath(): Path = File(tempDir.toFile(), "run").toPath().resolve("single-instance")
 
     private fun readPublishedDescriptor(): InstanceDescriptor? {
