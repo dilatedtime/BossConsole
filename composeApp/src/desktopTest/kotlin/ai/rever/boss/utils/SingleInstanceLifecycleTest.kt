@@ -22,8 +22,10 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -375,37 +377,7 @@ class SingleInstanceLifecycleTest {
         SingleInstanceFiles.write(desc)
         assertTrue(Files.exists(descriptorPath()), "Descriptor must exist before test")
 
-        val javaCmd =
-            ProcessHandle.current().info().command().orElseGet {
-                System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
-            }
-        val classPath = System.getProperty("java.class.path")
-        val lockFile = SingleInstanceFiles.lifecycleLockFile
-
-        val argFile = File.createTempFile("forked-lock-args", ".txt")
-        val escapedCp = classPath.replace("\\", "\\\\").replace("\"", "\\\"")
-        argFile.writeText("-cp\n\"$escapedCp\"\n")
-
-        val process =
-            try {
-                ProcessBuilder(
-                    javaCmd,
-                    "@" + argFile.absolutePath,
-                    "ai.rever.boss.utils.ForkedLockHolder",
-                    lockFile.absolutePath,
-                    "4000",
-                ).redirectErrorStream(true).start()
-            } finally {
-                argFile.deleteOnExit()
-            }
-
-        try {
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val line = reader.readLine()
-            assertEquals("LOCKED", line, "Forked process must acquire lock and output LOCKED")
-
-            // Child holds the OS FileLock in a separate OS process.
-            // Withdraw from parent must time out (fail closed) and preserve the published descriptor.
+        withForkedLockHolder(durationMs = 4000L) {
             val withdrawStart = System.nanoTime()
             SingleInstanceManager.withdrawForTest(desc)
             val withdrawDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - withdrawStart)
@@ -417,15 +389,90 @@ class SingleInstanceLifecycleTest {
             val onDisk = readPublishedDescriptor()
             assertNotNull(onDisk, "Descriptor must be preserved when withdraw times out")
             assertEquals(desc.token, onDisk.token, "Published token must remain intact")
-        } finally {
-            process.destroyForcibly()
-            process.waitFor(5, TimeUnit.SECONDS)
-            argFile.delete()
         }
 
         // Subsequent reclaim after lock release succeeds cleanly:
         SingleInstanceManager.withdrawForTest(desc)
         assertNull(readPublishedDescriptor(), "Descriptor must be removed once lock is available")
+    }
+
+    @Test
+    fun `withCrossProcessLock with no onTimeout throws TimeoutException while child holds lock`() {
+        SingleInstanceFiles.prepare()
+        withForkedLockHolder(durationMs = 4000L) {
+            assertThrows<TimeoutException> {
+                SingleInstanceFiles.withCrossProcessLock(timeoutMs = 300L) {
+                    // Must not run unlocked
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `nested withCrossProcessLock inside onTimeout handler does not execute unlocked`() {
+        SingleInstanceFiles.prepare()
+        withForkedLockHolder(durationMs = 4000L) {
+            var nestedRanUnlocked = false
+            SingleInstanceFiles.withCrossProcessLock(
+                timeoutMs = 200L,
+                onTimeout = {
+                    assertThrows<TimeoutException> {
+                        SingleInstanceFiles.withCrossProcessLock(timeoutMs = 100L) {
+                            nestedRanUnlocked = true
+                        }
+                    }
+                },
+            ) {
+            }
+            assertFalse(nestedRanUnlocked, "Nested block must not execute unlocked inside onTimeout")
+        }
+    }
+
+    private fun withForkedLockHolder(
+        durationMs: Long = 4000L,
+        block: (Process) -> Unit,
+    ) {
+        val javaCmd =
+            ProcessHandle.current().info().command().orElseGet {
+                System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
+            }
+        val classPath = System.getProperty("java.class.path")
+        val lockFile = SingleInstanceFiles.lifecycleLockFile
+
+        val argFile = File.createTempFile("forked-lock-args", ".txt")
+        val escapedCp = classPath.replace("\\", "\\\\").replace("\"", "\\\"")
+        argFile.writeText("-cp\n\"$escapedCp\"\n")
+
+        var process: Process? = null
+        try {
+            process =
+                ProcessBuilder(
+                    javaCmd,
+                    "@" + argFile.absolutePath,
+                    "ai.rever.boss.utils.ForkedLockHolder",
+                    lockFile.absolutePath,
+                    durationMs.toString(),
+                ).redirectErrorStream(true).start()
+
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val lineFuture = CompletableFuture.supplyAsync { reader.readLine() }
+            val line =
+                try {
+                    lineFuture.get(5, TimeUnit.SECONDS)
+                } catch (_: Exception) {
+                    lineFuture.cancel(true)
+                    null
+                }
+            assertEquals("LOCKED", line, "Forked process must acquire lock and output LOCKED")
+            block(process)
+        } finally {
+            process?.let { p ->
+                p.destroyForcibly()
+                val exited = p.waitFor(5, TimeUnit.SECONDS)
+                assertTrue(exited, "Forked process must terminate within 5 seconds")
+            }
+            argFile.delete()
+        }
     }
 
     private fun toSocketAddress(descriptor: InstanceDescriptor): SocketAddress =

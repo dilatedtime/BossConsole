@@ -592,6 +592,20 @@ internal object SingleInstanceFiles {
 
     private val crossProcessJvmLock = ReentrantLock()
 
+    private val holdsOsLock = ThreadLocal.withInitial { false }
+
+    private enum class LockAcquireStatus {
+        ACQUIRED,
+        TIMED_OUT,
+        UNSUPPORTED,
+    }
+
+    private data class LockAttemptResult(
+        val status: LockAcquireStatus,
+        val lock: FileLock? = null,
+        val cause: Exception? = null,
+    )
+
     /**
      * Shared cross-process serialization for publication and withdrawal (#1326).
      * Ensures an incoming process binding an endpoint cannot have its newly-created
@@ -619,12 +633,85 @@ internal object SingleInstanceFiles {
     ): T {
         crossProcessJvmLock.lock()
         try {
-            if (crossProcessJvmLock.holdCount > 1) {
+            if (holdsOsLock.get()) {
                 return block()
             }
             return acquireOsLockAndExecute(timeoutMs, onTimeout, block)
         } finally {
             crossProcessJvmLock.unlock()
+        }
+    }
+
+    private fun openLifecycleChannel(path: java.nio.file.Path): FileChannel? =
+        try {
+            FileChannel.open(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE,
+            )
+        } catch (e: IOException) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Single-instance cross-process lock file could not be opened; OS file locking unavailable",
+                error = e,
+            )
+            null
+        } catch (e: SecurityException) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Single-instance cross-process lock file access denied; OS file locking unavailable",
+                error = e,
+            )
+            null
+        }
+
+    private fun <T> handleLockFailure(
+        status: LockAcquireStatus,
+        cause: Exception?,
+        timeoutMs: Long,
+        onTimeout: (() -> T)?,
+    ): T {
+        if (status == LockAcquireStatus.UNSUPPORTED) {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Single-instance cross-process file locking is unavailable on this filesystem",
+                error = cause,
+            )
+            return onTimeout?.invoke()
+                ?: throw IllegalStateException(
+                    "Single-instance cross-process file locking is unavailable on this filesystem",
+                    cause,
+                )
+        }
+        logger.warn(
+            LogCategory.SYSTEM,
+            "Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms (held by peer)",
+        )
+        return onTimeout?.invoke()
+            ?: throw TimeoutException(
+                "Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms (held by peer)",
+            )
+    }
+
+    private fun <T> executeWithAcquiredLock(
+        lock: FileLock,
+        channel: FileChannel,
+        block: () -> T,
+    ): T {
+        holdsOsLock.set(true)
+        return try {
+            block()
+        } finally {
+            holdsOsLock.set(false)
+            try {
+                lock.release()
+            } catch (_: IOException) {
+            }
+            try {
+                channel.close()
+            } catch (_: IOException) {
+            }
         }
     }
 
@@ -638,51 +725,32 @@ internal object SingleInstanceFiles {
         if (parent != null && !parent.exists()) {
             parent.mkdirs()
         }
-        val channel =
-            FileChannel.open(
-                path,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE,
-            )
+        val channel = openLifecycleChannel(path)
+        if (channel == null) {
+            return handleLockFailure(LockAcquireStatus.UNSUPPORTED, null, timeoutMs, onTimeout)
+        }
         restrictToOwner(path, ownerOnlyFilePermissions)
 
-        val lock = tryAcquireFileLock(channel, timeoutMs)
-        if (lock == null) {
-            logger.warn(
-                LogCategory.SYSTEM,
-                "Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms",
-            )
+        val lockResult = tryAcquireFileLock(channel, timeoutMs)
+        val lock = lockResult.lock
+        return if (lock != null) {
+            executeWithAcquiredLock(lock, channel, block)
+        } else {
             try {
                 channel.close()
             } catch (_: IOException) {
             }
-            if (onTimeout != null) {
-                return onTimeout()
-            }
-            throw TimeoutException("Timed out waiting for single-instance cross-process lock after ${timeoutMs}ms")
-        }
-
-        return try {
-            block()
-        } finally {
-            try {
-                lock.release()
-            } catch (_: IOException) {
-            }
-            try {
-                channel.close()
-            } catch (_: IOException) {
-            }
+            handleLockFailure(lockResult.status, lockResult.cause, timeoutMs, onTimeout)
         }
     }
 
     private fun tryAcquireFileLock(
         channel: FileChannel,
         timeoutMs: Long,
-    ): FileLock? {
+    ): LockAttemptResult {
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         var acquiredLock: FileLock? = null
+        var unsupportedCause: Exception? = null
         var shouldStop = false
         while (acquiredLock == null && !shouldStop && System.nanoTime() < deadlineNanos) {
             acquiredLock =
@@ -691,11 +759,7 @@ internal object SingleInstanceFiles {
                 } catch (_: OverlappingFileLockException) {
                     null
                 } catch (e: IOException) {
-                    logger.warn(
-                        LogCategory.SYSTEM,
-                        "OS file locking failed with IOException on single-instance lock file",
-                        error = e,
-                    )
+                    unsupportedCause = e
                     shouldStop = true
                     null
                 }
@@ -708,7 +772,11 @@ internal object SingleInstanceFiles {
                 }
             }
         }
-        return acquiredLock
+        return when {
+            acquiredLock != null -> LockAttemptResult(LockAcquireStatus.ACQUIRED, lock = acquiredLock)
+            unsupportedCause != null -> LockAttemptResult(LockAcquireStatus.UNSUPPORTED, cause = unsupportedCause)
+            else -> LockAttemptResult(LockAcquireStatus.TIMED_OUT)
+        }
     }
 
     /**
@@ -968,27 +1036,14 @@ internal object SingleInstanceWire {
                 } catch (_: Exception) {
                     null
                 }
-            if (socketFileKey == null) {
-                logger.debug(
-                    LogCategory.SYSTEM,
-                    "Unix-domain socket file key unavailable; using loopback TCP for verifiable ownership",
+            channel to
+                InstanceDescriptor(
+                    transport = SingleInstanceTransport.UNIX,
+                    endpoint = path.toString(),
+                    token = token,
+                    pid = ProcessHandle.current().pid(),
+                    socketFileKey = socketFileKey,
                 )
-                try {
-                    channel.close()
-                } catch (_: IOException) {
-                }
-                Files.deleteIfExists(path)
-                null
-            } else {
-                channel to
-                    InstanceDescriptor(
-                        transport = SingleInstanceTransport.UNIX,
-                        endpoint = path.toString(),
-                        token = token,
-                        pid = ProcessHandle.current().pid(),
-                        socketFileKey = socketFileKey,
-                    )
-            }
         } catch (e: UnsupportedOperationException) {
             logger.debug(
                 LogCategory.SYSTEM,
@@ -1933,6 +1988,14 @@ object SingleInstanceManager {
         }
         serverChannel = null
         listenerThread = null
+
+        if (boundDescriptor?.transport == SingleInstanceTransport.UNIX) {
+            try {
+                Files.deleteIfExists(File(boundDescriptor.endpoint).toPath())
+            } catch (e: IOException) {
+                logger.warn(LogCategory.SYSTEM, "Error removing socket file on startup failure", error = e)
+            }
+        }
 
         SingleInstanceFiles.withdrawLocked(descriptorToWithdraw)
     }
