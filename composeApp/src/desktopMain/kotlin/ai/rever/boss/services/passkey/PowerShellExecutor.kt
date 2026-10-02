@@ -4,34 +4,63 @@ import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import java.io.File
 import java.io.IOException
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
 /**
- * Executes PowerShell scripts for Windows Hello authentication
- * Similar to SwiftScriptExecutor but for Windows PowerShell
+ * Executes PowerShell scripts for Windows Hello authentication.
+ * Similar to SwiftScriptExecutor but for Windows PowerShell.
  */
 object PowerShellExecutor {
     private val logger = BossLogger.forComponent("PowerShellExecutor")
+
+    const val SCRIPT_TIMEOUT_SECONDS = 30L
+    const val PROBE_TIMEOUT_SECONDS = 5L
+
+    internal var processRunner: (List<String>, File) -> Process = { command, outputFile ->
+        ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .redirectOutput(outputFile)
+            .start()
+    }
+
+    internal var probeRunner: () -> Process = {
+        ProcessBuilder("powershell", "-Command", "echo 'test'")
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+    }
 
     private val powerShellScriptsDir: String by lazy {
         findPowerShellScriptsDirectory()
     }
 
     /**
-     * Check if PowerShell is available on this system
+     * Check if PowerShell is available on this system.
      */
     fun isPowerShellAvailable(): Boolean {
         return try {
             val os = System.getProperty("os.name").lowercase()
             if (!os.contains("windows")) return false
 
-            val process =
-                ProcessBuilder("powershell", "-Command", "echo 'test'")
-                    .start()
-
-            val exitCode = process.waitFor(5, TimeUnit.SECONDS)
-            exitCode && process.exitValue() == 0
+            val process = probeRunner()
+            val finished = process.waitFor(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            if (finished) {
+                process.exitValue() == 0
+            } else {
+                process.destroyForcibly()
+                logger.warn(LogCategory.PASSKEY, "PowerShell availability probe timed out")
+                false
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logger.debug(
+                LogCategory.PASSKEY,
+                "PowerShell availability check interrupted",
+                mapOf("error" to e.toString()),
+            )
+            false
         } catch (e: Exception) {
             logger.debug(LogCategory.PASSKEY, "PowerShell not available", mapOf("error" to e.toString()))
             false
@@ -39,7 +68,7 @@ object PowerShellExecutor {
     }
 
     /**
-     * Execute a PowerShell script file with arguments
+     * Execute a PowerShell script file with arguments.
      */
     fun executePowerShellScript(
         scriptName: String,
@@ -59,11 +88,13 @@ object PowerShellExecutor {
         }
     }
 
-    private fun runScript(
+    internal fun runScript(
         scriptName: String,
         args: Array<out String>,
+        scriptsDir: String = powerShellScriptsDir,
+        timeoutSeconds: Long = SCRIPT_TIMEOUT_SECONDS,
     ): String {
-        val scriptPath = ScriptFileGuard.resolveInside(File(powerShellScriptsDir), scriptName).toPath()
+        val scriptPath = ScriptFileGuard.resolveInside(File(scriptsDir), scriptName).toPath()
 
         if (!Files.exists(scriptPath)) {
             throw IOException("PowerShell script not found: $scriptPath")
@@ -74,29 +105,78 @@ object PowerShellExecutor {
 
         logger.debug(LogCategory.PASSKEY, "Executing PowerShell script", mapOf("script" to scriptName))
 
-        val process =
-            ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .start()
-
-        val output = process.inputStream.bufferedReader().readText()
-        val exitCode = process.waitFor(30, TimeUnit.SECONDS)
-
-        if (!exitCode || process.exitValue() != 0) {
-            throw RuntimeException("PowerShell script failed with exit code: ${process.exitValue()}, output: $output")
-        }
-
-        return output.trim()
+        return executeCommand(command, scriptName, timeoutSeconds)
     }
 
+    internal fun executeCommand(
+        command: List<String>,
+        operationDescription: String,
+        timeoutSeconds: Long = SCRIPT_TIMEOUT_SECONDS,
+    ): String {
+        val outputFile = File.createTempFile("boss-ps-output", ".txt").apply {
+            deleteOnExit()
+        }
+
+        val process = try {
+            processRunner(command, outputFile)
+        } catch (e: Exception) {
+            outputFile.delete()
+            throw e
+        }
+
+        try {
+            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                val partialOutput = readTextSafely(outputFile)
+                throw IOException(
+                    "PowerShell script timed out after ${timeoutSeconds}s: " +
+                        "$operationDescription. Output: $partialOutput",
+                )
+            }
+
+            val exitCode = process.exitValue()
+            val output = readTextSafely(outputFile)
+
+            if (exitCode != 0) {
+                throw IllegalStateException(
+                    "PowerShell script failed with exit code: $exitCode, output: $output",
+                )
+            }
+
+            return output
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            process.destroyForcibly()
+            throw IOException("PowerShell script execution interrupted: $operationDescription", e)
+        } finally {
+            outputFile.delete()
+        }
+    }
+
+    private fun consoleCharset(): Charset =
+        try {
+            System.getProperty("native.encoding")?.let { Charset.forName(it) } ?: Charset.defaultCharset()
+        } catch (e: IllegalArgumentException) {
+            Charset.defaultCharset()
+        }
+
+    private fun readTextSafely(file: File): String =
+        try {
+            file.readText(consoleCharset()).trim()
+        } catch (e: IOException) {
+            ""
+        } catch (e: SecurityException) {
+            ""
+        }
+
     /**
-     * Find the PowerShell scripts directory in the project
+     * Find the PowerShell scripts directory in the project.
      */
     private fun findPowerShellScriptsDirectory(): String {
         val projectDir = System.getProperty("user.dir")
         logger.debug(LogCategory.PASSKEY, "Project dir", mapOf("path" to projectDir))
 
-        // Look for the powershell directory in various locations
         val possiblePaths =
             listOf(
                 "$projectDir/composeApp/src/desktopMain/kotlin/ai/rever/boss/services/passkey/powershell",
@@ -112,14 +192,13 @@ object PowerShellExecutor {
             }
         }
 
-        // Create the directory if it doesn't exist
         val defaultPath = possiblePaths.first()
         val dir = File(defaultPath)
-        if (dir.mkdirs()) {
+        if (dir.mkdirs() || dir.isDirectory) {
             logger.debug(LogCategory.PASSKEY, "Created PowerShell directory", mapOf("path" to defaultPath))
             return defaultPath
         } else {
-            throw RuntimeException("Could not find or create PowerShell scripts directory")
+            throw IllegalStateException("Could not find or create PowerShell scripts directory: $defaultPath")
         }
     }
 }
