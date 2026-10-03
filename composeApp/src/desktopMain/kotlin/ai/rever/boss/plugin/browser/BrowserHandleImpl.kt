@@ -572,14 +572,8 @@ internal class BrowserHandleImpl(
     // Offers of pinch deltas to the page, bounded and on a deadline. See [PinchOffers].
     private val pinchOffers = PinchOffers(maxPending = MAX_PENDING_PINCH_OFFERS, deadlineMs = PINCH_OFFER_DEADLINE_MS)
 
-    // The page's last answer to a pinch offer, so a change of answer is logged once rather than
-    // every delta. A page that claims every wheel event (see [BrowserPinchScript]) shows up here
-    // as "claimed" and nothing else, which tells it apart from a gate that never opens.
-    @Volatile private var lastPinchClaimed: Boolean? = null
-
-    // Unanswered offers in a row since the page last answered. Bounds how long a claim is
-    // carried by no answer: a slow frame keeps it, a hung renderer does not.
-    private val unansweredPinchOffers = AtomicInteger(0)
+    // Owns answer ordering, the per-document epoch, and the busy-page fallback as one unit.
+    private val pinchDocumentState = PinchDocumentState(MAX_UNANSWERED_PINCH_CLAIMS)
 
     /**
      * One macOS pinch delta, arriving on the EDT from the window-wide gesture listener.
@@ -610,9 +604,10 @@ internal class BrowserHandleImpl(
         val fraction =
             if (pointer != null && bounds != null) pointerFractionInBounds(bounds, pointer, density) else null
         val script = BrowserPinchScript.dispatch(magnification, fraction?.x?.toDouble(), fraction?.y?.toDouble())
+        val token = pinchDocumentState.beginOffer()
         pinchOffers.offer(
             send = { answer, isStale -> sendPinchOffer(script, answer, isStale) },
-            onAnswer = { answer -> onPinchAnswer(magnification, answer) },
+            onAnswer = { answer -> onPinchAnswer(token, magnification, answer) },
         )
     }
 
@@ -674,21 +669,26 @@ internal class BrowserHandleImpl(
     }
 
     private fun onPinchAnswer(
+        token: PinchOfferToken,
         magnification: Double,
         result: PinchAnswer,
     ) {
-        val claimed = resolvePinchClaim(result)
-        // On the EDT, the only thread that touches the accumulator. That serializes its updates
-        // but does not restore gesture order: offers are answered in completion order, so a quick
-        // answer can land before a slower earlier one. For a running sum that only matters at a
-        // direction change within one gesture.
-        //
         // The answer can arrive up to the offer deadline after the gate passed, by which time the
         // tab may be closed or the pointer somewhere else, so the gate runs again, and BEFORE the
         // accumulator: a step it had already completed and zeroed would otherwise be thrown away
         // along with the delta.
         SwingUtilities.invokeLater {
-            if (claimed) {
+            // Resolve on the EDT too. Besides serializing accumulator updates, this checks the
+            // document epoch after any time the callback spent queued here.
+            val resolution = pinchDocumentState.resolve(token, result) ?: return@invokeLater
+            resolution.claimChangedTo?.let { claimed ->
+                logger.debug(
+                    LogCategory.BROWSER,
+                    if (claimed) "Page claimed pinch" else "Page declined pinch, using page zoom",
+                    mapOf("handleId" to id),
+                )
+            }
+            if (resolution.claimed) {
                 pinchZoomAccumulator.reset()
                 return@invokeLater
             }
@@ -701,41 +701,11 @@ internal class BrowserHandleImpl(
         }
     }
 
-    /**
-     * Whether a delta counts as claimed by the page, given how its offer ended.
-     *
-     * No answer in time means "as the page last answered": a canvas app busy zooming its canvas
-     * keeps its claim through a slow frame instead of having page zoom stacked on top. With no
-     * answer yet on this page, it falls back to page zoom, which is how every pinch behaved
-     * before #1565. Past [MAX_UNANSWERED_PINCH_CLAIMS] timeouts in a row the page is taken to be
-     * hung rather than busy, and deltas go back to page zoom; otherwise a renderer that hung
-     * after claiming would leave pinch doing nothing at all until the tab navigated.
-     *
-     * Only a timeout spends that budget. A skipped offer was never asked, so it carries the last
-     * claim for free: skips arrive at trackpad rate and would use up the whole budget inside one
-     * deadline while the page is merely slow.
-     */
-    private fun resolvePinchClaim(result: PinchAnswer): Boolean {
-        val answer =
-            when (result) {
-                PinchAnswer.CLAIMED -> true
-                PinchAnswer.DECLINED -> false
-                PinchAnswer.TIMED_OUT, PinchAnswer.SKIPPED -> null
-            }
-        if (answer == null) {
-            if (result == PinchAnswer.TIMED_OUT) unansweredPinchOffers.incrementAndGet()
-            return lastPinchClaimed == true && unansweredPinchOffers.get() <= MAX_UNANSWERED_PINCH_CLAIMS
-        }
-        unansweredPinchOffers.set(0)
-        if (lastPinchClaimed != answer) {
-            lastPinchClaimed = answer
-            logger.debug(
-                LogCategory.BROWSER,
-                if (answer) "Page claimed pinch" else "Page declined pinch, using page zoom",
-                mapOf("handleId" to id),
-            )
-        }
-        return answer
+    private fun resetPinchDocument() {
+        // Advance synchronously so an old callback already queued for the EDT is rejected there.
+        // The accumulator is synchronized and can safely be cleared from the JxBrowser callback.
+        pinchDocumentState.advanceDocument()
+        pinchZoomAccumulator.reset()
     }
 
     private fun logPinchSuppressed(
@@ -1432,10 +1402,9 @@ internal class BrowserHandleImpl(
             browser.navigation().on(NavigationStarted::class.java) { _ ->
                 // Any frame navigation revokes menu tokens, including same-document transitions.
                 menuContextAuthority.invalidate()
-                // A pinch claim belongs to the page that made it. Carried over, a timed-out offer
-                // on the next page would read as claimed and page zoom would silently do nothing.
-                lastPinchClaimed = null
-                unansweredPinchOffers.set(0)
+                // Ownership and a partial page-zoom step both belong to the old document. The
+                // epoch also rejects any of its answers that are still in flight or queued.
+                resetPinchDocument()
                 _isLoading = true
                 loadingListeners.forEach { listener ->
                     try {
@@ -1659,10 +1628,8 @@ internal class BrowserHandleImpl(
         // injection path: between the two, every way the renderer can change is accounted for.
         subscriptions +=
             browser.on(RenderProcessTerminated::class.java) { event ->
-                // A dead renderer cannot be claiming anything. Reset exactly as NavigationStarted
-                // does, so the two claim fields always go stale together.
-                lastPinchClaimed = null
-                unansweredPinchOffers.set(0)
+                // A dead renderer cannot own a pinch or contribute to its replacement's step.
+                resetPinchDocument()
                 logger.debug(
                     LogCategory.BROWSER,
                     "Renderer terminated",
