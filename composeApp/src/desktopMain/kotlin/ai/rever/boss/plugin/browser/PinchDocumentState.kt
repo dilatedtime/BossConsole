@@ -10,21 +10,24 @@ internal data class PinchOfferToken(
  * The effect of a current pinch answer.
  *
  * [claimChangedTo] is non-null only when a fresh explicit page answer changes the remembered
- * ownership. It lets the handle keep transition logging outside this concurrency primitive.
+ * ownership. [appliesDelta] is false when that evidence arrived after a newer delta was already
+ * resolved: future offers use the ownership, but the overtaken delta cannot alter accumulation.
  */
 internal data class PinchResolution(
     val claimed: Boolean,
     val claimChangedTo: Boolean?,
+    val appliesDelta: Boolean,
 )
 
 /**
  * Orders asynchronous pinch answers and fences them to the document that received the offer.
  *
  * Renderer answers can complete in a different order from trackpad deltas. An explicit answer
- * older than the newest explicit answer is therefore discarded: applying it could reset a newer
- * declined delta's partial page-zoom step, or add an old-direction delta after the page claimed a
- * newer one. Timeouts and skipped offers carry the latest explicit ownership decision, preserving
- * the busy-page fallback without allowing old evidence to replace new evidence.
+ * older than the newest explicit answer is therefore discarded. An explicit answer overtaken by
+ * a newer timeout still updates future ownership, but cannot reset or add its old delta. Together
+ * those rules prevent a late answer from erasing partial page zoom or adding an old-direction
+ * delta. Timeouts and skipped offers carry the latest explicit ownership decision, preserving the
+ * busy-page fallback without allowing old evidence to replace new evidence.
  *
  * A navigation or renderer death advances the epoch and clears ownership as one synchronized
  * operation. Every callback from the old document then becomes stale, including callbacks that
@@ -35,6 +38,7 @@ internal class PinchDocumentState(
 ) {
     private var documentEpoch = 0L
     private var nextSequence = 0L
+    private var newestResolvedSequence = 0L
     private var newestExplicitSequence = 0L
     private var lastClaimed: Boolean? = null
     private var unansweredOffers = 0
@@ -79,18 +83,21 @@ internal class PinchDocumentState(
         unansweredOffers = 0
         val changedTo = claimed.takeIf { it != lastClaimed }
         lastClaimed = claimed
-        return PinchResolution(claimed = claimed, claimChangedTo = changedTo)
+        val appliesDelta = token.sequence > newestResolvedSequence
+        newestResolvedSequence = maxOf(newestResolvedSequence, token.sequence)
+        return PinchResolution(claimed = claimed, claimChangedTo = changedTo, appliesDelta = appliesDelta)
     }
 
     private fun resolveUnanswered(
         token: PinchOfferToken,
         answer: PinchAnswer,
     ): PinchResolution? {
-        // An unanswered old delta must not be applied after a newer explicit ownership decision.
-        if (token.sequence < newestExplicitSequence) return null
+        // No unanswered result carries new ownership evidence, so an overtaken one has no effect.
+        if (token.sequence <= newestResolvedSequence) return null
+        newestResolvedSequence = token.sequence
         if (answer == PinchAnswer.TIMED_OUT) unansweredOffers++
         val carriesClaim = lastClaimed == true && unansweredOffers <= maxUnansweredClaims
-        return PinchResolution(claimed = carriesClaim, claimChangedTo = null)
+        return PinchResolution(claimed = carriesClaim, claimChangedTo = null, appliesDelta = true)
     }
 
     /** Invalidates every outstanding offer and forgets the old document's ownership. */
@@ -98,6 +105,7 @@ internal class PinchDocumentState(
     fun advanceDocument() {
         documentEpoch++
         nextSequence = 0L
+        newestResolvedSequence = 0L
         newestExplicitSequence = 0L
         lastClaimed = null
         unansweredOffers = 0

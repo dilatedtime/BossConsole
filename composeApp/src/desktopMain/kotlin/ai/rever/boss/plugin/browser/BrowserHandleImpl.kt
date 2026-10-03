@@ -688,6 +688,9 @@ internal class BrowserHandleImpl(
                     mapOf("handleId" to id),
                 )
             }
+            // An older explicit answer can still be the newest ownership evidence, but its delta
+            // must not change accumulation after a later offer has already been applied.
+            if (!resolution.appliesDelta) return@invokeLater
             if (resolution.claimed) {
                 pinchZoomAccumulator.reset()
                 return@invokeLater

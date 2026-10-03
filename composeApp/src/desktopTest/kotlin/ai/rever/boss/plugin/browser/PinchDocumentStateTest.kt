@@ -15,7 +15,7 @@ class PinchDocumentStateTest {
 
         val decline = state.resolve(newer, PinchAnswer.DECLINED)
 
-        assertEquals(PinchResolution(claimed = false, claimChangedTo = false), decline)
+        assertEquals(PinchResolution(claimed = false, claimChangedTo = false, appliesDelta = true), decline)
         assertNull(state.resolve(older, PinchAnswer.CLAIMED))
     }
 
@@ -27,7 +27,7 @@ class PinchDocumentStateTest {
 
         val claim = state.resolve(newer, PinchAnswer.CLAIMED)
 
-        assertEquals(PinchResolution(claimed = true, claimChangedTo = true), claim)
+        assertEquals(PinchResolution(claimed = true, claimChangedTo = true, appliesDelta = true), claim)
         assertNull(state.resolve(older, PinchAnswer.DECLINED))
     }
 
@@ -43,7 +43,7 @@ class PinchDocumentStateTest {
         assertNull(state.resolve(oldClaim, PinchAnswer.CLAIMED))
         assertNull(state.resolve(oldTimeout, PinchAnswer.TIMED_OUT))
         assertEquals(
-            PinchResolution(claimed = false, claimChangedTo = false),
+            PinchResolution(claimed = false, claimChangedTo = false, appliesDelta = true),
             state.resolve(current, PinchAnswer.DECLINED),
         )
     }
@@ -92,7 +92,7 @@ class PinchDocumentStateTest {
 
         val reaffirmed = state.resolve(state.beginOffer(), PinchAnswer.CLAIMED)
 
-        assertEquals(PinchResolution(claimed = true, claimChangedTo = null), reaffirmed)
+        assertEquals(PinchResolution(claimed = true, claimChangedTo = null, appliesDelta = true), reaffirmed)
         assertTrue(state.resolve(state.beginOffer(), PinchAnswer.TIMED_OUT)!!.claimed)
     }
 
@@ -105,6 +105,22 @@ class PinchDocumentStateTest {
 
         assertNull(state.resolve(older, PinchAnswer.TIMED_OUT))
         assertNull(state.resolve(older, PinchAnswer.SKIPPED))
+    }
+
+    @Test
+    fun `an older explicit answer updates ownership without applying its overtaken delta`() {
+        val state = PinchDocumentState(maxUnansweredClaims = 2)
+        val older = state.beginOffer()
+        val newer = state.beginOffer()
+        assertFalse(state.resolve(newer, PinchAnswer.TIMED_OUT)!!.claimed)
+
+        val lateEvidence = state.resolve(older, PinchAnswer.CLAIMED)
+
+        assertEquals(
+            PinchResolution(claimed = true, claimChangedTo = true, appliesDelta = false),
+            lateEvidence,
+        )
+        assertTrue(state.resolve(state.beginOffer(), PinchAnswer.SKIPPED)!!.claimed)
     }
 
     @Test
