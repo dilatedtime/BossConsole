@@ -167,6 +167,15 @@ class BrowserPinchTest {
         assertNull(accumulator.add(0.02))
     }
 
+    @Test
+    fun `non-finite deltas cannot poison later page zoom`() {
+        val accumulator = PinchZoomAccumulator(threshold = 0.15)
+        assertNull(accumulator.add(Double.NaN))
+        assertNull(accumulator.add(Double.POSITIVE_INFINITY))
+        assertNull(accumulator.add(0.1))
+        assertEquals(PinchZoomAccumulator.Step.IN, accumulator.add(0.06))
+    }
+
     // --- PinchOffers: a busy page cannot stall or replay a pinch ---
 
     @Test

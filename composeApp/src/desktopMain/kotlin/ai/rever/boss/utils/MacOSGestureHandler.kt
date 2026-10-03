@@ -155,7 +155,7 @@ object MacOSGestureHandler {
  *
  * One instance per listener, so several registered listeners don't feed a shared total and trip
  * the threshold N times faster than a single one would. BrowserHandleImpl only calls it on the
- * EDT; it is synchronized anyway so a caller on another thread cannot corrupt the total.
+ * EDT except for lifecycle resets; synchronization keeps either path from corrupting the total.
  */
 internal class PinchZoomAccumulator(
     private val threshold: Double = ZOOM_THRESHOLD,
@@ -167,6 +167,7 @@ internal class PinchZoomAccumulator(
     /** Adds [magnification] and returns the step it completes, if any. */
     @Synchronized
     fun add(magnification: Double): Step? {
+        if (!magnification.isFinite()) return null
         total += magnification
         return when {
             total >= threshold -> Step.IN.also { total = 0.0 }
