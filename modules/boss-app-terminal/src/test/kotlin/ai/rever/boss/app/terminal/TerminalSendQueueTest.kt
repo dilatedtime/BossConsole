@@ -175,7 +175,7 @@ class TerminalSendQueueTest {
         }
 
     @Test
-    fun `cancelling a queued closeStdin abandons closing input`(): Unit =
+    fun `cancelling a queued closeStdin abandons closing input`() =
         runBlocking {
             val process = BlockedInputProcess()
             // inputWriteTimeoutMillis = 60_000 ensures slow runners cannot reach discardInput (5s default)
@@ -208,7 +208,7 @@ class TerminalSendQueueTest {
         }
 
     @Test
-    fun `cancelling a caller during uncontended acquireInputLock releases the mutex`(): Unit =
+    fun `cancelling a caller during uncontended acquireInputLock releases the mutex`() =
         runBlocking {
             val process = BlockedInputProcess()
             val session =
@@ -236,7 +236,46 @@ class TerminalSendQueueTest {
             assertTrue(process.writeStarted.await(5, TimeUnit.SECONDS), "Subsequent send must acquire the input lock")
             process.releaseWrite.countDown()
             subsequent.join()
+            assertFalse(process.writes.contains(42.toByte()), "Cancelled caller's bytes must not reach pipe")
             assertTrue(process.writes.contains(99.toByte()), "Subsequent write must be delivered")
+        }
+
+    @Test
+    fun `cancelling a queued caller during contended acquireInputLock releases the mutex`() =
+        runBlocking {
+            val process = BlockedInputProcess()
+            val session =
+                TerminalSession(
+                    "fixture",
+                    "/fixture",
+                    listOf("fixture"),
+                    process,
+                    80,
+                    24,
+                    inputQueueTimeoutMillis = 300,
+                    inputWriteTimeoutMillis = 60_000,
+                )
+            val holder = CompletableFuture.runAsync { runBlocking { session.send(byteArrayOf(0)) } }
+            try {
+                assertTrue(process.writeStarted.await(5, TimeUnit.SECONDS))
+                val queued = launch { session.send(byteArrayOf(42)) }
+                delay(100)
+                assertTrue(queued.isActive)
+                queued.cancelAndJoin()
+                assertTrue(queued.isCancelled)
+
+                process.releaseWrite.countDown()
+                holder.get(5, TimeUnit.SECONDS)
+
+                assertFalse(process.writes.contains(42.toByte()), "Cancelled caller's bytes must not reach pipe")
+
+                // Mutex was returned when queued caller was cancelled; subsequent send succeeds immediately.
+                val subsequent = launch(Dispatchers.IO) { session.send(byteArrayOf(99)) }
+                subsequent.join()
+                assertEquals(listOf(0.toByte(), 99.toByte()), process.writes.toList())
+            } finally {
+                process.releaseWrite.countDown()
+            }
         }
 
     private class BlockedInputProcess : Process() {

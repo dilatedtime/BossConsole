@@ -129,28 +129,28 @@ internal class TerminalSession(
     }
 
     private suspend fun acquireInputLock(ticket: Any): Boolean {
-        val acquired =
-            try {
+        var acquired = false
+        try {
+            acquired =
                 withTimeoutOrNull(inputQueueTimeoutMillis) {
                     inputMutex.lock(ticket)
                     true
                 } == true
-            } catch (cancellation: CancellationException) {
+            return acquired
+        } finally {
+            if (!acquired) {
                 // Mutex.lock fast-path does not check cancellation; withTimeoutOrNull prompt
-                // cancellation can throw CancellationException after the lock was taken,
-                // bypassing the post-timeout check and caller's try/finally. Hand the ticket
-                // back so the session's input mutex is not permanently leaked (#1778).
-                if (inputMutex.holdsLock(ticket)) {
-                    inputMutex.unlock(ticket)
+                // cancellation can throw CancellationException after the lock was taken, or the
+                // grant can land on a waiter the timeout already shed. In any path where acquire
+                // did not complete cleanly, hand the ticket back so the session's input mutex is
+                // not leaked (#1778).
+                runCatching {
+                    if (inputMutex.holdsLock(ticket)) {
+                        inputMutex.unlock(ticket)
+                    }
                 }
-                throw cancellation
             }
-        if (!acquired && inputMutex.holdsLock(ticket)) {
-            // The grant can still land on a waiter the timeout already shed; hand
-            // it back instead of leaving the queue locked behind a dead caller.
-            inputMutex.unlock(ticket)
         }
-        return acquired
     }
 
     private fun requireUsableInput() {
