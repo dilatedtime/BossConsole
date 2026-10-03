@@ -442,6 +442,19 @@ class ShortcutKeySemanticsTest {
     }
 
     @Test
+    fun `native key-up before lagging AWT press prints exactly once`() {
+        useBindings(KeyBinding(actionId = KeymapActions.BROWSER_PRINT, key = "P", modifiers = listOf("Cmd")))
+        var nativePrints = 0
+
+        assertTrue(AWTKeyboardInterceptor.claimNativePrint(windowId) { nativePrints++ })
+        AWTKeyboardInterceptor.releaseNativePrint(windowId)
+        assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_PRESSED, KeyEvent.VK_P)))
+        assertTrue(dispatchKeyEvent(key(KeyEvent.KEY_RELEASED, KeyEvent.VK_P)))
+
+        assertEquals(1, printEventCount.get() + nativePrints)
+    }
+
+    @Test
     fun `native-only key-up gives each physical press one print`() {
         var nativePrints = 0
 

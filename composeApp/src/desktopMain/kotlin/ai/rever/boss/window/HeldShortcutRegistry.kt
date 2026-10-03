@@ -176,6 +176,15 @@ internal class HeldShortcutRegistry {
         }
     }
 
+    /**
+     * Release ownership of [keyCode] when AWT reports KEY_RELEASED.
+     *
+     * If the key was held as an armed browser-print chord, it transitions to [KeyState.AwtPrintWon]
+     * to refuse a lagging native callback; if held as a disarmed chord, it transitions to
+     * [KeyState.NativePrintCompleted]. When `shortcut == null` (i.e. the key was not actively [KeyState.Held],
+     * such as when a native winner marker lingers), removing the entry cleans up the marker so subsequent
+     * presses start from a fresh slate.
+     */
     fun release(keyCode: Int): HeldShortcut? =
         synchronized(lock) {
             val current = states[keyCode]
@@ -282,6 +291,8 @@ internal class HeldShortcutRegistry {
                     if (current.windowId == windowId) states.remove(KeyEvent.VK_P)
                 }
 
+                // KeyState.Held is deliberately a no-op: an AWT KEY_PRESSED has already claimed
+                // ownership and will complete or transition this chord through [release].
                 is KeyState.NativePrintReleased,
                 is KeyState.Held,
                 null,

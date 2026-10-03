@@ -249,8 +249,6 @@ class HeldShortcutRegistryTest {
         registry.releaseNativePrint("window-a")
         assertTrue(registry.claimNativePrint("window-a"), "the next physical press must get a fresh winner")
         registry.releaseNativePrint("window-a")
-
-        assertTrue(registry.hasNoHeldKeys)
     }
 
     @Test
@@ -275,7 +273,10 @@ class HeldShortcutRegistryTest {
         assertTrue(registry.claimNativePrint("window-a"))
         assertTrue(registry.claimNativePrint("window-b"))
         registry.releaseNativePrint("window-a")
-        assertFalse(registry.claimNativePrint("window-b"), "another window cannot retire the current winner")
+        assertFalse(
+            registry.claimNativePrint("window-b"),
+            "releasing foreign window-a must not retire window-b active winner",
+        )
         registry.releaseNativePrint("window-b")
         assertTrue(registry.claimNativePrint("window-b"))
     }

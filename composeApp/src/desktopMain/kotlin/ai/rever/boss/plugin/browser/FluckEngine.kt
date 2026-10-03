@@ -2666,6 +2666,18 @@ object FluckEngine {
             }
         }
 
+    internal fun currentBrowserKeyEventRoute(ownerWindowId: String?): BrowserKeyEventRoute =
+        resolveBrowserKeyEventRoute(
+            ownerWindowId = ownerWindowId,
+            ownerWindowIsFocused = ownerWindowId?.let(WindowFocusManager::isWindowFocused) == true,
+            fallbackFocusedWindowId =
+                if (ownerWindowId == null) {
+                    WindowFocusManager.focusedWindowFlow.value
+                } else {
+                    null
+                },
+        )
+
     /**
      * Whether this native key interceptor is the only layer that sees main-modifier chords in
      * this configuration, and so has to serve them itself.
@@ -2915,17 +2927,7 @@ object FluckEngine {
                 val modifiers = event.keyModifiers()
                 val keyCode = event.keyCode()
 
-                val route =
-                    resolveBrowserKeyEventRoute(
-                        ownerWindowId = ownerWindowId,
-                        ownerWindowIsFocused = ownerWindowId?.let(WindowFocusManager::isWindowFocused) == true,
-                        fallbackFocusedWindowId =
-                            if (ownerWindowId == null) {
-                                WindowFocusManager.focusedWindowFlow.value
-                            } else {
-                                null
-                            },
-                    )
+                val route = currentBrowserKeyEventRoute(ownerWindowId)
                 if (!route.acceptsInput) {
                     ownerWindowId?.let { windowId ->
                         if (suppressionLogged.compareAndSet(false, true)) {
@@ -3275,9 +3277,13 @@ object FluckEngine {
         browser.set(
             com.teamdev.jxbrowser.browser.callback.input.ReleaseKeyCallback::class.java,
             com.teamdev.jxbrowser.browser.callback.input.ReleaseKeyCallback { params ->
-                if (params.event().keyCode() == com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_P) {
-                    val shortcutWindowId = ownerWindowId ?: WindowFocusManager.focusedWindowFlow.value
-                    shortcutWindowId?.let(ai.rever.boss.window.AWTKeyboardInterceptor::releaseNativePrint)
+                if (params.event().keyCode() == com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_P &&
+                    usesNativePrintChord(ai.rever.boss.keymap.KeymapSettingsManager.currentSettings.value)
+                ) {
+                    val route = currentBrowserKeyEventRoute(ownerWindowId)
+                    if (route.acceptsInput) {
+                        route.shortcutWindowId?.let(ai.rever.boss.window.AWTKeyboardInterceptor::releaseNativePrint)
+                    }
                 }
                 com.teamdev.jxbrowser.browser.callback.input.ReleaseKeyCallback.Response
                     .proceed()
