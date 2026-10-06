@@ -21,7 +21,8 @@ class HeldShortcutRegistryTest {
     private fun event(
         keyCode: Int = KeyEvent.VK_N,
         modifiers: Int = 0,
-    ) = KeyEvent(source, KeyEvent.KEY_PRESSED, 0, modifiers, keyCode, keyCode.toChar())
+        whenTime: Long = 0L,
+    ) = KeyEvent(source, KeyEvent.KEY_PRESSED, whenTime, modifiers, keyCode, keyCode.toChar())
 
     private fun held(
         keyCode: Int = KeyEvent.VK_N,
@@ -275,7 +276,7 @@ class HeldShortcutRegistryTest {
         registry.releaseNativePrint("window-a")
         assertFalse(
             registry.claimNativePrint("window-b"),
-            "releasing foreign window-a must not retire window-b active winner",
+            "window-b active winner must remain active after foreign window-a release",
         )
         registry.releaseNativePrint("window-b")
         assertTrue(registry.claimNativePrint("window-b"))
@@ -290,5 +291,33 @@ class HeldShortcutRegistryTest {
 
         assertTrue(released.releaseActionArmed)
         assertFalse(registry.claimNativePrint("window-a"))
+    }
+
+    @Test
+    fun `modifier release clears its own modifier bit even if event mask retains it`() {
+        val registry = HeldShortcutRegistry()
+        registry.claim(held())
+
+        registry.modifierReleased(event(KeyEvent.VK_META, InputEvent.META_DOWN_MASK))
+
+        assertEquals(AwtModifierSnapshot(metaDown = false), registry[KeyEvent.VK_N]?.modifiers)
+        assertTrue(registry.claimsRepeat(event(), "window-a"))
+    }
+
+    @Test
+    fun `repeat within timeout is consumed but press after timeout is treated as fresh`() {
+        val registry = HeldShortcutRegistry()
+        val shortcut = held()
+        registry.claim(shortcut, event(modifiers = InputEvent.META_DOWN_MASK, whenTime = 1000L))
+
+        val repeatEvent = event(modifiers = InputEvent.META_DOWN_MASK, whenTime = 1040L)
+        assertTrue(registry.claimsRepeat(repeatEvent, "window-a"), "repeat within timeout must be claimed")
+
+        val latePressEvent = event(modifiers = InputEvent.META_DOWN_MASK, whenTime = 3040L)
+        assertFalse(
+            registry.claimsRepeat(latePressEvent, "window-a"),
+            "press after timeout gap must not be treated as repeat",
+        )
+        assertTrue(registry.hasNoHeldKeys, "stale held record must be removed on timeout expiry")
     }
 }

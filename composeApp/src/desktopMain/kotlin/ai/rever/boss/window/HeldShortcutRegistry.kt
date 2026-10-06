@@ -47,6 +47,15 @@ internal data class AwtModifierSnapshot(
             else -> false
         }
 
+    fun without(keyCode: Int): AwtModifierSnapshot =
+        when (keyCode) {
+            KeyEvent.VK_META -> copy(metaDown = false)
+            KeyEvent.VK_CONTROL -> copy(controlDown = false)
+            KeyEvent.VK_SHIFT -> copy(shiftDown = false)
+            KeyEvent.VK_ALT -> copy(altDown = false)
+            else -> this
+        }
+
     companion object {
         fun from(event: KeyEvent): AwtModifierSnapshot =
             AwtModifierSnapshot(
@@ -74,6 +83,7 @@ internal class HeldShortcutRegistry {
 
         data class Held(
             val shortcut: HeldShortcut,
+            val lastEventTime: Long = 0L,
         ) : KeyState {
             override val windowId: String = shortcut.windowId
         }
@@ -103,11 +113,16 @@ internal class HeldShortcutRegistry {
 
     operator fun get(keyCode: Int): HeldShortcut? = synchronized(lock) { (states[keyCode] as? KeyState.Held)?.shortcut }
 
+    companion object {
+        internal const val REPEAT_TIMEOUT_MS = 1000L
+    }
+
     fun claim(
         shortcut: HeldShortcut,
         event: KeyEvent? = null,
     ): HeldShortcut {
         val candidate = if (event == null) shortcut else shortcut.copy(modifiers = AwtModifierSnapshot.from(event))
+        val eventTime = if (event != null && event.`when` > 0L) event.`when` else 0L
         return synchronized(lock) {
             val previous = states[candidate.keyCode]
             val nativeAlreadyWon =
@@ -122,7 +137,7 @@ internal class HeldShortcutRegistry {
                 } else {
                     candidate
                 }
-            states[claimed.keyCode] = KeyState.Held(claimed)
+            states[claimed.keyCode] = KeyState.Held(claimed, lastEventTime = eventTime)
             claimed
         }
     }
@@ -130,6 +145,9 @@ internal class HeldShortcutRegistry {
     /**
      * Returns true for an auto-repeat of the same physical chord. A record from another window
      * or modifier combination is stale and is atomically discarded so the new press can match.
+     *
+     * A press arriving after [REPEAT_TIMEOUT_MS] since the last event is treated as a fresh
+     * press rather than an auto-repeat, recovering gracefully if an intervening key-up was lost.
      */
     fun claimsRepeat(
         event: KeyEvent,
@@ -138,7 +156,18 @@ internal class HeldShortcutRegistry {
         synchronized(lock) {
             when (val current = states[event.keyCode]) {
                 is KeyState.Held -> {
-                    if (current.shortcut.matches(event, windowId)) {
+                    val timeDelta =
+                        if (current.lastEventTime > 0L && event.`when` > 0L) {
+                            event.`when` - current.lastEventTime
+                        } else {
+                            0L
+                        }
+                    if (timeDelta > REPEAT_TIMEOUT_MS) {
+                        states.remove(event.keyCode)
+                        false
+                    } else if (current.shortcut.matches(event, windowId)) {
+                        val nextTime = if (event.`when` > 0L) event.`when` else current.lastEventTime
+                        states[event.keyCode] = current.copy(lastEventTime = nextTime)
                         true
                     } else {
                         states.remove(event.keyCode)
@@ -214,11 +243,11 @@ internal class HeldShortcutRegistry {
      * identity expected from subsequent OS repeats. Unrelated and lock-key releases do nothing.
      */
     fun modifierReleased(event: KeyEvent) {
-        val newModifiers = AwtModifierSnapshot.from(event)
+        val newModifiers = AwtModifierSnapshot.from(event).without(event.keyCode)
         synchronized(lock) {
             states.replaceAll { _, state ->
                 if (state is KeyState.Held && state.shortcut.usedModifier(event.keyCode)) {
-                    KeyState.Held(state.shortcut.copy(modifiers = newModifiers))
+                    state.copy(shortcut = state.shortcut.copy(modifiers = newModifiers))
                 } else {
                     state
                 }
@@ -239,7 +268,7 @@ internal class HeldShortcutRegistry {
                 is KeyState.Held -> {
                     val shortcut = current.shortcut
                     if (shortcut.windowId == windowId && shortcut.firesOnRelease && shortcut.releaseActionArmed) {
-                        states[KeyEvent.VK_P] = KeyState.Held(shortcut.copy(releaseActionArmed = false))
+                        states[KeyEvent.VK_P] = current.copy(shortcut = shortcut.copy(releaseActionArmed = false))
                         true
                     } else {
                         false
