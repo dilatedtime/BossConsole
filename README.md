@@ -2,27 +2,29 @@
 
 <img src="docs/boss-logo.png" alt="BOSS" width="128" height="128" />
 
-### 🔬 The operator's console for AI agents - and the scientists who direct them
+### A desktop workspace for AI agents and the people directing them
 
-**The first open-source, multi-platform harness for AI agents - an evolvable toolbox for agents and the humans they work with.**
+**BOSS brings AI coding agents, a browser, terminal, editor, secrets, plugins, and governed MCP tools into one open-source desktop application.**
 
-_🧪 Built for enterprises, science, and research._
+Built for technical teams, researchers, and independent developers.
 
-**⚡ Natively multi-threaded - built on the JVM, not Electron - with live hot-reload and laptop-to-supercomputer scale.**
+**It runs on the JVM, supports live plugin reloads, and works on macOS, Windows, and Linux.**
 
-Bring your own agent - Claude Code, Codex, Gemini, or OpenCode - and give it a real browser, terminal, editor, secrets, and automation. Then decide exactly what each one is allowed to touch. Run it on your own machine, hand a live terminal to your phone with a QR code, and reshape any tool - by hand or by the agent itself - while the app keeps running.
+Use Claude Code, Codex, Gemini, or OpenCode with the same local workspace. You decide which tools an agent can call. BOSS can also share a live terminal with another device and load updated plugins without restarting the application.
 
 [![BOSS Version](https://img.shields.io/github/v/release/risa-labs-inc/BossConsole-Releases.svg?label=BOSS&color=brightgreen)](https://github.com/risa-labs-inc/BossConsole-Releases/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue.svg)](https://github.com/risa-labs-inc/BossConsole-Releases/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[**⬇ Download**](#downloads) · [📊 Compare](#how-boss-compares) · [⚡ Browser benchmark](#browser-performance) · [🤖 Run an agent](#run-any-ai-coding-agent) · [🔐 Governance](#you-decide-what-your-agents-can-touch) · [🧰 Toolbox](#toolbox--an-app-store-inside-the-app) · [🖥️ BossTerm](#bossterm--a-terminal-you-can-share-to-any-device)
+[Download](#downloads) · [Compare](#how-boss-compares) · [Browser benchmark](#browser-performance) · [Run an agent](#run-any-ai-coding-agent) · [Governance](#you-decide-what-your-agents-can-touch) · [Toolbox](#toolbox--an-app-store-inside-the-app) · [BossTerm](#bossterm--a-terminal-you-can-share-to-any-device)
 
 </div>
 
 > **Just want to download BOSS?** Head to [**BossConsole-Releases**](https://github.com/risa-labs-inc/BossConsole-Releases) for pre-built installers.
 
-Built with Kotlin Multiplatform and Compose Multiplatform, BOSS unifies an embedded browser, a blazing-fast shareable terminal, a code editor, an extensible **Toolbox** of plugins, and a governed **MCP** tool layer into one desktop workspace for complex, AI-assisted work.
+This repository is a fork of [risa-labs-inc/BossConsole](https://github.com/risa-labs-inc/BossConsole).
+
+Built with Kotlin Multiplatform and Compose Multiplatform, BOSS combines an embedded browser, a shareable terminal, a code editor, an extensible **Toolbox** of plugins, and a governed **MCP** tool layer.
 
 ---
 
