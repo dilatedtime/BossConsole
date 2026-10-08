@@ -193,12 +193,18 @@ internal class SessionFileImporter(
         val reason: String,
     ) : IOException(reason)
 
-    @Suppress("ReturnCount")
-    private fun readAndConsume(): Read =
-        try {
+    @Suppress("ReturnCount", "ThrowsCount")
+    private fun readAndConsume(): Read {
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+            lastRejection = null
+            lastSeen = null
+            return Read.Absent
+        }
+        return try {
             val attrs = Files.readAttributes(path, PosixFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
             problemWith(attrs)?.let { throw Refused(it) }
-            val seen = Snapshot(attrs.fileKey(), attrs.size(), attrs.lastModifiedTime())
+            val key = attrs.fileKey() ?: runCatching { path.toRealPath(LinkOption.NOFOLLOW_LINKS) }.getOrNull()
+            val seen = Snapshot(key, attrs.size(), attrs.lastModifiedTime())
             val age = java.time.Duration.between(attrs.lastModifiedTime().toInstant(), now())
             if (seen != lastSeen || age < pollInterval.toJavaDuration()) {
                 lastSeen = seen
@@ -238,6 +244,7 @@ internal class SessionFileImporter(
         } catch (e: IOException) {
             reject("I/O error: ${e::class.simpleName}")
         }
+    }
 
     private fun problemWith(attrs: PosixFileAttributes): String? =
         when {
@@ -246,19 +253,26 @@ internal class SessionFileImporter(
             else -> ownerProblem(path, attrs, LinkOption.NOFOLLOW_LINKS) ?: contentProblem(attrs)
         }
 
-    private fun contentProblem(attrs: PosixFileAttributes): String? =
-        when {
+    private fun contentProblem(attrs: PosixFileAttributes): String? {
+        val rawMode =
+            runCatching {
+                Files.getAttribute(path, "unix:mode", LinkOption.NOFOLLOW_LINKS) as? Int
+            }.getOrNull()
+        return when {
+            rawMode != null && (rawMode and UNIX_PERM_MASK) != MODE_0600 -> "mode is not 0600"
             attrs.permissions() != OWNER_RW -> "mode is not 0600"
             attrs.size() > MAX_BYTES -> "too large"
             else -> parentProblem()
         }
+    }
 
     // A directory others can write to lets them rename a different file in between check and read.
     @Suppress("ReturnCount")
     private fun parentProblem(): String? {
         val parent = path.parent ?: return "has no parent directory"
-        val dir = Files.readAttributes(parent, PosixFileAttributes::class.java)
-        ownerProblem(parent, dir)?.let { return "parent directory $it" }
+        val dir = Files.readAttributes(parent, PosixFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        if (dir.isSymbolicLink) return "parent directory is a symlink"
+        ownerProblem(parent, dir, LinkOption.NOFOLLOW_LINKS)?.let { return "parent directory $it" }
         return if (dir.permissions().any { it in OTHERS_WRITE }) "parent directory is writable by others" else null
     }
 
@@ -300,9 +314,10 @@ internal class SessionFileImporter(
 
     @Suppress("ReturnCount")
     private fun parseRefreshToken(bytes: ByteArray): String? {
+        val text = bytes.decodeToString(throwOnInvalidSequence = true).removePrefix("\uFEFF")
         val element =
             try {
-                Json.parseToJsonElement(bytes.decodeToString(throwOnInvalidSequence = true))
+                Json.parseToJsonElement(text)
             } catch (e: SerializationException) {
                 logger.warn(LogCategory.AUTH, "Session import file is not valid JSON", decodeFailure(e))
                 return null
@@ -315,7 +330,8 @@ internal class SessionFileImporter(
             field
                 ?.takeIf { it.isString }
                 ?.content
-                ?.takeIf { it.isNotBlank() }
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
         if (token == null) logger.warn(LogCategory.AUTH, "Session import file has an unexpected shape")
         return token
     }
@@ -324,6 +340,8 @@ internal class SessionFileImporter(
         const val ENV = "BOSS_SESSION_IMPORT"
         private const val FIELD = "refresh_token"
         internal const val MAX_BYTES = 16 * 1024
+        private const val UNIX_PERM_MASK = 0xFFF // 07777 in octal
+        private const val MODE_0600 = 0x180 // 0600 in octal: rw-------
         private val OTHERS_WRITE = setOf(PosixFilePermission.GROUP_WRITE, PosixFilePermission.OTHERS_WRITE)
         private val OWNER_RW = setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)
 

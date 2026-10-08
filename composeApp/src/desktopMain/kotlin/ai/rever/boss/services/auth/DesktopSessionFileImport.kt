@@ -12,6 +12,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicReference
@@ -46,6 +48,7 @@ internal actual fun startSessionFileImport(scope: CoroutineScope) {
     val job =
         // Off the caller's (main) dispatcher: the loop does file I/O and a network round trip.
         scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            SupabaseConfig.isInitialized.filter { it }.first()
             val status = SupabaseConfig.client.auth.sessionStatus
             importer.run(status.map(::wantsSessionImport))
         }
