@@ -119,4 +119,25 @@ class AutomaticPluginInstallRegressionTest {
         assertFalse(retry.canAttempt("plugin", "2", Long.MAX_VALUE))
         assertTrue(retry.canAttempt("plugin", "3", 600_000))
     }
+
+    @Test
+    fun `promote replaces existing destination file and signature sidecar atomically`() {
+        val directory = Files.createTempDirectory("plugin-update-replace").toFile()
+        try {
+            val destination = java.io.File(directory, "plugin-replace.jar").apply { writeText("old bytes") }
+            PluginSignatureSidecar.write(destination.absolutePath, "old signature")
+            val artifact = PluginUpdateArtifact(destination)
+            artifact.target.writeText("prior collision")
+            PluginSignatureSidecar.write(artifact.target.absolutePath, "prior signature")
+            artifact.download.writeText("promoted bytes")
+            PluginSignatureSidecar.write(artifact.download.absolutePath, "new signature")
+
+            assertTrue(artifact.promote().isSuccess)
+            assertEquals("promoted bytes", artifact.target.readText())
+            assertEquals("new signature", PluginSignatureSidecar.read(artifact.target.absolutePath))
+            assertFalse(artifact.download.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }

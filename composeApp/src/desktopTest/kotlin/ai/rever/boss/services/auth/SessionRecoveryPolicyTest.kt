@@ -11,7 +11,7 @@ import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Unit tests for [SessionRecoveryPolicy] — the retry-vs-clear decision behind
+ * Unit tests for [SessionRecoveryPolicy] - the retry-vs-clear decision behind
  * CoreAuthService's session recovery loop.
  */
 class SessionRecoveryPolicyTest {

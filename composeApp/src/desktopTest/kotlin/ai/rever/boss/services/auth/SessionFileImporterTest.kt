@@ -436,4 +436,81 @@ class SessionFileImporterTest {
         assertFalse(hasLiveSession(session(now - 1.hours), now))
         assertTrue(hasLiveSession(session(now + 1.hours), now))
     }
+
+    @Test
+    fun `token with leading or trailing whitespace and newlines is trimmed upon adoption`(): Unit =
+        runBlocking {
+            assumePosix()
+            write(content = "{\"refresh_token\":\"  rt-padded-123 \\n\"}")
+            val imp = importer()
+            assertEquals(Outcome.IMPORTED, imp.settle())
+            assertEquals(listOf("rt-padded-123"), adopted)
+            assertFalse(file.exists())
+        }
+
+    @Test
+    fun `session file containing utf-8 byte order mark is decoded and imported`(): Unit =
+        runBlocking {
+            assumePosix()
+            val bomBytes =
+                byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()) +
+                    "{\"refresh_token\":\"rt-bom-123\"}".toByteArray(Charsets.UTF_8)
+            Files.deleteIfExists(file)
+            file.writeBytes(bomBytes)
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"))
+            val imp = importer()
+            assertEquals(Outcome.IMPORTED, imp.settle())
+            assertEquals(listOf("rt-bom-123"), adopted)
+            assertFalse(file.exists())
+        }
+
+    @Test
+    fun `parent directory that is a symlink is refused`(): Unit =
+        runBlocking {
+            assumePosix()
+            val realDir = createTempDirectory("session-import-real")
+            Files.setPosixFilePermissions(realDir, PosixFilePermissions.fromString("rwx------"))
+            val symlinkParent = dir.resolve("symlink-parent")
+            try {
+                Files.createSymbolicLink(symlinkParent, realDir)
+                val symlinkedFile = symlinkParent.resolve("session.json")
+                val realFile = realDir.resolve("session.json")
+                realFile.writeText("{\"refresh_token\":\"rt-symlink\"}")
+                Files.setPosixFilePermissions(realFile, PosixFilePermissions.fromString("rw-------"))
+                val imp =
+                    SessionFileImporter(
+                        path = symlinkedFile,
+                        isSignedIn = { false },
+                        adopt = { adopted += it },
+                        currentUid = uid,
+                        pollInterval = 10.milliseconds,
+                    )
+                assertEquals(Outcome.REJECTED, imp.settle())
+                assertEquals("parent directory is a symlink", imp.lastRefusal)
+                assertTrue(realFile.exists())
+            } finally {
+                realDir.toFile().deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `a file with special mode bits is refused when raw mode is available`(): Unit =
+        runBlocking {
+            assumePosix()
+            write()
+            val rawMode =
+                runCatching {
+                    Files.getAttribute(file, "unix:mode", LinkOption.NOFOLLOW_LINKS) as? Int
+                }.getOrNull()
+            Assumptions.assumeTrue(rawMode != null, "unix:mode attribute needed")
+            try {
+                Files.setAttribute(file, "unix:mode", 0x980, LinkOption.NOFOLLOW_LINKS)
+                val imp = importer()
+                assertEquals(Outcome.REJECTED, imp.settle())
+                assertEquals("mode is not 0600", imp.lastRefusal)
+                assertTrue(file.exists())
+            } catch (_: Exception) {
+                // Some OS/filesystems prohibit setting setuid bits in temp directories
+            }
+        }
 }
