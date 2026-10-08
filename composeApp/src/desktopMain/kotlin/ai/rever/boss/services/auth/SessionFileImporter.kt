@@ -15,18 +15,23 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.LinkOption
 import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFileAttributes
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -45,6 +50,10 @@ import kotlin.time.toJavaDuration
  * once. Its only accepted content is `{"refresh_token":"..."}`. Nothing read from it is ever logged.
  * The read buffers are zeroed after parsing; the decoded JSON and token strings are not wipeable.
  *
+ * The outcome of the import is written to an atomic 0600 sibling result file ([resultPath])
+ * holding the outcome (IMPORTED, FAILED, MALFORMED, REJECTED, SIGNED_IN), status, error/reason,
+ * and timestamp. Tokens are never included in the result file.
+ *
  * Writer contract (also in AGENTS.md): `umask 077`, write `$path.tmp` in the same directory, then
  * `mv` it onto [path].
  */
@@ -62,10 +71,14 @@ internal class SessionFileImporter(
     private val fastPolls: Int = 120,
     private val failureStatus: (Exception) -> Int? = { null },
     private val now: () -> Instant = Instant::now,
+    private val resultPath: Path = path.resolveSibling("${path.fileName}.result"),
 ) {
     enum class Outcome { ABSENT, PENDING, SIGNED_IN, REJECTED, MALFORMED, IMPORTED, FAILED }
 
     private val logger = BossLogger.forComponent("SessionFileImporter")
+
+    /** The path to the sibling result file; for tests and callers. */
+    internal val outcomePath: Path get() = resultPath
 
     // Last refusal logged, so a file left in place is reported once per reason, not every poll.
     @Volatile
@@ -134,25 +147,46 @@ internal class SessionFileImporter(
     private suspend fun consumeAndAdopt(): Outcome {
         val bytes =
             when (val read = withContext(Dispatchers.IO) { readAndConsume() }) {
-                is Read.Absent -> return Outcome.ABSENT
-                is Read.Pending -> return Outcome.PENDING
-                is Read.SignedIn -> return Outcome.SIGNED_IN
-                is Read.Rejected -> return Outcome.REJECTED
-                is Read.Content -> read.bytes
+                is Read.Absent -> {
+                    return Outcome.ABSENT
+                }
+
+                is Read.Pending -> {
+                    return Outcome.PENDING
+                }
+
+                is Read.SignedIn -> {
+                    withContext(Dispatchers.IO) { writeResult(Outcome.SIGNED_IN) }
+                    return Outcome.SIGNED_IN
+                }
+
+                is Read.Rejected -> {
+                    return Outcome.REJECTED
+                }
+
+                is Read.Content -> {
+                    read.bytes
+                }
             }
-        val token =
+        val (token, malformedReason) =
             try {
                 parseRefreshToken(bytes)
             } finally {
                 bytes.fill(0)
-            } ?: return Outcome.MALFORMED
+            }
+        if (token == null) {
+            withContext(Dispatchers.IO) { writeResult(Outcome.MALFORMED, error = malformedReason) }
+            return Outcome.MALFORMED
+        }
         if (isSignedIn()) {
             logger.info(LogCategory.AUTH, "Session import discarded: a session appeared after the file was consumed")
+            withContext(Dispatchers.IO) { writeResult(Outcome.SIGNED_IN) }
             return Outcome.SIGNED_IN
         }
         return try {
             adopt(token)
             logger.info(LogCategory.AUTH, "Session imported from file")
+            withContext(Dispatchers.IO) { writeResult(Outcome.IMPORTED, status = 200) }
             Outcome.IMPORTED
         } catch (e: CancellationException) {
             throw e
@@ -160,11 +194,15 @@ internal class SessionFileImporter(
             @Suppress("TooGenericExceptionCaught") e: Exception,
         ) {
             // Only the type and status: an auth error can echo request details.
+            val status = failureStatus(e)
             logger.warn(
                 LogCategory.AUTH,
                 "Session import failed",
-                mapOf("error" to e::class.simpleName, "status" to failureStatus(e)),
+                mapOf("error" to e::class.simpleName, "status" to status),
             )
+            withContext(Dispatchers.IO) {
+                writeResult(Outcome.FAILED, status = status, error = e::class.simpleName)
+            }
             Outcome.FAILED
         }
     }
@@ -196,6 +234,11 @@ internal class SessionFileImporter(
     @Suppress("ReturnCount")
     private fun readAndConsume(): Read =
         try {
+            if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+                lastRejection = null
+                lastSeen = null
+                return Read.Absent
+            }
             val attrs = Files.readAttributes(path, PosixFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
             problemWith(attrs)?.let { throw Refused(it) }
             val seen = Snapshot(attrs.fileKey(), attrs.size(), attrs.lastModifiedTime())
@@ -293,22 +336,23 @@ internal class SessionFileImporter(
         rejectionRepeated = reason == lastRejection
         if (!rejectionRepeated) {
             logger.warn(LogCategory.AUTH, "Session import file refused and left in place", mapOf("reason" to reason))
+            writeResult(Outcome.REJECTED, reason = reason)
         }
         lastRejection = reason
         return Read.Rejected
     }
 
     @Suppress("ReturnCount")
-    private fun parseRefreshToken(bytes: ByteArray): String? {
+    private fun parseRefreshToken(bytes: ByteArray): Pair<String?, String?> {
         val element =
             try {
                 Json.parseToJsonElement(bytes.decodeToString(throwOnInvalidSequence = true))
             } catch (e: SerializationException) {
                 logger.warn(LogCategory.AUTH, "Session import file is not valid JSON", decodeFailure(e))
-                return null
+                return null to "not valid JSON"
             } catch (_: CharacterCodingException) {
                 logger.warn(LogCategory.AUTH, "Session import file is not UTF-8")
-                return null
+                return null to "not UTF-8"
             }
         val field = (element as? JsonObject)?.takeIf { it.keys == setOf(FIELD) }?.get(FIELD) as? JsonPrimitive
         val token =
@@ -316,8 +360,70 @@ internal class SessionFileImporter(
                 ?.takeIf { it.isString }
                 ?.content
                 ?.takeIf { it.isNotBlank() }
-        if (token == null) logger.warn(LogCategory.AUTH, "Session import file has an unexpected shape")
-        return token
+        if (token == null) {
+            logger.warn(LogCategory.AUTH, "Session import file has an unexpected shape")
+            return null to "unexpected shape"
+        }
+        return token to null
+    }
+
+    @Suppress("LongMethod")
+    private fun writeResult(
+        outcome: Outcome,
+        status: Int? = null,
+        error: String? = null,
+        reason: String? = null,
+    ) {
+        val parent = resultPath.parent
+        val tmp = parent?.resolve("${resultPath.fileName}.tmp") ?: Paths.get("${resultPath.fileName}.tmp")
+        try {
+            val json =
+                buildJsonObject {
+                    put("outcome", outcome.name)
+                    status?.let { put("status", it) }
+                    error?.let { put("error", it) }
+                    reason?.let { put("reason", it) }
+                    put("timestamp", now().toString())
+                }.toString() + "\n"
+            val bytes = json.toByteArray(Charsets.UTF_8)
+            Files.deleteIfExists(tmp)
+            try {
+                val attr = PosixFilePermissions.asFileAttribute(OWNER_RW)
+                Files.createFile(tmp, attr)
+                Files.setPosixFilePermissions(tmp, OWNER_RW)
+            } catch (_: UnsupportedOperationException) {
+                Files.createFile(tmp)
+            }
+            Files.write(tmp, bytes, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
+            try {
+                Files.move(tmp, resultPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(tmp, resultPath, StandardCopyOption.REPLACE_EXISTING)
+            }
+            try {
+                Files.setPosixFilePermissions(resultPath, OWNER_RW)
+            } catch (_: UnsupportedOperationException) {
+                // Non-POSIX filesystem
+            }
+        } catch (e: IOException) {
+            logger.warn(
+                LogCategory.AUTH,
+                "Failed to write session import result file",
+                mapOf("error" to e::class.simpleName),
+            )
+        } catch (e: SecurityException) {
+            logger.warn(
+                LogCategory.AUTH,
+                "Failed to write session import result file",
+                mapOf("error" to e::class.simpleName),
+            )
+        } finally {
+            try {
+                Files.deleteIfExists(tmp)
+            } catch (_: IOException) {
+                // Best effort cleanup
+            }
+        }
     }
 
     companion object {

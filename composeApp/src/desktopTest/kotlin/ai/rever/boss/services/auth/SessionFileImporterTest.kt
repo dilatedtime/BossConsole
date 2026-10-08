@@ -10,6 +10,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assumptions
 import java.io.IOException
 import java.nio.file.FileSystems
@@ -20,6 +24,7 @@ import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermissions
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.exists
+import kotlin.io.path.readText
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.AfterTest
@@ -45,6 +50,7 @@ class SessionFileImporterTest {
             if (posix) Files.setPosixFilePermissions(it, PosixFilePermissions.fromString("rwx------"))
         }
     private val file = dir.resolve("session-import.json")
+    private val resultFile = file.resolveSibling("${file.fileName}.result")
     private val uid = if (posix) Files.getAttribute(dir, "unix:uid") as Int else null
 
     private var signedIn = false
@@ -52,9 +58,16 @@ class SessionFileImporterTest {
     private var fileExistedAtAdopt: Boolean? = null
     private var adoptFailure: Exception? = null
 
+    private class FakeRestException(
+        val code: Int,
+    ) : Exception("unauthorized")
+
+    private fun resultJson(): JsonObject = Json.parseToJsonElement(resultFile.readText()).jsonObject
+
     private fun importer(
         currentUid: Int? = uid,
         currentUser: String? = System.getProperty("user.name"),
+        failureStatus: (Exception) -> Int? = { null },
     ) = SessionFileImporter(
         path = file,
         isSignedIn = { signedIn },
@@ -66,6 +79,7 @@ class SessionFileImporterTest {
         currentUid = currentUid,
         currentUser = currentUser,
         pollInterval = 10.milliseconds,
+        failureStatus = failureStatus,
     )
 
     // A file is read only once it is unchanged across two polls and one poll interval old.
@@ -436,4 +450,135 @@ class SessionFileImporterTest {
         assertFalse(hasLiveSession(session(now - 1.hours), now))
         assertTrue(hasLiveSession(session(now + 1.hours), now))
     }
+
+    @Test
+    fun `successful adoption writes 0600 result file with outcome IMPORTED and status 200`() =
+        runBlocking {
+            assumePosix()
+            write()
+            val imp = importer()
+            assertEquals(Outcome.IMPORTED, imp.settle())
+            assertTrue(resultFile.exists(), "result file must exist")
+            if (posix) {
+                assertEquals(
+                    "rw-------",
+                    PosixFilePermissions.toString(Files.getPosixFilePermissions(resultFile)),
+                )
+            }
+            val json = resultJson()
+            assertEquals("IMPORTED", json["outcome"]?.jsonPrimitive?.content)
+            assertEquals("200", json["status"]?.jsonPrimitive?.content)
+            assertTrue(json["timestamp"]?.jsonPrimitive?.content?.isNotBlank() == true)
+            assertFalse(resultFile.readText().contains("rt-123"), "token must not appear in result")
+        }
+
+    @Test
+    fun `failed adoption writes outcome FAILED with error type and status code`() =
+        runBlocking {
+            assumePosix()
+            write()
+            adoptFailure = FakeRestException(401)
+            val imp = importer(failureStatus = { (it as? FakeRestException)?.code })
+            assertEquals(Outcome.FAILED, imp.settle())
+            assertTrue(resultFile.exists())
+            val json = resultJson()
+            assertEquals("FAILED", json["outcome"]?.jsonPrimitive?.content)
+            assertEquals("FakeRestException", json["error"]?.jsonPrimitive?.content)
+            assertEquals("401", json["status"]?.jsonPrimitive?.content)
+            assertTrue(json["timestamp"]?.jsonPrimitive?.content?.isNotBlank() == true)
+            assertFalse(resultFile.readText().contains("rt-123"))
+        }
+
+    @Test
+    fun `failed adoption without status code writes outcome FAILED with error type and no status`() =
+        runBlocking {
+            assumePosix()
+            write()
+            adoptFailure = IOException("network unreachable")
+            val imp = importer()
+            assertEquals(Outcome.FAILED, imp.settle())
+            assertTrue(resultFile.exists())
+            val json = resultJson()
+            assertEquals("FAILED", json["outcome"]?.jsonPrimitive?.content)
+            assertEquals("IOException", json["error"]?.jsonPrimitive?.content)
+            assertNull(json["status"])
+            assertTrue(json["timestamp"]?.jsonPrimitive?.content?.isNotBlank() == true)
+            assertFalse(resultFile.readText().contains("rt-123"))
+        }
+
+    @Test
+    fun `malformed JSON writes outcome MALFORMED with error description`() =
+        runBlocking {
+            assumePosix()
+            write(content = "not valid json {")
+            val imp = importer()
+            assertEquals(Outcome.MALFORMED, imp.settle())
+            assertTrue(resultFile.exists())
+            val json1 = resultJson()
+            assertEquals("MALFORMED", json1["outcome"]?.jsonPrimitive?.content)
+            assertEquals("not valid JSON", json1["error"]?.jsonPrimitive?.content)
+
+            // Unexpected shape
+            write(content = """{"other_key":"value"}""")
+            assertEquals(Outcome.MALFORMED, imp.settle())
+            val json2 = resultJson()
+            assertEquals("MALFORMED", json2["outcome"]?.jsonPrimitive?.content)
+            assertEquals("unexpected shape", json2["error"]?.jsonPrimitive?.content)
+        }
+
+    @Test
+    fun `refused file writes outcome REJECTED with reason and does not rewrite on repeated poll`() =
+        runBlocking {
+            assumePosix()
+            write(mode = "rw-r--r--")
+            val imp = importer()
+            assertEquals(Outcome.REJECTED, imp.settle())
+            assertTrue(resultFile.exists())
+            val json = resultJson()
+            assertEquals("REJECTED", json["outcome"]?.jsonPrimitive?.content)
+            assertEquals("mode is not 0600", json["reason"]?.jsonPrimitive?.content)
+            val mtime1 = Files.getLastModifiedTime(resultFile)
+
+            // Repeated poll should not rewrite the result file
+            assertEquals(Outcome.REJECTED, imp.settle())
+            val mtime2 = Files.getLastModifiedTime(resultFile)
+            assertEquals(mtime1, mtime2, "repeated refusal must not touch result file")
+        }
+
+    @Test
+    fun `existing result file is atomically replaced on subsequent import`() =
+        runBlocking {
+            assumePosix()
+            resultFile.writeText("""{"outcome":"OLD","timestamp":"old-time"}""")
+            write()
+            val imp = importer()
+            assertEquals(Outcome.IMPORTED, imp.settle())
+            val json = resultJson()
+            assertEquals("IMPORTED", json["outcome"]?.jsonPrimitive?.content)
+            assertEquals("200", json["status"]?.jsonPrimitive?.content)
+        }
+
+    @Test
+    fun `already signed in writes outcome SIGNED_IN`() =
+        runBlocking {
+            assumePosix()
+            write()
+            signedIn = true
+            val imp = importer()
+            assertEquals(Outcome.SIGNED_IN, imp.settle())
+            assertTrue(resultFile.exists())
+            val json = resultJson()
+            assertEquals("SIGNED_IN", json["outcome"]?.jsonPrimitive?.content)
+        }
+
+    @Test
+    fun `result file write failure does not crash or abort adoption`() =
+        runBlocking {
+            assumePosix()
+            Files.createDirectory(resultFile)
+            write()
+            val imp = importer()
+            assertEquals(Outcome.IMPORTED, imp.settle())
+            assertEquals(listOf("rt-123"), adopted)
+        }
 }
