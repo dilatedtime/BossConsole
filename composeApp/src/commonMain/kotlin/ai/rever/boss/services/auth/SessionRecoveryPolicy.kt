@@ -17,10 +17,10 @@ import kotlin.time.Instant
  */
 internal object SessionRecoveryPolicy {
     sealed interface Action {
-        /** Transient failure (connectivity, timeout, 5xx) — retry with backoff. */
+        /** Transient failure (connectivity, timeout, 5xx) - retry with backoff. */
         data object Retry : Action
 
-        /** The auth server rejected the refresh token — the session is unrecoverable. */
+        /** The auth server rejected the refresh token - the session is unrecoverable. */
         data object ClearSession : Action
     }
 
@@ -29,10 +29,10 @@ internal object SessionRecoveryPolicy {
 
     /**
      * A refresh failure is fatal only when the auth server explicitly rejected
-     * the refresh token (4xx — e.g. revoked, or rotated by another running
-     * instance). Everything else — no network, timeouts, 5xx, Cloudflare 52x —
+     * the refresh token (4xx - e.g. revoked, or rotated by another running
+     * instance). Everything else - no network, timeouts, 5xx, Cloudflare 52x -
      * may heal on its own and keeps the session. Within 4xx, 408 (request
-     * timeout) and 429 (rate limited — GoTrue and the Cloudflare edge both
+     * timeout) and 429 (rate limited - GoTrue and the Cloudflare edge both
      * emit these under load) say nothing about the token itself and retry.
      */
     fun actionFor(error: Throwable): Action =

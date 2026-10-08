@@ -249,7 +249,7 @@ internal object CoreAuthService {
                             // Startup path: a stored session that expired while the
                             // app was closed and can't be refreshed yet must not
                             // leave the UI on the Loading spinner until recovery
-                            // succeeds — resolve as Offline. The recovery loop
+                            // succeeds: resolve as Offline. The recovery loop
                             // flips the state once refresh succeeds (Authenticated)
                             // or the token is rejected (login screen). Mid-session,
                             // keep the current state and recover silently.
