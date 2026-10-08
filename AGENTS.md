@@ -726,7 +726,25 @@ file; BOSS adopts it as its own session (`refreshSession` then `importSession`).
 - **A refused file is left in place** and the reason logged once (`Session import file refused
   and left in place`, with e.g. `mode is not 0600` or `is owned by uid 65534, not the process uid
   1000`). Fixing the file (or replacing it) is picked up on a later poll. A refusal that repeats
-  slows the poll like an absent file.
+- **Outcome reporting**: The outcome of the import attempt is written atomically to a 0600 sibling
+  file `$BOSS_SESSION_IMPORT.result` (written via temporary sibling `${path.result}.tmp` then atomic
+  rename). The host process can poll for this result file to determine whether adoption succeeded or
+  if a retry is required:
+  - `{"outcome":"IMPORTED","status":200,"timestamp":"..."}`: Token was successfully adopted and the
+    session is active.
+  - `{"outcome":"FAILED","status":<code?>,"error":"<Type>","timestamp":"..."}`: Network or auth adoption
+    failed (e.g. `RestException` with status `401`, or `IOException`). The token was consumed; host
+    should retry with a fresh token.
+  - `{"outcome":"MALFORMED","error":"<reason>","timestamp":"..."}`: File was consumed but content was
+    invalid JSON, not UTF-8, or had unexpected shape.
+  - `{"outcome":"REJECTED","reason":"<reason>","timestamp":"..."}`: File was refused before reading
+    (e.g. `mode is not 0600`, UID mismatch, symlink). Written once on first rejection, not on every
+    repeat poll. The file remains in place.
+  - `{"outcome":"SIGNED_IN","timestamp":"..."}`: BOSS already has an active session.
+  - **Confidentiality guarantee**: Under no circumstances is the sensitive refresh token or
+    authentication credential written to the result file.
+  - **Resilience**: Any I/O error writing the result file is logged as a warning and never crashes
+    or aborts session adoption.
 - **Session recovery**: `CoreAuthService` does not clear a session that replaced the one it was
   recovering (`SessionRecoveryPolicy.replacedSince`), so a handoff that lands while recovery's
   refresh of the old token is in flight survives that refresh's rejection. The guard is one-directional:
