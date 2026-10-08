@@ -23,7 +23,7 @@ import java.io.File
  * `$pluginId-$version.jar`, the plugin-manager store writes
  * `${pluginId.replace('.','_')}_$version.jar`, GitHub installs keep arbitrary
  * asset names), so multiple versions of the same plugin can accumulate. At
- * startup the directory scan loads whichever JAR the OS lists first — an older
+ * startup the directory scan loads whichever JAR the OS lists first: an older
  * version can shadow a newer one ("Plugin already loaded" for the rest).
  *
  * This reconciler groups JARs by their manifest `pluginId`, keeps the highest
@@ -77,7 +77,7 @@ object PluginJarReconciler {
     /**
      * Scan [pluginDir] and remove stale duplicate plugin JARs. Does NOT load
      * or unload anything. Deletes are best-effort: on Windows the JVM may hold
-     * a lock on a previously-loaded JAR and `delete()` returns false — the
+     * a lock on a previously-loaded JAR and `delete()` returns false - the
      * stale file lingers until the next reconcile.
      * [pluginIds] limits an in-session update to its own plugin. A full scan is startup-only:
      * other plugins may have staged newer JARs while their old JARs are still in use.

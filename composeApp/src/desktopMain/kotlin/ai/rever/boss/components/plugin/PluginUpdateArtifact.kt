@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.loader.PluginClassLoader
 import ai.rever.boss.plugin.loader.PluginSignatureSidecar
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.UUID
 
 /** Downloads are invisible to startup until the final preference/view checks admit installation. */
@@ -26,11 +27,15 @@ internal class PluginUpdateArtifact(
 
     fun promote(): Result<Unit> =
         runCatching {
-            Files.move(download.toPath(), target.toPath())
+            Files.move(download.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
             Files.deleteIfExists(File("${target.absolutePath}.rejected-update").toPath())
             val signature = File(PluginSignatureSidecar.pathFor(download.absolutePath))
             if (signature.exists()) {
-                Files.move(signature.toPath(), File(PluginSignatureSidecar.pathFor(target.absolutePath)).toPath())
+                Files.move(
+                    signature.toPath(),
+                    File(PluginSignatureSidecar.pathFor(target.absolutePath)).toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
             }
             Unit
         }
