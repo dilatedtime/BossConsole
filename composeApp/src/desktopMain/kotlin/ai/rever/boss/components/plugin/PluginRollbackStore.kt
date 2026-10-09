@@ -259,6 +259,7 @@ internal object PluginRollbackStore {
         pluginDir: File,
         pluginId: String,
         currentJarPath: String?,
+        deleteFile: (File) -> Boolean = { it.delete() },
     ): File? {
         val restorable =
             RollbackLayout(pluginDir, pluginId).activeSnapshot()?.let { snapshot ->
@@ -269,6 +270,9 @@ internal object PluginRollbackStore {
         return runCatching {
             val destination = File(pluginDir, "${safeName(pluginId)}-$version.jar")
             kept.copyTo(destination, overwrite = true)
+            runCatching {
+                File("${destination.absolutePath}.rejected-update").delete()
+            }
             PluginSignatureSidecar
                 .read(kept.absolutePath)
                 ?.let { PluginSignatureSidecar.persist(destination.absolutePath, it) }
@@ -283,7 +287,22 @@ internal object PluginRollbackStore {
                 ?.takeIf { it.isFile && it.canonicalPath != destination.canonicalPath }
                 ?.let { broken ->
                     PluginSignatureSidecar.delete(broken.absolutePath)
-                    if (broken.delete()) PluginBundledTrust.delete(broken.absolutePath)
+                    val deleted = deleteFile(broken)
+                    if (deleted) {
+                        PluginBundledTrust.delete(broken.absolutePath)
+                    } else {
+                        // On Windows or when an open classloader/handle retains the file,
+                        // deletion fails. Fence the file with .rejected-update so PluginJarReconciler
+                        // and startup directory scans do not pick this broken JAR as a winner.
+                        runCatching {
+                            File("${broken.absolutePath}.rejected-update").writeText("Rolled back")
+                        }
+                        logger.warn(
+                            LogCategory.SYSTEM,
+                            "Could not delete broken plugin JAR during rollback - fenced with rejected marker",
+                            mapOf("pluginId" to pluginId, "broken" to broken.name),
+                        )
+                    }
                 }
             destination
         }.onFailure { e ->
