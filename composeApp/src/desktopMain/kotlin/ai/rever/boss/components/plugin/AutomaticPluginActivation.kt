@@ -18,11 +18,17 @@ internal suspend fun activateAutomaticPluginUpdate(
             }
         },
         restore = {
-            checkNotNull(previousPath) { "Previous plugin artifact is unavailable" }
+            val candidatePath =
+                previousPath?.takeIf { java.io.File(it).isFile }
+                    ?: runCatching {
+                        val pluginDir = java.io.File(path).parentFile
+                        PluginRollbackStore.restore(pluginDir, pluginId, path)?.absolutePath
+                    }.getOrNull()
+            checkNotNull(candidatePath) { "Previous plugin artifact is unavailable" }
             if (manager.getPluginInfo(pluginId) != null) {
                 manager.uninstallPlugin(pluginId, force = true).getOrThrow()
             }
-            manager.installPlugin(previousPath).mapCatching { info ->
+            manager.installPlugin(candidatePath).mapCatching { info ->
                 check(info.state == PluginState.LOADED) { "Previous plugin could not be restored" }
             }
         },

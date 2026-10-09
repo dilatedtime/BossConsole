@@ -322,16 +322,28 @@ internal object PluginLoadGateRecovery {
 private fun refusedJarFor(
     pluginDir: java.io.File,
     pluginId: String,
-): java.io.File? =
-    pluginDir
-        .listFiles { f: java.io.File -> f.isFile && f.name.endsWith(".jar") }
-        ?.firstOrNull { jar ->
-            runCatching {
-                ai.rever.boss.plugin.loader.PluginManifestReader
-                    .readFromJar(jar.absolutePath)
-                    .pluginId
-            }.getOrNull() == pluginId
+): java.io.File? {
+    val comparator =
+        compareBy<Pair<java.io.File, ai.rever.boss.plugin.api.PluginManifest>> {
+            java.io.File("${it.first.absolutePath}.rejected-update").exists()
+        }.thenBy {
+            Version.parse(it.second.version)
+        }.thenBy {
+            it.first.lastModified()
         }
+    val candidates =
+        pluginDir
+            .listFiles { f: java.io.File -> f.isFile && f.name.endsWith(".jar", ignoreCase = true) }
+            ?.mapNotNull { jar ->
+                val manifest =
+                    runCatching {
+                        PluginManifestReader.readFromJar(jar.absolutePath)
+                    }.getOrNull() ?: return@mapNotNull null
+                if (manifest.pluginId != pluginId) return@mapNotNull null
+                jar to manifest
+            }
+    return candidates?.maxWithOrNull(comparator)?.first
+}
 
 /**
  * How long a store lookup may hold the dialog back before we give up and show the offline copy.
