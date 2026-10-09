@@ -394,4 +394,43 @@ class PluginRollbackStoreTest {
         assertFalse(PluginBundledTrust.isTrusted(restored.absolutePath))
         assertFalse(File(PluginBundledTrust.pathFor(restored.absolutePath)).exists())
     }
+
+    @Test
+    fun `when deletion of broken jar fails during restore it is fenced with rejected-update marker`() {
+        val old = writeJar("com.example.rollback-1.0.0.jar", "1.0.0")
+        PluginRollbackStore.snapshot(dir, pluginId, old.absolutePath)
+        val broken = writeJar("com.example.rollback-2.0.0.jar", "2.0.0")
+        val fence = File("${broken.absolutePath}.rejected-update")
+        assertFalse(fence.exists())
+
+        val restored =
+            assertNotNull(
+                PluginRollbackStore.restore(
+                    dir,
+                    pluginId,
+                    broken.absolutePath,
+                    deleteFile = { false },
+                ),
+            )
+        assertEquals("com.example.rollback-1.0.0.jar", restored.name)
+        assertTrue(broken.exists(), "broken file was supposed to fail deletion")
+        assertTrue(fence.exists(), "broken file must be fenced with rejected-update marker")
+        assertEquals("Rolled back", fence.readText())
+    }
+
+    @Test
+    fun `restored destination file removes any stale rejected-update marker`() {
+        val old = writeJar("com.example.rollback-1.0.0.jar", "1.0.0")
+        PluginRollbackStore.snapshot(dir, pluginId, old.absolutePath)
+        old.delete()
+
+        val expectedDestination = File(dir, "com.example.rollback-1.0.0.jar")
+        val staleMarker = File("${expectedDestination.absolutePath}.rejected-update")
+        staleMarker.writeText("Old failure")
+        assertTrue(staleMarker.exists())
+
+        val restored = assertNotNull(PluginRollbackStore.restore(dir, pluginId, null))
+        assertEquals(expectedDestination.absolutePath, restored.absolutePath)
+        assertFalse(staleMarker.exists(), "stale rejected marker must be removed from restored target")
+    }
 }

@@ -6,7 +6,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 /**
- * Tests for [findRelocatedPluginJar] — the fallback used by
+ * Tests for [findRelocatedPluginJar] - the fallback used by
  * [DynamicPluginManager.loadPersistedPlugins] when a persisted jar path went
  * stale because the background system-plugin updater replaced the file under
  * a new versioned name mid-startup.
@@ -31,6 +31,17 @@ class FindRelocatedPluginJarTest {
 
             // 1.8.10 > 1.8.9 numerically though not lexicographically.
             assertEquals(newest, findRelocatedPluginJar(dir, "com.example.mine"))
+        }
+    }
+
+    @Test
+    fun `ignores candidate jars fenced with rejected update sidecar`() {
+        withTempDir { dir ->
+            val older = PluginJarTestFixtures.writeJar(dir, "my-plugin-1.8.7.jar", "com.example.mine", "1.8.7")
+            val rejected = PluginJarTestFixtures.writeJar(dir, "my-plugin-2.0.0.jar", "com.example.mine", "2.0.0")
+            File("${rejected.absolutePath}.rejected-update").writeText("Rejected update")
+
+            assertEquals(older, findRelocatedPluginJar(dir, "com.example.mine"))
         }
     }
 

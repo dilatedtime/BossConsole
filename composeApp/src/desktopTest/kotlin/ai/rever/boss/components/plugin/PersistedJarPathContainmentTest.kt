@@ -204,4 +204,28 @@ class PersistedJarPathContainmentTest {
         assertTrue(isContainedPath(staleInside.absolutePath, listOf(root)))
         assertFalse(isContainedPath(inside.absolutePath, emptyList()), "no roots means nothing is allowed")
     }
+
+    @Test
+    fun `a persisted jar marked with rejected-update falls back to relocated valid jar`() =
+        runBlocking {
+            val pluginDir = tempDir("plugins")
+            val valid = loadableJar(pluginDir, "valid-1.0.0.jar", "com.example.containment.relocated")
+            val rejected = loadableJar(pluginDir, "rejected-2.0.0.jar", "com.example.containment.relocated")
+            File("${rejected.absolutePath}.rejected-update").writeText("Rolled back")
+            val manager = newManager()
+
+            val entry = PersistedPluginEntry("com.example.containment.relocated", rejected.absolutePath, true)
+            val results =
+                manager.loadPersistedPlugins(
+                    listOf(entry),
+                    allowedRoots = listOf(pluginDir),
+                )
+
+            val result = results["com.example.containment.relocated"]
+            assertNotNull(result)
+            assertTrue(result.isSuccess, "the rejected path must fall back to the valid relocated jar")
+            val info = manager.getPluginInfo("com.example.containment.relocated")
+            assertNotNull(info)
+            assertEquals(valid.canonicalPath, File(info.jarPath).canonicalPath)
+        }
 }

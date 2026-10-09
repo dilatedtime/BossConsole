@@ -368,4 +368,32 @@ class ReloadJarPathTest {
             assertEquals(expected, resolved, "case '${case.name}'")
         }
     }
+
+    @Test
+    fun `candidate with rejected update marker is excluded from reload`() {
+        val loaded = "/p/tool-1.0.0.jar"
+        val rejectedPersisted = "/p/tool-2.0.0.jar"
+        val resolved =
+            resolveReloadJarPath(
+                candidates = ReloadJarCandidates(loadedJarPath = loaded, persistedJarPath = rejectedPersisted),
+                exists = { true },
+                relocated = { null },
+                isRejected = { it == rejectedPersisted },
+            )
+        assertEquals(loaded, resolved)
+    }
+
+    @Test
+    fun `falls back to relocation when all candidates are rejected`() {
+        val rejectedLoaded = "/p/tool-2.0.0.jar"
+        val fallback = "/p/tool-1.0.0.jar"
+        val resolved =
+            resolveReloadJarPath(
+                candidates = ReloadJarCandidates(loadedJarPath = rejectedLoaded, persistedJarPath = null),
+                exists = { true },
+                relocated = { fallback },
+                isRejected = { it == rejectedLoaded },
+            )
+        assertEquals(fallback, resolved)
+    }
 }
