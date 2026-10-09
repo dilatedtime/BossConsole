@@ -2382,10 +2382,21 @@ class DynamicPluginManager(
                             Exception("Persisted JAR path is outside the managed plugin roots: ${entry.jarPath}"),
                         )
                 } else {
-                    if (!jarFile.exists()) {
+                    val isRejected = java.io.File("${jarFile.absolutePath}.rejected-update").exists()
+                    if (!jarFile.exists() || isRejected) {
+                        if (isRejected) {
+                            logger.warn(
+                                LogCategory.SYSTEM,
+                                "Persisted plugin JAR was marked as rejected update - seeking relocated jar",
+                                mapOf(
+                                    "pluginId" to entry.pluginId,
+                                    "jarPath" to entry.jarPath,
+                                ),
+                            )
+                        }
                         // The background system-plugin updater can replace a JAR
                         // (new versioned filename, old file deleted) between the
-                        // persisted snapshot being read and this entry's turn —
+                        // persisted snapshot being read and this entry's turn -
                         // the path goes stale while the plugin sits right there
                         // under a new name. Re-resolve by pluginId before giving up.
                         // jarFile passed containment, so its parent is inside an
@@ -2975,8 +2986,8 @@ internal fun managedPluginJarRoots(): List<java.io.File> =
 
 /**
  * [candidate] when it canonically lives under the managed plugin roots, else
- * null. Persisted jar paths are installed.json input — attacker-shaped rows
- * must not redirect a reload at an outside jar — so a refusal is reported
+ * null. Persisted jar paths are installed.json input - attacker-shaped rows
+ * must not redirect a reload at an outside jar - so a refusal is reported
  * through [onRefused] rather than silently dropped.
  */
 internal fun confinedPersistedJarPath(
@@ -3003,11 +3014,11 @@ internal fun confinedPersistedJarPath(
  * does exactly that.
  *
  * Highest-version assumption: this path only triggers when the persisted
- * file is GONE — i.e. after a delete-and-replace, where highest == intended.
+ * file is GONE - i.e. after a delete-and-replace, where highest == intended.
  * A pinned/downgraded version keeps its file and never gets here; and the
  * startup reconciler dedupes multi-version leftovers before the persisted
  * pass, so ambiguity is transient. Cost (opens every jar's manifest) is
- * fine because this is the exceptional path — hoist a single dir-wide
+ * fine because this is the exceptional path - hoist a single dir-wide
  * manifest map if it ever runs per-entry at scale.
  */
 internal fun findRelocatedPluginJar(
@@ -3015,8 +3026,11 @@ internal fun findRelocatedPluginJar(
     pluginId: String,
 ): java.io.File? =
     dir
-        ?.listFiles { f -> f.isFile && f.extension == "jar" }
-        ?.mapNotNull { jar ->
+        ?.listFiles { f ->
+            f.isFile &&
+                f.extension.equals("jar", ignoreCase = true) &&
+                !java.io.File("${f.absolutePath}.rejected-update").exists()
+        }?.mapNotNull { jar ->
             val manifest =
                 runCatching {
                     ai.rever.boss.plugin.loader.PluginManifestReader

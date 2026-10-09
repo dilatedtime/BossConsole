@@ -2,7 +2,7 @@ package ai.rever.boss.components.plugin
 
 /**
  * The JAR a reload should load: the one the plugin is running from, else the installer's recorded
- * one — comparing manifest versions when both exist — else whatever is on disk under a new name,
+ * one - comparing manifest versions when both exist - else whatever is on disk under a new name,
  * else null.
  *
  * **Every candidate is checked against the filesystem, and that is the whole point.** A reload is
@@ -14,20 +14,20 @@ package ai.rever.boss.components.plugin
  * On Windows the previously-loaded JAR may survive the updater's cleanup (`delete()` can return
  * false while the JVM holds a lock on it). Position-based ordering would then reload from the
  * stale jar, so when the loaded jar and the persisted record both exist and both manifests parse,
- * the higher manifest version wins. Equal versions — and every case where no known candidate
- * yields a parseable version — keep the original position preference (loaded first), which also
+ * the higher manifest version wins. Equal versions - and every case where no known candidate
+ * yields a parseable version - keep the original position preference (loaded first), which also
  * preserves callers that do not supply a version reader.
  *
  * [relocated] is a TRUE last resort, unchanged: it is consulted only when neither candidate in
  * [candidates] survives its existence check. The plugin directory is
- * deliberately not part of the version comparison — a routine reload must not silently swap to a
+ * deliberately not part of the version comparison - a routine reload must not silently swap to a
  * stray dev build or a pinned/downgraded install that happens to declare a higher version under
  * the same [pluginId] key, nor race a download that streams onto a scannable
  * `<pluginId>-<version>.jar` name.
  *
  * Documented trade-off, not a defect: when both known candidates exist, the persisted
  * `installed.json` record CAN redirect a reload away from the running jar while that jar is still
- * on disk — the record's manifest version being higher wins, same directory, same user, no
+ * on disk - the record's manifest version being higher wins, same directory, same user, no
  * privilege boundary crossed. Callers confine the persisted candidate to the managed plugin
  * roots first (see [isContainedPath]), so the redirect can only land inside them.
  *
@@ -44,19 +44,21 @@ package ai.rever.boss.components.plugin
  * [PluginReloadVersion] compares all prerelease identifiers and ignores build metadata for
  * precedence. The shared plugin API comparator only supports a subset of prerelease formats.
  */
+@Suppress("LongParameterList") // Injected test seams for existence, relocation, versions, and rejected markers.
 internal fun resolveReloadJarPath(
     candidates: ReloadJarCandidates,
     exists: (String) -> Boolean,
     relocated: () -> String?,
     manifestVersion: (String) -> String? = { null },
     onManifestVersionReadFailed: (String) -> Unit = {},
+    isRejected: (String) -> Boolean = { java.io.File("$it.rejected-update").exists() },
 ): String? {
     // Known candidates in the original position order: the running jar, then the installer's
     // record. The directory scan is deliberately NOT consulted here (see [relocated] above).
     val known =
         listOfNotNull(candidates.loadedJarPath, candidates.persistedJarPath)
             .distinct()
-            .filter { exists(it) }
+            .filter { exists(it) && !isRejected(it) }
 
     return when {
         known.isEmpty() -> {
@@ -77,7 +79,7 @@ internal fun resolveReloadJarPath(
                 }
             val readable = versions.filterValues { it != null }
             // Highest manifest version wins; equal versions (and every case where no known
-            // candidate yields a parseable version — no-reader callers and unreadable manifests
+            // candidate yields a parseable version - no-reader callers and unreadable manifests
             // alike) keep the original position preference (the loaded jar first), which is the
             // order this resolver had before version awareness was added.
             readable.entries
