@@ -126,11 +126,17 @@ class McpPolicyEngine(
     private val _sessionTrustedTools = MutableStateFlow<Set<McpSessionTrust>>(emptySet())
     val sessionTrustedTools: StateFlow<Set<McpSessionTrust>> = _sessionTrustedTools.asStateFlow()
 
-    /** Capture before reading policy; a reset invalidates every older authorization. */
     internal fun revocationVersion(
         toolName: String,
         providerId: String? = null,
-    ): Long = (revocations[toolName] ?: 0L) + (providerId?.let { providerRevocations[it] } ?: 0L)
+    ): Long {
+        val toolRev = revocations[toolName] ?: 0L
+        val providerRev =
+            providerId?.let { id ->
+                (providerRevocations[id] ?: 0L) + (legacyProviderId(id)?.let { providerRevocations[it] } ?: 0L)
+            } ?: 0L
+        return toolRev + providerRev
+    }
 
     /**
      * The reset counter for a provider rule's own subject.
@@ -140,7 +146,8 @@ class McpPolicyEngine(
      * provider stamp before suspending (a plugin pack between approval and its detached write)
      * needs exactly this number to tell whether the operator reset that provider in between.
      */
-    internal fun providerRevocationVersion(providerId: String): Long = providerRevocations[providerId] ?: 0L
+    internal fun providerRevocationVersion(providerId: String): Long =
+        (providerRevocations[providerId] ?: 0L) + (legacyProviderId(providerId)?.let { providerRevocations[it] } ?: 0L)
 
     /**
      * Final authorization boundary. Session grants and operator resets use the same lock.
@@ -227,7 +234,7 @@ class McpPolicyEngine(
         if (isProviderDenied(providerId)) {
             return McpPolicyAction.DENY
         }
-        if (providerId != null && McpSessionTrust(providerId, toolName) in _sessionTrustedTools.value) {
+        if (providerId != null && isSessionTrusted(toolName, providerId)) {
             return McpPolicyAction.ALLOW
         }
         if (configuredTool != null) return configuredTool
@@ -260,10 +267,20 @@ class McpPolicyEngine(
             } == true
     }
 
-    private fun legacyProviderId(providerId: String): String? =
+    internal fun legacyProviderId(providerId: String): String? =
         providerId
             .substringAfter("::", missingDelimiterValue = "")
             .takeIf(String::isNotEmpty)
+
+    private fun isSessionTrusted(
+        toolName: String,
+        providerId: String,
+    ): Boolean {
+        val trusted = _sessionTrustedTools.value
+        val legacy = legacyProviderId(providerId)
+        return McpSessionTrust(providerId, toolName) in trusted ||
+            (legacy != null && McpSessionTrust(legacy, toolName) in trusted)
+    }
 
     /**
      * Trust [toolName], contributed by [providerId], for the duration of this session only.
@@ -294,10 +311,13 @@ class McpPolicyEngine(
         toolName: String,
         providerId: String? = null,
     ) {
+        val legacy = providerId?.let { legacyProviderId(it) }
         _sessionTrustedTools.update { trusted ->
             trusted
                 .filterNot {
-                    it.toolName == toolName && (providerId == null || it.providerId == providerId)
+                    val matchesCurrent = providerId == null || it.providerId == providerId
+                    val matchesLegacy = legacy != null && it.providerId == legacy
+                    it.toolName == toolName && (matchesCurrent || matchesLegacy)
                 }.toSet()
         }
         logger.info(
@@ -615,17 +635,26 @@ class McpPolicyEngine(
      */
     fun revokeProviderPolicy(providerId: String): Boolean =
         synchronized(lock) {
+            val legacy = legacyProviderId(providerId)
+            val keysToRemove =
+                buildSet {
+                    add(providerId)
+                    if (legacy != null) add(legacy)
+                }
             val saved =
                 applyConfig(
                     key = providerId,
                     logKey = "provider",
-                    updated = _config.value.copy(providerRules = _config.value.providerRules - providerId),
+                    updated = _config.value.copy(providerRules = _config.value.providerRules - keysToRemove),
                     successMessage = "Revoked provider policy",
                     failureMessage = "Failed to persist MCP provider policy revocation",
                     faultFor = { k, e -> McpPolicyFault.ProviderPolicyPersistFailed(k, e) },
                 )
             // Invalidate queued authorizations even when the durable reset fails.
             providerRevocations[providerId] = (providerRevocations[providerId] ?: 0L) + 1
+            if (legacy != null) {
+                providerRevocations[legacy] = (providerRevocations[legacy] ?: 0L) + 1
+            }
             saved
         }
 

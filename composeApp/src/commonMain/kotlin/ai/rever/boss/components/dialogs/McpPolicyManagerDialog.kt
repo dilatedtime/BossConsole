@@ -115,10 +115,11 @@ fun McpPolicyManagerDialog(
     // row's button, or dismissing, drops any pending confirmation rather than carrying it silently.
     var confirmingDeny by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
-    val filteredRules = filterSavedPolicies(rules, sectionTools, query, mcpPolicyPluginNames(), availableTools)
+    val pluginNames = mcpPolicyPluginNames()
+    val filteredRules = filterSavedPolicies(rules, sectionTools, query, pluginNames, availableTools)
     val filteredTools =
         availableTools.filter {
-            it.matchesPolicyQuery(query)
+            it.matchesPolicyQuery(query, pluginNames)
         }
 
     BossDialog(
@@ -312,10 +313,18 @@ fun McpPolicyManagerDialog(
 private fun emptyRulesMessage(noSavedRules: Boolean): String =
     if (noSavedRules) "No saved rules. Default policies and session trust still apply." else "No matching saved rules."
 
-private fun McpToolIdentity.matchesPolicyQuery(query: String): Boolean =
-    toolName.contains(query.trim(), ignoreCase = true) ||
-        providerId.contains(query.trim(), ignoreCase = true) ||
-        description.contains(query.trim(), ignoreCase = true)
+internal fun McpToolIdentity.matchesPolicyQuery(
+    query: String,
+    pluginNames: Map<String, String> = emptyMap(),
+): Boolean {
+    val term = query.trim()
+    return toolName.contains(term, ignoreCase = true) ||
+        providerId.contains(term, ignoreCase = true) ||
+        providerId.substringAfter("::").contains(term, ignoreCase = true) ||
+        providerId.substringBefore("::").contains(term, ignoreCase = true) ||
+        description.contains(term, ignoreCase = true) ||
+        (pluginNames.isNotEmpty() && policySectionName(providerId, pluginNames).contains(term, ignoreCase = true))
+}
 
 @Composable
 private fun FilteredPolicyCandidates(

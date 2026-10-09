@@ -55,6 +55,7 @@ fun McpProviderTrustDialog(
     providerRules: Map<String, McpPolicyAction>,
     onRevoke: suspend (providerId: String) -> Boolean,
     onDismiss: () -> Unit,
+    pluginNames: Map<String, String> = mcpPolicyPluginNames(),
 ) {
     val colors = BossTheme.colors
     val radii = BossTheme.radius
@@ -63,7 +64,7 @@ fun McpProviderTrustDialog(
     // successful revoke of any provider clears it, matching McpPolicyManagerDialog's own
     // reasoning for the equivalent per-tool dialog - this is diagnostic, not an audit trail.
     var failedRevoke by remember { mutableStateOf<String?>(null) }
-    val trusted = providerRules.filterValues { it == McpPolicyAction.ALLOW }
+    val activeRules = providerRules.filterValues { it != McpPolicyAction.ASK }
 
     BossDialog(
         onDismissRequest = onDismiss,
@@ -95,7 +96,7 @@ fun McpProviderTrustDialog(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
-                if (trusted.isEmpty()) {
+                if (activeRules.isEmpty()) {
                     Text(
                         text = "No plugin is trusted as a whole. Tools are governed individually.",
                         fontSize = 13.sp,
@@ -109,23 +110,34 @@ fun McpProviderTrustDialog(
                                 .heightIn(max = 280.dp)
                                 .verticalScroll(rememberScrollState()),
                     ) {
-                        trusted.keys.sorted().forEach { providerId ->
+                        activeRules.keys.sorted().forEach { providerId ->
+                            val action = activeRules[providerId] ?: McpPolicyAction.ALLOW
+                            val isDenied = action == McpPolicyAction.DENY
+                            val displayName = policySectionName(providerId, pluginNames)
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = providerId,
+                                        text = displayName,
                                         fontSize = 13.sp,
-                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Medium,
                                         color = colors.textPrimary,
                                     )
+                                    if (displayName != providerId) {
+                                        Text(
+                                            text = providerId,
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = colors.textSecondary,
+                                        )
+                                    }
                                     Text(
-                                        text = "All tools trusted",
+                                        text = if (isDenied) "All tools denied" else "All tools trusted",
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
-                                        color = colors.signal,
+                                        color = if (isDenied) colors.alert else colors.signal,
                                     )
                                     if (failedRevoke == providerId) {
                                         Text(

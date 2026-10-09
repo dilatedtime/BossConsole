@@ -86,7 +86,10 @@ internal fun approvalDialogBounds(): Pair<Dp, Dp> {
 }
 
 @Composable
-internal fun ToolDetails(request: McpApprovalRequest) {
+internal fun ToolDetails(
+    request: McpApprovalRequest,
+    pluginNames: Map<String, String> = mcpPolicyPluginNames(),
+) {
     val colors = BossTheme.colors
     val radii = BossTheme.radius
     Column(
@@ -108,8 +111,9 @@ internal fun ToolDetails(request: McpApprovalRequest) {
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
+            val displayName = policySectionName(request.providerId, pluginNames)
             Text(
-                text = request.providerId,
+                text = displayName,
                 fontSize = 11.sp,
                 color = colors.textSecondary,
                 maxLines = 1,

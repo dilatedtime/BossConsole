@@ -280,10 +280,7 @@ internal object McpLedgerCli {
             // A plugin's tools record `<pluginId>::<providerId>`, so the plugin id alone has to match
             // every provider it registered: an audit that silently finds nothing for a plugin reads as
             // "this plugin never received it".
-            val providerMatches =
-                query.provider == null ||
-                    record.providerId == query.provider ||
-                    record.providerId.substringBefore("::") == query.provider
+            val providerMatches = matchesProvider(record.providerId, query.provider)
             val secretMatches =
                 query.secret == null ||
                     record.secretRefs.any { McpLedgerSecrets.matches(it.lowercase(Locale.ROOT), query.secret) }
@@ -651,3 +648,12 @@ internal object McpLedgerFormat {
         }
     }
 }
+
+private fun matchesProvider(
+    recordProviderId: String,
+    queryProvider: String?,
+): Boolean =
+    queryProvider == null ||
+        recordProviderId == queryProvider ||
+        recordProviderId.substringBefore("::") == queryProvider ||
+        recordProviderId.substringAfter("::") == queryProvider

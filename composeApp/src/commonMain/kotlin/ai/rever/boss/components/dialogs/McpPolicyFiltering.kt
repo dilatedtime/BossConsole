@@ -13,7 +13,10 @@ internal fun filterSavedPolicies(
     val term = query.trim()
     return rules.filterKeys { name ->
         name.contains(term, true) || byName[name]?.let {
-            it.description.contains(term, true) || it.providerId.contains(term, true) ||
+            it.description.contains(term, true) ||
+                it.providerId.contains(term, true) ||
+                it.providerId.substringAfter("::").contains(term, true) ||
+                it.providerId.substringBefore("::").contains(term, true) ||
                 policySectionName(it.providerId, pluginNames).contains(term, true)
         } == true
     }

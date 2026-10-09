@@ -544,6 +544,8 @@ class McpLedgerCliTest {
         }
         assertEquals(listOf("vault_list", "vault_get"), tools("secret-manager"))
         assertEquals(listOf("vault_get"), tools("secret-manager::vault"))
+        assertEquals(listOf("vault_get"), tools("vault"))
+        assertEquals(listOf("vault_list"), tools("index"))
         assertEquals(listOf("open_terminal"), tools("boss-workspace"))
         // A prefix of a plugin id is not the plugin.
         assertEquals(emptyList<String>(), tools("secret"))

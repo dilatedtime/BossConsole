@@ -269,4 +269,60 @@ class McpProviderPolicyTest {
         assertTrue(engine.setProviderPolicy("terminal-tab", McpPolicyAction.ALLOW))
         assertEquals(McpPolicyAction.ALLOW, engine.policyFor("run_command", "terminal-tab"))
     }
+
+    @Test
+    fun `revoking a namespaced provider removes both scoped and legacy rules and increments revocations`() {
+        val file = createTempPolicyFile()
+        val engine = McpPolicyEngine(policyFile = file)
+        val legacyId = "shared-provider"
+        val scopedId = "plugin-a::$legacyId"
+
+        engine.setProviderPolicy(legacyId, McpPolicyAction.DENY)
+        engine.setProviderPolicy(scopedId, McpPolicyAction.DENY)
+
+        val beforeRevocation = engine.providerRevocationVersion(scopedId)
+        assertTrue(engine.revokeProviderPolicy(scopedId))
+
+        assertFalse(scopedId in engine.config.value.providerRules)
+        assertFalse(legacyId in engine.config.value.providerRules)
+        assertTrue(engine.providerRevocationVersion(scopedId) > beforeRevocation)
+        assertEquals(McpPolicyAction.ASK, engine.policyFor("k8s_delete", scopedId))
+    }
+
+    @Test
+    fun `session trust preserves continuity across scoped and legacy provider IDs`() {
+        val engine = McpPolicyEngine(policyFile = createTempPolicyFile())
+        val legacyId = "shared-provider"
+        val scopedId = "plugin-a::$legacyId"
+
+        engine.trustForSession("run_command", legacyId)
+        assertEquals(
+            McpPolicyAction.ALLOW,
+            engine.policyFor("run_command", scopedId),
+            "session trust granted under legacy id must apply when invoked under namespaced id",
+        )
+
+        engine.revokeSessionTrust("run_command", scopedId)
+        assertEquals(
+            McpPolicyAction.ASK,
+            engine.policyFor("run_command", scopedId),
+            "revoking under namespaced id must also clear legacy grant",
+        )
+    }
+
+    @Test
+    fun `revocationVersion accounts for both scoped and legacy provider revocations`() {
+        val engine = McpPolicyEngine(policyFile = createTempPolicyFile())
+        val legacyId = "shared-provider"
+        val scopedId = "plugin-a::$legacyId"
+
+        val initialVersion = engine.revocationVersion("run_command", scopedId)
+        engine.revokeProviderPolicy(scopedId)
+        val afterVersion = engine.revocationVersion("run_command", scopedId)
+
+        assertTrue(
+            afterVersion > initialVersion,
+            "revocationVersion must increment when provider policy is revoked",
+        )
+    }
 }

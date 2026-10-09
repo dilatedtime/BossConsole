@@ -17,14 +17,27 @@ internal fun mcpPolicyPluginNames(): Map<String, String> {
 internal fun policySectionName(
     providerId: String,
     names: Map<String, String>,
-): String =
+): String {
     // Plugin-registered providers carry a "<pluginId>::<providerId>" scoped id; the map is
     // keyed by pluginId, so strip the namespace first or every plugin section falls into the
-    // mangling branch (#926).
-    names[providerId.substringBefore("::")]?.takeIf { it.isNotBlank() }
-        ?: names[providerId]?.takeIf { it.isNotBlank() }
-        ?: providerId
-            .substringAfterLast('.')
-            .replace('-', ' ')
-            .replace('_', ' ')
-            .replaceFirstChar { it.titlecase() }
+    // mangling branch (#926, #1633).
+    val pluginId = providerId.substringBefore("::")
+    val unscopedProviderId = providerId.substringAfter("::")
+    val matched =
+        names[pluginId]?.takeIf { it.isNotBlank() }
+            ?: names[providerId]?.takeIf { it.isNotBlank() }
+            ?: names[unscopedProviderId]?.takeIf { it.isNotBlank() }
+    if (matched != null) return matched
+
+    val rawToFormat =
+        if (providerId.contains("::")) {
+            unscopedProviderId.ifBlank { pluginId }
+        } else {
+            providerId
+        }
+    return rawToFormat
+        .substringAfterLast('.')
+        .replace('-', ' ')
+        .replace('_', ' ')
+        .replaceFirstChar { it.titlecase() }
+}

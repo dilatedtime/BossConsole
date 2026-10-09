@@ -78,10 +78,13 @@ internal fun McpPolicySections(
     val pluginNames = mcpPolicyPluginNames()
     val groups =
         tools.groupBy { it.providerId }.filter { (provider, members) ->
-            policySectionName(provider, pluginNames).contains(query.trim(), true) ||
-                provider.contains(query.trim(), true) ||
+            val term = query.trim()
+            policySectionName(provider, pluginNames).contains(term, true) ||
+                provider.contains(term, true) ||
+                provider.substringAfter("::").contains(term, true) ||
+                provider.substringBefore("::").contains(term, true) ||
                 members.any {
-                    it.toolName.contains(query.trim(), true) || it.description.contains(query.trim(), true)
+                    it.toolName.contains(term, true) || it.description.contains(term, true)
                 }
         }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {

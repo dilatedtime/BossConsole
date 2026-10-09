@@ -718,9 +718,10 @@ private fun ScopeOptions(
             )
         }
         if (McpApprovalScope.ALWAYS_PLUGIN in scopes) {
+            val pluginDisplayName = policySectionName(request.providerId, mcpPolicyPluginNames())
             ScopeOption(
                 title = "Always, for every tool from this plugin",
-                description = "Trusts everything \"${request.providerId}\" provides, now and in later versions.",
+                description = "Trusts everything \"$pluginDisplayName\" provides, now and in later versions.",
                 selected = selected == McpApprovalScope.ALWAYS_PLUGIN,
                 titleColor = BossTheme.colors.warn,
                 onSelect = { onSelect(McpApprovalScope.ALWAYS_PLUGIN) },
