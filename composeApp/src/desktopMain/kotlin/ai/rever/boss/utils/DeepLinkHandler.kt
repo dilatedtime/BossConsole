@@ -15,6 +15,8 @@ import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogSanitizer
 import ai.rever.boss.window.MenuActionsHandler
 import ai.rever.boss.window.Project
+import ai.rever.boss.window.WindowProjectStateRegistry
+import ai.rever.boss.window.resolveActionableWindowOrFallback
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -532,11 +534,10 @@ actual object DeepLinkHandler {
                 )
 
             withContext(Dispatchers.Main) {
-                // Update project state (use per-window state if available)
+                val effectiveWindowId = targetWindowId ?: resolveActionableWindowOrFallback()
                 val windowProjectState =
-                    targetWindowId?.let {
-                        ai.rever.boss.window.WindowProjectStateRegistry
-                            .get(it)
+                    effectiveWindowId?.let { id ->
+                        WindowProjectStateRegistry.get(id)
                     }
 
                 if (windowProjectState != null) {
@@ -547,15 +548,14 @@ actual object DeepLinkHandler {
                 }
                 logger.info(LogCategory.FILE, "Folder opened in codebase", mapOf("path" to folder.absolutePath))
 
-                // Emit panel open event to show the codebase panel
-                if (targetWindowId == null) {
+                if (effectiveWindowId == null) {
                     logger.warn(LogCategory.UI, "No usable window registered, cannot open codebase panel")
                 } else {
-                    PanelEventBus.openPanel(PanelIds.CODEBASE, sourceWindowId = targetWindowId)
+                    PanelEventBus.openPanel(PanelIds.CODEBASE, sourceWindowId = effectiveWindowId)
                     logger.debug(
                         LogCategory.UI,
                         "Emitted codebase panel open event",
-                        mapOf("windowId" to targetWindowId),
+                        mapOf("windowId" to effectiveWindowId),
                     )
                 }
             }
@@ -744,7 +744,8 @@ actual object DeepLinkHandler {
         panelIdStr: String,
         targetWindowId: String?,
     ) {
-        if (targetWindowId == null) {
+        val effectiveWindowId = targetWindowId ?: resolveActionableWindowOrFallback()
+        if (effectiveWindowId == null) {
             logger.warn(
                 LogCategory.UI,
                 "No usable window registered, cannot open panel",
@@ -762,11 +763,11 @@ actual object DeepLinkHandler {
                     defaultOrder = 0, // Will be ignored, registry has real value
                     pluginId = "ai.rever.boss", // Default plugin
                 )
-            PanelEventBus.openPanel(panelId, sourceWindowId = targetWindowId)
+            PanelEventBus.openPanel(panelId, sourceWindowId = effectiveWindowId)
             logger.info(
                 LogCategory.UI,
                 "Emitted panel open event",
-                mapOf("panelId" to panelIdStr, "windowId" to targetWindowId),
+                mapOf("panelId" to panelIdStr, "windowId" to effectiveWindowId),
             )
         }
     }

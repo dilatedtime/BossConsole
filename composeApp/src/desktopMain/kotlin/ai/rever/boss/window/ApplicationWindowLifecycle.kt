@@ -19,3 +19,12 @@ internal class ApplicationWindowLifecycle {
         WindowFocusManager.focusWindow(target.id)
     }
 }
+
+/**
+ * Resolves an actionable window ID, falling back to any existing window in
+ * [WindowManager], or creating a new window when zero windows are registered.
+ */
+internal fun resolveActionableWindowOrFallback(): String? {
+    val existingId = WindowFocusManager.resolveActionableWindowId() ?: WindowManager.windows.firstOrNull()?.id
+    return existingId ?: WindowManager.createNewWindow().id
+}

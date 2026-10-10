@@ -5,6 +5,7 @@ import ai.rever.boss.utils.WindowFocusManager
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogSanitizer
+import ai.rever.boss.window.resolveActionableWindowOrFallback
 import androidx.compose.runtime.mutableStateOf
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +34,9 @@ actual object URLHandlerService {
 
     /** Bound on untrusted `boss://url` approval requests per [UrlOpenRateLimiter.WINDOW_MS]. */
     private val openRateLimiter = UrlOpenRateLimiter()
+
+    /** Test seam and fallback window resolver for zero-window recovery. */
+    internal var windowResolver: () -> String? = ::resolveActionableWindowOrFallback
 
     // Track active URL processing operations
     // Incremented when a coroutine is launched to process a URL
@@ -143,12 +147,9 @@ actual object URLHandlerService {
             WindowFocusManager.bringToFront()
             logger.debug(LogCategory.BROWSER, "Brought window to front")
 
-            // Resolve the target window. Uses the registration/focus-gain-backed
-            // lookup, not focusedWindowFlow alone: bringToFront() above is async
-            // (SwingUtilities.invokeLater), so on a cold start or an MCP/CLI
-            // caller that holds OS focus the flow can still be null while a
-            // usable window is plainly registered.
-            val focusedWindowId = WindowFocusManager.resolveActionableWindowId()
+            // Resolve the target window using windowResolver, which falls back to
+            // creating a new window if no usable window is currently open.
+            val focusedWindowId = windowResolver()
             if (focusedWindowId == null) {
                 logger.warn(
                     LogCategory.BROWSER,

@@ -15,6 +15,7 @@ import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogSanitizer
 import ai.rever.boss.window.Project
 import ai.rever.boss.window.WindowManager
+import ai.rever.boss.window.resolveActionableWindowOrFallback
 import kotlinx.coroutines.*
 import java.io.File
 
@@ -39,6 +40,9 @@ class CLICommandHandler private constructor() {
     // Whole commands for the same reason: a Space can carry terminal commands.
     private val workspaceReadinessQueue = ReadinessQueue<CLICommand.LoadWorkspace>()
     private val fileReadinessQueue = ReadinessQueue<String>()
+
+    /** Test seam and fallback window resolver for zero-window recovery. */
+    internal var windowResolver: () -> String? = ::resolveActionableWindowOrFallback
 
     // Service references - set during initialization
     private var windowManager: WindowManager? = null
@@ -313,11 +317,9 @@ class CLICommandHandler private constructor() {
             return
         }
 
-        // Resolve the target window. Uses the registration/focus-gain-backed
-        // lookup, not focusedWindowFlow alone — an MCP-driven or CLI caller
-        // holds OS focus itself, so the flow can be null while a usable window
-        // is plainly registered (same reason as the boss:// deep-link handlers).
-        val focusedWindowId = WindowFocusManager.resolveActionableWindowId()
+        // Resolve the target window using windowResolver, which falls back to
+        // creating a new window if no usable window is currently open.
+        val focusedWindowId = windowResolver()
         if (focusedWindowId == null) {
             logger.warn(
                 LogCategory.SYSTEM,
@@ -382,9 +384,9 @@ class CLICommandHandler private constructor() {
             return
         }
 
-        // Resolve the target window (see handleLoadWorkspace for why this is
-        // not focusedWindowFlow).
-        val focusedWindowId = WindowFocusManager.resolveActionableWindowId()
+        // Resolve the target window using windowResolver, which falls back to
+        // creating a new window if no usable window is currently open.
+        val focusedWindowId = windowResolver()
         if (focusedWindowId == null) {
             logger.warn(
                 LogCategory.SYSTEM,
@@ -452,9 +454,7 @@ class CLICommandHandler private constructor() {
         }
 
         withContext(Dispatchers.Main) {
-            // Resolve the target window (see handleLoadWorkspace for why this is
-            // not focusedWindowFlow).
-            val focusedWindowId = WindowFocusManager.resolveActionableWindowId()
+            val focusedWindowId = windowResolver()
             val windowProjectState =
                 focusedWindowId?.let {
                     ai.rever.boss.window.WindowProjectStateRegistry
@@ -511,9 +511,9 @@ class CLICommandHandler private constructor() {
         }
         val requiresConfirmation = disposition == TerminalCommandDisposition.CONFIRM
 
-        // Resolve the target window (see handleLoadWorkspace for why this is
-        // not focusedWindowFlow).
-        val focusedWindowId = WindowFocusManager.resolveActionableWindowId()
+        // Resolve the target window using windowResolver, which falls back to
+        // creating a new window if no usable window is currently open.
+        val focusedWindowId = windowResolver()
         if (focusedWindowId == null) {
             logger.warn(LogCategory.SYSTEM, "No usable window registered, cannot open terminal")
             return
