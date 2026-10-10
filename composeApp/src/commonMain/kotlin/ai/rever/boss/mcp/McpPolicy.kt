@@ -138,6 +138,17 @@ data class McpToolPolicyConfig(
      */
     val providerRules: Map<String, McpPolicyAction> = emptyMap(),
     /**
+     * Provider scoping for persisted [rules], mapping `toolName -> providerId`.
+     *
+     * A tool-scoped rule is earned by the contributing provider. Scoping ensures that a
+     * standing ALLOW or DENY is not inherited by an unrelated provider that registers a tool
+     * under the same name across restarts or plugin swaps (#1360).
+     *
+     * Legacy configuration files without this field answer name-wide so existing operator
+     * choices survive upgrade until explicitly reset.
+     */
+    val ruleProviders: Map<String, String> = emptyMap(),
+    /**
      * Whether `{{secret:<id>}}` references in tool arguments are resolved at all. Off, a
      * secret-bearing call is refused (never passed through with its placeholders intact, which
      * would leave the agent believing a credential was delivered). A rollback switch, not a
@@ -268,8 +279,16 @@ object McpMutatingToolCatalog {
         toolName: String,
         config: McpToolPolicyConfig,
         declaredReadOnly: Boolean? = null,
+        providerId: String? = null,
     ): McpPolicyAction {
-        config.rules[toolName]?.let { return it }
+        val rule = config.rules[toolName]
+        val ruleProvider = config.ruleProviders[toolName]
+        val ruleApplies =
+            rule != null && (
+                ruleProvider == null ||
+                    (providerId != null && matchesRuleProvider(providerId, ruleProvider))
+            )
+        if (ruleApplies) return rule!!
         return if (isMutating(toolName, declaredReadOnly)) {
             config.defaultMutatingAction
         } else {
@@ -277,3 +296,20 @@ object McpMutatingToolCatalog {
         }
     }
 }
+
+/**
+ * Whether [callingProviderId] matches the scope of [ruleProviderId].
+ *
+ * If either id has been namespaced (`<pluginId>::<providerId>`), an exact match is required
+ * when both ids carry a plugin namespace, preventing cross-plugin privilege inheritance.
+ * A namespaced id matches an unscoped legacy id if their provider component matches.
+ */
+internal fun matchesRuleProvider(
+    callingProviderId: String,
+    ruleProviderId: String,
+): Boolean =
+    when {
+        callingProviderId == ruleProviderId -> true
+        callingProviderId.contains("::") && ruleProviderId.contains("::") -> false
+        else -> callingProviderId.substringAfter("::") == ruleProviderId.substringAfter("::")
+    }

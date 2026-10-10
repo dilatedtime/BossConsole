@@ -220,7 +220,8 @@ class McpPolicyEngine(
     ): McpPolicyAction {
         if (_fault.value is McpPolicyFault.PersistedPolicyUnreadable) return McpPolicyAction.DENY
         val configuredTool = _config.value.rules[toolName]
-        if (configuredTool == McpPolicyAction.DENY) {
+        val toolRuleApplies = isToolRuleApplicable(toolName, providerId)
+        if (toolRuleApplies && configuredTool == McpPolicyAction.DENY) {
             return McpPolicyAction.DENY
         }
         val configuredProvider = providerId?.let { _config.value.providerRules[it] }
@@ -230,7 +231,7 @@ class McpPolicyEngine(
         if (providerId != null && McpSessionTrust(providerId, toolName) in _sessionTrustedTools.value) {
             return McpPolicyAction.ALLOW
         }
-        if (configuredTool != null) return configuredTool
+        if (toolRuleApplies && configuredTool != null) return configuredTool
         if (configuredProvider == McpPolicyAction.ALLOW) return McpPolicyAction.ALLOW
         val risk = DefaultMcpRiskEvaluator().evaluateRisk(toolName, McpToolArgs(emptyMap())).level
         return if (risk >= McpRiskLevel.HIGH || McpMutatingToolCatalog.isMutating(toolName, declaredReadOnly)) {
@@ -238,6 +239,14 @@ class McpPolicyEngine(
         } else {
             _config.value.defaultReadOnlyAction
         }
+    }
+
+    private fun isToolRuleApplicable(
+        toolName: String,
+        providerId: String?,
+    ): Boolean {
+        val ruleProvider = _config.value.ruleProviders[toolName] ?: return true
+        return providerId != null && matchesRuleProvider(providerId, ruleProvider)
     }
 
     /**
@@ -404,10 +413,20 @@ class McpPolicyEngine(
                 return@synchronized false
             }
             if (preserveDeny && policyFor(toolName, providerId) == McpPolicyAction.DENY) return@synchronized false
+            val updatedProviders =
+                if (providerId != null) {
+                    _config.value.ruleProviders + (toolName to providerId)
+                } else {
+                    _config.value.ruleProviders - toolName
+                }
             applyConfig(
                 key = toolName,
                 logKey = "tool",
-                updated = _config.value.copy(rules = _config.value.rules + (toolName to action)),
+                updated =
+                    _config.value.copy(
+                        rules = _config.value.rules + (toolName to action),
+                        ruleProviders = updatedProviders,
+                    ),
                 successMessage = "Updated tool policy: ${action.name}",
                 failureMessage = "Failed to persist MCP policy update",
                 faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },
@@ -446,10 +465,20 @@ class McpPolicyEngine(
             if (policyFor(toolName, providerId) == McpPolicyAction.DENY) {
                 return@synchronized McpProactivePolicyOutcome.Denied
             }
+            val updatedProviders =
+                if (providerId != null) {
+                    _config.value.ruleProviders + (toolName to providerId)
+                } else {
+                    _config.value.ruleProviders - toolName
+                }
             writeConfig(
                 key = toolName,
                 logKey = "tool",
-                updated = _config.value.copy(rules = _config.value.rules + (toolName to action)),
+                updated =
+                    _config.value.copy(
+                        rules = _config.value.rules + (toolName to action),
+                        ruleProviders = updatedProviders,
+                    ),
                 successMessage = "Updated tool policy: ${action.name}",
                 failureMessage = "Failed to persist MCP policy update",
                 faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },
@@ -486,6 +515,8 @@ class McpPolicyEngine(
                     updated =
                         _config.value.copy(
                             rules = _config.value.rules + changes.associate { it.toolName to it.action },
+                            ruleProviders =
+                                _config.value.ruleProviders + changes.associate { it.toolName to it.providerId },
                         ),
                     successMessage = "Updated section tool policies",
                     failureMessage = "Failed to persist MCP section policies",
@@ -667,7 +698,11 @@ class McpPolicyEngine(
                 applyConfig(
                     key = toolName,
                     logKey = "tool",
-                    updated = _config.value.copy(rules = _config.value.rules - toolName),
+                    updated =
+                        _config.value.copy(
+                            rules = _config.value.rules - toolName,
+                            ruleProviders = _config.value.ruleProviders - toolName,
+                        ),
                     successMessage = "Revoked persisted tool policy",
                     failureMessage = "Failed to persist MCP policy revocation",
                     faultFor = { k, e -> McpPolicyFault.PolicyPersistFailed(k, e) },

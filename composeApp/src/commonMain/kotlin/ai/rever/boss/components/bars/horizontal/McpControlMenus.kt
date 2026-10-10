@@ -112,6 +112,7 @@ internal fun rememberMcpAccessMenu(persistedPolicyConfig: McpToolPolicyConfig): 
             onApplySection = { changes ->
                 withContext(Dispatchers.IO) { McpToolRegistryImpl.policyEngine.setSectionPolicies(changes) }
             },
+            ruleProviders = persistedPolicyConfig.ruleProviders,
         )
     }
     return McpAccessMenu(

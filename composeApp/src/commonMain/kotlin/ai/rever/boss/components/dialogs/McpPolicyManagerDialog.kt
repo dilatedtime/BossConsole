@@ -85,7 +85,7 @@ import kotlinx.coroutines.launch
  * from what is actually on disk.
  */
 @Composable
-@Suppress("LongMethod") // Declarative Compose layout.
+@Suppress("LongMethod", "CyclomaticComplexMethod") // Declarative Compose layout.
 fun McpPolicyManagerDialog(
     rules: Map<String, McpPolicyAction>,
     availableTools: List<McpToolIdentity>,
@@ -95,6 +95,7 @@ fun McpPolicyManagerDialog(
     onDismiss: () -> Unit,
     sectionTools: List<McpToolIdentity>? = null,
     onApplySection: (suspend (List<McpSectionPolicyChange>) -> McpProactivePolicyOutcome)? = null,
+    ruleProviders: Map<String, String> = emptyMap(),
 ) {
     val windowSize = LocalWindowInfo.current.containerSize
     val windowHeight = with(LocalDensity.current) { windowSize.height.toDp() }
@@ -115,7 +116,9 @@ fun McpPolicyManagerDialog(
     // row's button, or dismissing, drops any pending confirmation rather than carrying it silently.
     var confirmingDeny by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
-    val filteredRules = filterSavedPolicies(rules, sectionTools, query, mcpPolicyPluginNames(), availableTools)
+    val pluginNames = mcpPolicyPluginNames()
+    val filteredRules =
+        filterSavedPolicies(rules, sectionTools, query, pluginNames, availableTools, ruleProviders)
     val filteredTools =
         availableTools.filter {
             it.matchesPolicyQuery(query)
@@ -241,16 +244,29 @@ fun McpPolicyManagerDialog(
                                             fontFamily = FontFamily.Monospace,
                                             color = colors.textPrimary,
                                         )
-                                        Text(
-                                            text = action.name,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Medium,
-                                            // Both values represent a durable, disk-persisted rule -
-                                            // the same category McpApprovalDialog's "Always Allow"/
-                                            // "Always Deny" buttons are, which use warn/alert rather
-                                            // than an ordinary success color.
-                                            color = if (action == McpPolicyAction.DENY) colors.alert else colors.warn,
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                text = action.name,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                // Both values represent a durable, disk-persisted rule -
+                                                // the same category McpApprovalDialog's "Always Allow"/
+                                                // "Always Deny" buttons are, which use warn/alert rather
+                                                // than an ordinary success color.
+                                                color =
+                                                    if (action == McpPolicyAction.DENY) colors.alert else colors.warn,
+                                            )
+                                            val scopedProvider = ruleProviders[toolName]
+                                            if (scopedProvider != null) {
+                                                val sectionName = policySectionName(scopedProvider, pluginNames)
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = "· $sectionName",
+                                                    fontSize = 11.sp,
+                                                    color = colors.textSecondary,
+                                                )
+                                            }
+                                        }
                                         if (failedRevoke == toolName) {
                                             Text(
                                                 // Session trust clears even on failure, but a saved ALLOW still
