@@ -36,7 +36,9 @@ internal fun prepareWindowForClose(windowId: String) {
         if (needsTransitionWait) runBlocking { delay(150) }
     }
     // Detach browser UI before AWT disposal to avoid OffScreenWidget native crashes.
-    SplitViewStateRegistry.getState(windowId)?.disposeAllBrowsersBlocking()
+    cleanup.run("dispose all browsers") {
+        SplitViewStateRegistry.getState(windowId)?.disposeAllBrowsersBlocking()
+    }
 }
 
 private fun exitNativeFullscreenForClose(

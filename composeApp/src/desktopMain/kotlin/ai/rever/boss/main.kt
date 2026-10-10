@@ -463,6 +463,9 @@ fun main(rawArgs: Array<String>) {
     }
 
     val windowLifecycle = ApplicationWindowLifecycle()
+    SingleInstanceManager.windowActivationHandler = {
+        windowLifecycle.reopen()
+    }
     val quitLifecycle = ApplicationQuitLifecycle()
     val startWithoutWindow = SystemUtils.isMacOS && launchArguments.windowlessRequested
     // Create the initial window once, except after a windowless macOS update.
@@ -765,9 +768,11 @@ fun main(rawArgs: Array<String>) {
                                     WindowManager.closeWindow(windowState.id)
                                     ai.rever.boss.utils.WindowFocusManager
                                         .unregisterWindow(windowState.id)
-                                    // Don't call exitApplication - keep app running (macOS style)
-                                    // When window count reaches 0, app stays in Dock
-                                    // User can quit via Cmd+Q or right-click Dock → Quit
+                                    // On macOS, keep app running without windows in Dock.
+                                    // On Windows/Linux, closing the last window shuts down the application.
+                                    if (!SystemUtils.isMacOS && WindowManager.windowCount == 0) {
+                                        quitApplication()
+                                    }
                                 },
                             )
                         }
