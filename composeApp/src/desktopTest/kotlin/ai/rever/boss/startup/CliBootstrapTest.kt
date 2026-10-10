@@ -83,4 +83,36 @@ class CliBootstrapTest {
         assertFalse(CliBootstrap.isHeadlessCli(arrayOf("--help", "extra")))
         assertTrue(CliBootstrap.isHeadlessCli(arrayOf("-v", "status")))
     }
+
+    @Test
+    fun forwardToExistingInstanceActivatesWhenNoLinks() {
+        var activateCalled = false
+        val result =
+            CliBootstrap.forwardToExistingInstance(
+                args = emptyArray(),
+                send = { _, _ -> false },
+                activate = {
+                    activateCalled = true
+                    true
+                },
+            )
+        assertTrue(result)
+        assertTrue(activateCalled)
+    }
+
+    @Test
+    fun forwardToExistingInstanceReturnsFalseWhenActivationFails() {
+        var activateCalled = false
+        val result =
+            CliBootstrap.forwardToExistingInstance(
+                args = emptyArray(),
+                send = { _, _ -> false },
+                activate = {
+                    activateCalled = true
+                    false
+                },
+            )
+        assertFalse(result)
+        assertTrue(activateCalled)
+    }
 }
