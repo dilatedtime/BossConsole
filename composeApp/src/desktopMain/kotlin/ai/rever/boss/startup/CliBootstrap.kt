@@ -97,16 +97,24 @@ object CliBootstrap {
      * Forwards open requests to an already running instance when single-instance lock acquisition fails.
      * Returns true if all requests were successfully forwarded or there were no URLs to forward.
      */
+    @Suppress("LongMethod")
     fun forwardToExistingInstance(
         args: Array<String>,
+        activate: () -> Boolean = {
+            SingleInstanceManager.activateExistingInstance()
+        },
         send: (String, DeepLinkOrigin) -> Boolean = { link, origin ->
             SingleInstanceManager.sendToExistingInstance(link, origin)
         },
     ): Boolean {
         val deepLinks = OsOpenArguments.requestsFrom(args)
         if (deepLinks.isEmpty()) {
-            logger.info(LogCategory.SYSTEM, "No URL to send - existing BOSS window should be visible")
-            return true
+            logger.info(LogCategory.SYSTEM, "No URL to send - activating existing BOSS instance")
+            val activated = activate()
+            if (!activated) {
+                logger.warn(LogCategory.SYSTEM, "Failed to activate existing BOSS instance")
+            }
+            return activated
         }
 
         logger.info(

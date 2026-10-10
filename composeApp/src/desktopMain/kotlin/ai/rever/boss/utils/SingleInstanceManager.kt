@@ -53,6 +53,7 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
+import javax.swing.SwingUtilities
 import kotlin.concurrent.thread
 
 private val logger = BossLogger.forComponent("SingleInstanceManager")
@@ -71,6 +72,9 @@ internal const val PROTOCOL_VERSION = "boss-si-1"
 
 /** Asks the running instance to prove it is listening. */
 internal const val VERB_PING = "PING"
+
+/** Asks the running instance to activate and bring itself forward. */
+internal const val VERB_ACTIVATE = "ACTIVATE"
 
 /** Asks the running instance to process a URL. */
 internal const val VERB_OPEN = "OPEN"
@@ -397,7 +401,7 @@ internal fun parseRequestLine(line: String): SingleInstanceRequest? {
 
     val token = parts[1]
     return when (parts[2]) {
-        VERB_PING, VERB_LLM_TOKEN, VERB_STATUS, VERB_MCP_LIST -> {
+        VERB_PING, VERB_ACTIVATE, VERB_LLM_TOKEN, VERB_STATUS, VERB_MCP_LIST -> {
             if (parts.size == 3) {
                 SingleInstanceRequest(token, parts[2], DeepLinkOrigin.EXTERNAL, null)
             } else {
@@ -507,6 +511,9 @@ internal fun formatOpenRequest(
 
 /** Builds a liveness probe line. Never log the result: it carries the token. */
 internal fun formatPingRequest(token: String): String = "$PROTOCOL_VERSION $token $VERB_PING"
+
+/** Builds an activation request line. Never log the result: it carries the token. */
+internal fun formatActivateRequest(token: String): String = "$PROTOCOL_VERSION $token $VERB_ACTIVATE"
 
 /** Builds a credential request. Never log the result: it carries the channel token. */
 internal fun formatLlmTokenRequest(token: String): String = "$PROTOCOL_VERSION $token $VERB_LLM_TOKEN"
@@ -1709,6 +1716,12 @@ object SingleInstanceManager {
     /** Test seam / host hook for dev plugin reload response. */
     internal var pluginReloadHandlerOverride: ((String) -> Boolean)? = null
 
+    /**
+     * Handler invoked when [VERB_ACTIVATE] arrives. Defaults to null.
+     * Invoked on the Swing EDT to bring windows forward or recreate them if none exist.
+     */
+    internal var windowActivationHandler: (() -> Unit)? = null
+
     /** Test seam for overriding connection and handler budget timeouts. */
     internal var connectionBudgetMsOverride: Long? = null
 
@@ -2007,6 +2020,7 @@ object SingleInstanceManager {
         mcpListProviderOverride = null
         mcpInvokeHandlerOverride = null
         pluginReloadHandlerOverride = null
+        windowActivationHandler = null
         watchdogSchedulerOverride = null
         connectionBudgetMsOverride = null
         beforeTeardownFaultedListenerForTest = null
@@ -2185,6 +2199,22 @@ object SingleInstanceManager {
             expected != null && tokensMatch(expected, request.token)
         }
 
+    @Suppress("TooGenericExceptionCaught")
+    private fun handleActivation(): String {
+        logger.info(LogCategory.SYSTEM, "Received activation request from new instance")
+        val handler = windowActivationHandler
+        if (handler != null) {
+            SwingUtilities.invokeLater {
+                try {
+                    handler()
+                } catch (t: Throwable) {
+                    logger.warn(LogCategory.SYSTEM, "Window activation handler threw", error = t)
+                }
+            }
+        }
+        return RESPONSE_OK
+    }
+
     /**
      * Checks the token, then acts on the request, returning the response to send
      * back. A request that does not present the live token is refused here,
@@ -2200,6 +2230,10 @@ object SingleInstanceManager {
         return when {
             request.verb == VERB_PING -> {
                 RESPONSE_PONG
+            }
+
+            request.verb == VERB_ACTIVATE -> {
+                handleActivation()
             }
 
             request.verb == VERB_OPEN && isForwardableUrl(request.url) -> {
@@ -2552,6 +2586,33 @@ object SingleInstanceManager {
             logger.warn(
                 LogCategory.SYSTEM,
                 "Existing instance did not accept the URL",
+                mapOf("response" to (response ?: "none")),
+            )
+        }
+        return response == RESPONSE_OK
+    }
+
+    /**
+     * Sends [VERB_ACTIVATE] to the running instance, asking it to bring its windows
+     * forward or reopen a window if none are currently open.
+     *
+     * Returns true if the running instance acknowledged the activation request with [RESPONSE_OK].
+     */
+    fun activateExistingInstance(): Boolean {
+        val target = readSafeDescriptor(requireVerified = false) ?: return false
+        val request = formatActivateRequest(target.token)
+        logger.debug(
+            LogCategory.SYSTEM,
+            "Attempting to activate existing instance",
+            mapOf("transport" to target.transport.name, "endpoint" to target.endpoint),
+        )
+        val response = SingleInstanceWire.exchangeWithRetry(target, request)
+        if (response == RESPONSE_OK) {
+            logger.info(LogCategory.SYSTEM, "Existing instance acknowledged activation request")
+        } else {
+            logger.warn(
+                LogCategory.SYSTEM,
+                "Existing instance did not accept activation request",
                 mapOf("response" to (response ?: "none")),
             )
         }
